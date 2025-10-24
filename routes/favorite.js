@@ -7,6 +7,8 @@ const fs = require('fs');
 const path = require('path');
 const dotenv = require('dotenv');
 dotenv.config();
+// ✅ Mailjet HTTPS mailer (no SMTP)
+const { sendEmail } = require('../utils/mailer');
 
 const router = express.Router();
 
@@ -22,8 +24,10 @@ const FAVORITE_CATEGORIES = [
   'Blockbuster Movies','Award-Winning Movies','Family Movies'
 ];
 /* ----------------------- FAVORITES: Share PDF (Ajay Kedar themed, full details) ----------------------- */
-/* ----------------------- FAVORITES: Share PDF (bright, professional, no overlap) ----------------------- */
-// POST /api/favorites/share-bucket-pdf
+
+// If used elsewhere in file:
+// const FAVORITE_CATEGORIES = ["movies","series","both"]; // example
+
 router.post('/share-bucket-pdf', async (req, res) => {
   const { user_id, favorite_category, to_email } = req.body || {};
   let filePath;
@@ -49,18 +53,13 @@ router.post('/share-bucket-pdf', async (req, res) => {
   /* ---------- PDF helpers (spacing-safe) ---------- */
   const drawPageHeader = (doc, title, subtitle) => {
     doc.save();
-    // header band
     doc.rect(0, 0, doc.page.width, mm(26)).fill(palette.card);
-    // title
     doc.fill(palette.text).font('Helvetica-Bold').fontSize(18);
     doc.text(title, mm(20), mm(8), { align: 'left' });
-    // subtitle
     doc.fill(palette.muted).font('Helvetica').fontSize(9);
     doc.text(subtitle, mm(20), mm(16), { align: 'left' });
-    // bottom border
     doc.rect(0, mm(26), doc.page.width, 1).fill(palette.divider);
     doc.restore();
-    // start content a bit lower
     doc.y = mm(34);
   };
 
@@ -77,11 +76,7 @@ router.post('/share-bucket-pdf', async (req, res) => {
   const ensurePageSpace = (doc, neededHeight = mm(28)) => {
     if (doc.y + neededHeight > doc.page.height - mm(16)) {
       doc.addPage({ margin: mm(14) });
-      // faint header strip for new page
-      doc.save();
-      doc.rect(0, 0, doc.page.width, mm(10)).fill(palette.card);
-      doc.restore();
-      // top padding
+      doc.save(); doc.rect(0, 0, doc.page.width, mm(10)).fill(palette.card); doc.restore();
       doc.y = mm(18);
     }
   };
@@ -98,23 +93,15 @@ router.post('/share-bucket-pdf', async (req, res) => {
     return { w, h };
   };
 
-  // render chips in rows; returns { nextY, lastHeight }
   const chipsRow = (doc, startX, startY, items, color) => {
     if (!items || !items.length) return { nextY: startY, lastHeight: 0 };
-    let x = startX;
-    let y = startY;
-    let rowH = 0;
-    items.forEach((t, i) => {
+    let x = startX; let y = startY; let rowH = 0;
+    items.forEach((t) => {
       const { w, h } = chip(doc, x, y, t, color);
       rowH = Math.max(rowH, h);
       x += w + 6;
       const rightLimit = doc.page.width - mm(20);
-      if (x > rightLimit) {
-        // wrap to next line
-        x = startX;
-        y += rowH + 4;
-        rowH = 0;
-      }
+      if (x > rightLimit) { x = startX; y += rowH + 4; rowH = 0; }
     });
     return { nextY: y + (rowH || 0), lastHeight: rowH };
   };
@@ -128,44 +115,38 @@ router.post('/share-bucket-pdf', async (req, res) => {
     const y = doc.y + 4;
     doc.rect(mm(20), y, doc.page.width - mm(40), 1).fill(palette.divider);
     doc.restore();
-    doc.y = y + 10; // space after heading
+    doc.y = y + 10;
   };
 
-  // single row renderer with explicit y management (prevents overlap)
   const row = (doc, idx, title, rightText, catName, subcatName, genresArr, partsOrSeasonsArr, isMovie) => {
     ensurePageSpace(doc, mm(24));
     const startX = mm(24);
     const rightX = doc.page.width - mm(22);
 
-    // Title and right meta on the same baseline
     doc.save();
     doc.font('Helvetica-Bold').fontSize(11).fill(palette.text);
     const titleY = doc.y;
     const maxW = rightX - startX - 120;
     doc.text(`${idx}. ${title}`, startX, titleY, { width: maxW });
-    // compute baseline after title
     const afterTitleY = doc.y;
-    // Right meta (year • watched) aligned to titleY baseline
+
     doc.font('Helvetica').fontSize(10).fill(palette.accent2);
     const rtW = doc.widthOfString(rightText || '');
     doc.text(rightText || '', rightX - rtW, titleY);
-    // continue below whichever is lower
+
     let y = Math.max(afterTitleY, titleY + doc.currentLineHeight());
 
-    // Category / Subcategory chips
     const catChips = [catName || '—'].concat(subcatName ? [subcatName] : []);
     y += 4;
     let rowRes = chipsRow(doc, startX, y, catChips, palette.accent);
     y = rowRes.nextY;
 
-    // Genres chips
     if (genresArr && genresArr.length) {
       y += 6;
       rowRes = chipsRow(doc, startX, y, genresArr, palette.accent2);
       y = rowRes.nextY;
     }
 
-    // Parts / Seasons line (plain text to keep baseline tidy)
     if (partsOrSeasonsArr && partsOrSeasonsArr.length) {
       y += 8;
       ensurePageSpace(doc, mm(10));
@@ -175,11 +156,10 @@ router.post('/share-bucket-pdf', async (req, res) => {
       y = doc.y;
     }
 
-    // Divider and pad
     const divY = y + 8;
     doc.rect(mm(20), divY, doc.page.width - mm(40), 0.8).fill(palette.divider);
     doc.restore();
-    doc.y = divY + 8; // next row starts after divider
+    doc.y = divY + 8;
   };
 
   try {
@@ -191,7 +171,7 @@ router.post('/share-bucket-pdf', async (req, res) => {
       return res.status(400).json({ error: 'favorite_category not allowed.' });
     }
 
-    /* ---------- Fetch all rows with genres + parts/seasons ---------- */
+    /* ---------- Fetch all rows ---------- */
     const moviesSql = `
       SELECT
         f.favorite_id,
@@ -257,7 +237,7 @@ router.post('/share-bucket-pdf', async (req, res) => {
     const series = sRes.rows || [];
     const counts = { movies: movies.length, series: series.length, total: movies.length + series.length };
 
-    /* ---------- Build PDF ---------- */
+    /* ---------- Build PDF (to temp file) ---------- */
     const tmpDir = path.join(process.cwd(), 'tmp');
     if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
     const filename = `favorites_${user_id}_${Date.now()}.pdf`;
@@ -270,14 +250,13 @@ router.post('/share-bucket-pdf', async (req, res) => {
     // background
     doc.rect(0, 0, doc.page.width, doc.page.height).fill(palette.bg);
 
-    // static title per your request
     drawPageHeader(
       doc,
       'Ajay Kedar – Movies or Series List',
       `Bucket: ${favorite_category} • User #${user_id} • ${fmtStamp()}`
     );
 
-    // quick summary chips
+    // summary
     doc.font('Helvetica').fontSize(10).fill(palette.muted);
     const summaryY = doc.y;
     const { nextY } = chipsRow(
@@ -292,99 +271,80 @@ router.post('/share-bucket-pdf', async (req, res) => {
     // MOVIES
     sectionHeading(doc, 'Movies', counts.movies, palette.movie);
     if (!movies.length) {
-      doc.fill(palette.muted).font('Helvetica').fontSize(10)
-        .text('No movies in this bucket yet.', mm(24));
+      doc.fill(palette.muted).font('Helvetica').fontSize(10).text('No movies in this bucket yet.', mm(24));
       doc.y += 8;
     } else {
       movies.forEach((m, i) => {
         const metaRight = `${m.release_year || ''}${m.is_watched ? '  •  Watched' : ''}`;
-        row(
-          doc,
-          i + 1,
-          m.title,
-          metaRight,
-          m.category_name,
-          m.subcategory_name,
-          m.genres || [],
-          m.parts || [],
-          true
-        );
+        row(doc, i + 1, m.title, metaRight, m.category_name, m.subcategory_name, m.genres || [], m.parts || [], true);
       });
     }
 
     // SERIES
     sectionHeading(doc, 'Series', counts.series, palette.series);
     if (!series.length) {
-      doc.fill(palette.muted).font('Helvetica').fontSize(10)
-        .text('No series in this bucket yet.', mm(24));
+      doc.fill(palette.muted).font('Helvetica').fontSize(10).text('No series in this bucket yet.', mm(24));
       doc.y += 8;
     } else {
       series.forEach((s, i) => {
         const metaRight = `${s.release_year || ''}${s.is_watched ? '  •  Watched' : ''}`;
-        row(
-          doc,
-          i + 1,
-          s.title,
-          metaRight,
-          s.category_name,
-          s.subcategory_name,
-          s.genres || [],
-          s.seasons || [],
-          false
-        );
+        row(doc, i + 1, s.title, metaRight, s.category_name, s.subcategory_name, s.genres || [], s.seasons || [], false);
       });
     }
 
-    // footer
     doc.moveDown(1);
-    doc.fill(palette.muted).font('Helvetica').fontSize(8)
-      .text('Favorites • Generated by your app', mm(20));
+    doc.fill(palette.muted).font('Helvetica').fontSize(8).text('Favorites • Generated by your app', mm(20));
     drawPageFooter(doc);
 
-    // finalize
     doc.end();
     await new Promise((resolve, reject) => {
       stream.on('finish', resolve);
       stream.on('error', reject);
     });
 
-    /* ---------- Send email ---------- */
-    const transporter = process.env.SMTP_HOST
-      ? nodemailer.createTransport({
-          host: process.env.SMTP_HOST,
-          port: Number(process.env.SMTP_PORT || 465),
-          secure: String(process.env.SMTP_SECURE || 'true') === 'true',
-          auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
-        })
-      : nodemailer.createTransport({
-          service: 'gmail',
-          auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
-        });
+    /* ---------- Send email via Mailjet (Base64 attachment) ---------- */
+    const pdfBuffer = fs.readFileSync(filePath);
+    const base64Pdf = pdfBuffer.toString('base64');
 
-    const info = await transporter.sendMail({
-      from: process.env.EMAIL_FROM || process.env.EMAIL_USER,
-      to: to_email,
-      subject: `Favorites — ${favorite_category}`,
-      text: `Attached is the ${favorite_category} favorites list for user #${user_id}. Total items: ${counts.total}.`,
-      attachments: [{ filename: `Favorites - ${favorite_category}.pdf`, path: filePath }],
-    });
+    const subject = `Favorites — ${favorite_category}`;
+    const html = `
+      <p>Attached is the <b>${favorite_category}</b> favorites list for user #${user_id}.</p>
+      <p>Total items: <b>${counts.total}</b> (${counts.movies} movies, ${counts.series} series)</p>
+    `;
+    const text =
+      `Attached is the ${favorite_category} favorites list for user #${user_id}.\n` +
+      `Total items: ${counts.total} (${counts.movies} movies, ${counts.series} series)`;
+
+    await sendEmail(
+      to_email,
+      subject,
+      html,
+      text,
+      [
+        {
+          Filename: `Favorites - ${favorite_category}.pdf`,
+          ContentType: 'application/pdf',
+          Base64Content: base64Pdf,
+        },
+      ]
+    );
 
     // cleanup
     fs.unlink(filePath, () => {});
+
     return res.json({
       ok: true,
       sent_to: to_email,
       favorite_category,
       counts,
-      mail_response: info.response || 'sent',
+      mail_response: 'sent',
     });
   } catch (err) {
-    console.error('share-bucket-pdf error:', err);
+    console.error('share-bucket-pdf error:', err?.response?.data || err);
     if (filePath) { try { fs.unlinkSync(filePath); } catch (_) {} }
     return res.status(500).json({ error: 'Failed to generate or send PDF' });
   }
 });
-
 
 
 // GET /api/favorites/bucket?user_id=&favorite_category=
