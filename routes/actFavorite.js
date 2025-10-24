@@ -62,19 +62,23 @@ function safeNormalizeImages(input) {
 // Convert DB row's images / images_raw into arrays consistently
 function coerceImagesOut(value) {
   if (value == null) return null;
-  if (Array.isArray(value)) return value;
+  if (Array.isArray(value)) return value; // jsonb[] parsed by pg as JS array
+
   if (typeof value === "string") {
     const parsed = parseJSONMaybe(value);
     if (Array.isArray(parsed)) return parsed;
     if (parsed != null) return [String(parsed)];
-    // string but not JSON → maybe CSV?
     if (value.includes(",")) {
       return value.split(",").map((x) => x.trim()).filter(Boolean);
     }
     return [value];
   }
-  // PG json/jsonb already comes as object/array
-  return Array.isArray(value) ? value : [String(value)];
+  // jsonb objects from pg
+  try {
+    return Array.isArray(value) ? value : [String(value)];
+  } catch {
+    return [String(value)];
+  }
 }
 
 // PostgreSQL error → HTTP
@@ -135,15 +139,64 @@ const mapRow = (r) => ({
 
 /* ---------------- Routes ---------------- */
 
-// GET / → list all
-router.get("/", async (_req, res) => {
+/**
+ * GET /            → list all (optional filters: ?q=, ?country=, ?name=, ?series=)
+ * GET /countries   → list countries
+ * GET /:id         → get single
+ * POST /           → create (images accepted as array/CSV/JSON/string)
+ * PATCH /:id       → update (replace images if provided)
+ * POST /:id/images/append → append images only (no replacement, no double-append)
+ * DELETE /:id      → delete
+ */
+
+// GET / → list all (with simple filters)
+router.get("/", async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      `SELECT f.*, c.country_name
-         FROM user_act_favorite f
-    LEFT JOIN country_list c ON c.id = f.country_id
-     ORDER BY f.created_at DESC, f.id DESC`
-    );
+    const { q, country, name, series } = req.query;
+
+    const where = [];
+    const params = [];
+    let i = 1;
+
+    if (country) {
+      // allow id or exact country name
+      const maybeNum = Number(country);
+      if (Number.isFinite(maybeNum) && maybeNum > 0) {
+        where.push(`f.country_id = $${i++}`);
+        params.push(Math.trunc(maybeNum));
+      } else {
+        where.push(`c.country_name = $${i++}`);
+        params.push(String(country).trim());
+      }
+    }
+    if (name) {
+      where.push(`lower(f.favorite_actress_name) LIKE lower($${i++})`);
+      params.push(String(name).trim() + "%");
+    }
+    if (series) {
+      where.push(`lower(f.favorite_movie_series) LIKE lower($${i++})`);
+      params.push(String(series).trim() + "%");
+    }
+    if (q) {
+      // broad text search on name, series, notes
+      where.push(`(
+        lower(f.favorite_actress_name) LIKE lower($${i})
+        OR lower(f.favorite_movie_series) LIKE lower($${i})
+        OR lower(COALESCE(f.notes, '')) LIKE lower($${i})
+      )`);
+      params.push(`%${String(q).trim()}%`);
+      i++;
+    }
+
+    const sql = `
+      SELECT f.*, c.country_name
+        FROM user_act_favorite f
+   LEFT JOIN country_list c ON c.id = f.country_id
+       ${where.length ? "WHERE " + where.join(" AND ") : ""}
+    ORDER BY f.created_at DESC, f.id DESC
+    `;
+
+    const { rows } = await pool.query(sql, params);
     res.json(rows.map(mapRow));
   } catch (err) {
     const { status, message } = normalizePgError(err);
@@ -185,7 +238,7 @@ router.get("/:id", async (req, res) => {
   }
 });
 
-// POST /
+// POST / (create)
 router.post("/", async (req, res) => {
   try {
     const {
@@ -224,6 +277,9 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ error: String(e.message || "Invalid images") });
     }
 
+    // IMPORTANT:
+    // We set BOTH images_raw and images to the same JSON array/string.
+    // The DB trigger will ensure 'images' is an array and keeps it consistent.
     const sql = `
       INSERT INTO user_act_favorite
         (country_id, favorite_actress_name, age, actress_dob,
@@ -254,7 +310,8 @@ router.post("/", async (req, res) => {
   }
 });
 
-// PATCH /:id
+// PATCH /:id (update fields; replaces images if provided)
+// If you want append-only, use POST /:id/images/append
 router.patch("/:id", async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
@@ -308,6 +365,7 @@ router.patch("/:id", async (req, res) => {
     }
 
     if (req.body.images !== undefined) {
+      // REPLACE images completely (not append)
       let imagesVal = null;
       try {
         imagesVal = safeNormalizeImages(req.body.images);
@@ -337,6 +395,41 @@ router.patch("/:id", async (req, res) => {
     const cid = newCountryId ?? rows[0].country_id;
     const { rows: c } = await pool.query("SELECT country_name FROM country_list WHERE id=$1", [
       cid,
+    ]);
+    res.json(mapRow({ ...rows[0], country_name: c[0]?.country_name || null }));
+  } catch (err) {
+    const { status, message } = normalizePgError(err);
+    res.status(status).json({ error: message });
+  }
+});
+
+// POST /:id/images/append → append images (no replacement)
+// IMPORTANT: we update images directly (NOT images_raw), to avoid trigger re-appending.
+router.post("/:id/images/append", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
+
+  try {
+    let toAppend = safeNormalizeImages(req.body?.images);
+    if (!toAppend || toAppend.length === 0) {
+      return res.status(400).json({ error: "images required (array/CSV/JSON/string)" });
+    }
+
+    // Build JSON array once
+    const asJson = JSON.stringify(toAppend);
+
+    const sql = `
+      UPDATE user_act_favorite
+         SET images = COALESCE(images, '[]'::jsonb) || $1::jsonb,
+             updated_at = NOW()
+       WHERE id = $2
+   RETURNING *`;
+    const { rows } = await pool.query(sql, [asJson, id]);
+    if (rows.length === 0) return res.status(404).json({ error: "Not found" });
+
+    // Fetch country_name for mapper
+    const { rows: c } = await pool.query("SELECT country_name FROM country_list WHERE id=$1", [
+      rows[0].country_id,
     ]);
     res.json(mapRow({ ...rows[0], country_name: c[0]?.country_name || null }));
   } catch (err) {
