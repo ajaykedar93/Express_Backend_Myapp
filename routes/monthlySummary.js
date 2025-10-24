@@ -2,8 +2,13 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db");
 const PDFDocument = require("pdfkit");
-const nodemailer = require("nodemailer");
 require("dotenv").config();
+
+// Mailer (Mailjet HTTPS API): sendOTP / sendEmail
+const { sendOTP, sendEmail } = require('../utils/mailer');
+
+
+
 
 // ---------------- Helpers ----------------
 const format = (num) =>
