@@ -3,9 +3,13 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db"); // PostgreSQL client
 const PDFDocument = require("pdfkit");
-const nodemailer = require("nodemailer");
 require("dotenv").config();
 const { body, validationResult } = require("express-validator");
+
+
+
+// Mailer (Mailjet HTTPS API): sendOTP / sendEmail
+const { sendEmail } = require("../utils/mailer"); // Mailjet version
 
 /* ---------------- Helpers ---------------- */
 const formatDate = (dateStr) => {
@@ -756,6 +760,7 @@ router.get("/transactions/monthly-total/pdf", async (req, res) => {
   }
 });
 
+
 // 8) SEND current-month PDF via email (same perfect-fit layout)
 router.post(
   "/transactions/monthly-total/email",
@@ -781,6 +786,7 @@ router.post(
         }
       }
 
+      // You already have these helpers elsewhere
       const data = await fetchCurrentMonthData(category_id, subcategory_id);
 
       const pdfBuffer = await buildCurrentMonthPDF({
@@ -792,30 +798,36 @@ router.post(
         collectBuffer: true,
       });
 
-      const transporter = nodemailer.createTransport({
-        service: "gmail",
-        auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
-      });
+      const subject =
+        `Transaction Report — ${data.label} (${data.categoryName}` +
+        `${data.subcategoryName ? " / " + data.subcategoryName : ""})`;
 
-      const subject = `Transaction Report — ${data.label} (${data.categoryName}${data.subcategoryName ? " / " + data.subcategoryName : ""})`;
+      // Mailjet: Base64 attachment
+      const base64Pdf = pdfBuffer.toString("base64");
+      const safeName =
+        `Transactions_${data.label}_${data.categoryName}` +
+        `${data.subcategoryName ? "_" + data.subcategoryName : ""}`
+          .replace(/[^\w\-]+/g, "_") + ".pdf";
 
-      await transporter.sendMail({
-        from: process.env.EMAIL_USER,
-        to: email,
+      await sendEmail(
+        email,
         subject,
-        text: `Please find attached your transaction report for ${data.label}.\nCategory: ${data.categoryName}\nSubcategory: ${data.subcategoryName || "All"}`,
-        attachments: [
+        `<p>Please find attached your transaction report for <b>${data.label}</b>.<br/>Category: <b>${data.categoryName}</b><br/>Subcategory: <b>${data.subcategoryName || "All"}</b></p>`,
+        `Please find attached your transaction report for ${data.label}.
+Category: ${data.categoryName}
+Subcategory: ${data.subcategoryName || "All"}`,
+        [
           {
-            filename: `Transactions_${data.label}_${data.categoryName}${data.subcategoryName ? "_" + data.subcategoryName : ""}.pdf`.replace(/[^\w\-]+/g, "_"),
-            content: pdfBuffer,
-            contentType: "application/pdf",
+            Filename: safeName,
+            ContentType: "application/pdf",
+            Base64Content: base64Pdf,
           },
-        ],
-      });
+        ]
+      );
 
       res.json({ message: `PDF sent successfully to ${email}` });
     } catch (err) {
-      console.error("Email send error:", err);
+      console.error("Email send error:", err?.response?.data || err);
       res.status(502).json({ error: "Failed to send email." });
     }
   }
