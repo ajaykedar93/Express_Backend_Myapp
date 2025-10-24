@@ -465,17 +465,19 @@ router.get("/monthly-summary/download", async (req, res) => {
     res.status(500).json({ message: "Internal server error." });
   }
 });
-
-// ----------------- Monthly Summary Email API -----------------
+// ----------------- Monthly Summary Email API (Mailjet Version) -----------------
 router.post("/monthly-summary/send", async (req, res) => {
   try {
     const { month, year, formatType, email } = req.body;
+
+    // Validation
     if (!month || !year || !formatType || !email) {
       return res
         .status(400)
         .json({ message: "Month, year, formatType, and email are required." });
     }
 
+    // Query database
     const query = `
       SELECT
         dt.sequence_no,
@@ -494,19 +496,22 @@ router.post("/monthly-summary/send", async (req, res) => {
         AND EXTRACT(YEAR FROM dt.transaction_date) = $2
       ORDER BY dt.transaction_date, dt.sequence_no;
     `;
+
     const result = await db.query(query, [month, year]);
     const transactions = result.rows;
 
-    if (!transactions.length)
+    // Handle no records
+    if (!transactions.length) {
       return res.status(404).json({ message: "No transactions found." });
+    }
 
     const monthName = new Date(year, month - 1).toLocaleString("default", {
       month: "long",
     });
     const title = `${monthName} ${year} Transactions`;
 
+    // ---------------- PDF FORMAT ----------------
     if (formatType === "pdf") {
-      // Generate attractive PDF buffer
       const pdfBuffer = await buildMonthlyPDF({
         title,
         monthName,
@@ -515,25 +520,28 @@ router.post("/monthly-summary/send", async (req, res) => {
         collectBuffer: true,
       });
 
-      const transporter = nodemailer.createTransport({
-        service: "gmail",
-        auth: {
-          user: process.env.EMAIL_USER,
-          pass: process.env.EMAIL_PASS,
-        },
-      });
+      // Convert to Base64 for Mailjet attachment
+      const base64Pdf = pdfBuffer.toString("base64");
 
-      await transporter.sendMail({
-        from: process.env.EMAIL_USER,
-        to: email,
-        subject: `Monthly Transactions - ${monthName} ${year}`,
-        text: `Please find attached your transaction report for ${monthName} ${year}.`,
-        attachments: [{ filename: `${title}.pdf`, content: pdfBuffer }],
-      });
+      await sendEmail(
+        email,
+        `Monthly Transactions - ${monthName} ${year}`,
+        `<p>Please find attached your transaction report for <b>${monthName} ${year}</b>.</p>`,
+        `Please find attached your transaction report for ${monthName} ${year}.`,
+        [
+          {
+            Filename: `${title}.pdf`,
+            ContentType: "application/pdf",
+            Base64Content: base64Pdf,
+          },
+        ]
+      );
 
       return res.json({ message: `PDF sent successfully to ${email}` });
-    } else if (formatType === "text") {
-      // Text version (with Qty column)
+    }
+
+    // ---------------- TEXT FORMAT ----------------
+    else if (formatType === "text") {
       let txt = `*** ${title} ***\n\n`;
       let currentDate = "";
       let seq = 1;
@@ -548,7 +556,10 @@ router.post("/monthly-summary/send", async (req, res) => {
           txt += `\nDate: ${currentDate}\n`;
           txt += `No | Amount | Type | Category | Subcategory | Qty | Purpose\n`;
         }
-        txt += `${seq}. ${format(t.amount)} | ${t.type} | ${t.category} | ${t.subcategory || "-"} | ${t.quantity ?? 0} | ${t.purpose || "-"}\n`;
+
+        txt += `${seq}. ${format(t.amount)} | ${t.type} | ${t.category} | ${
+          t.subcategory || "-"
+        } | ${t.quantity ?? 0} | ${t.purpose || "-"}\n`;
         seq++;
 
         if (t.type === "debit") monthTotalDebit += parseFloat(t.amount);
@@ -560,30 +571,28 @@ router.post("/monthly-summary/send", async (req, res) => {
       txt += `Total Debit (${monthName}): ${format(monthTotalDebit)}\n`;
       txt += `Total Credit (${monthName}): ${format(monthTotalCredit)}\n`;
 
-      const transporter = nodemailer.createTransport({
-        service: "gmail",
-        auth: {
-          user: process.env.EMAIL_USER,
-          pass: process.env.EMAIL_PASS,
-        },
-      });
-
-      await transporter.sendMail({
-        from: process.env.EMAIL_USER,
-        to: email,
-        subject: `Monthly Transactions - ${monthName} ${year}`,
-        text: txt,
-      });
+      await sendEmail(
+        email,
+        `Monthly Transactions - ${monthName} ${year}`,
+        `<pre style="font-family: monospace; white-space: pre-wrap;">${txt}</pre>`,
+        txt
+      );
 
       return res.json({ message: `Text report sent successfully to ${email}` });
-    } else {
+    }
+
+    // ---------------- INVALID FORMAT ----------------
+    else {
       return res
         .status(400)
         .json({ message: "Invalid formatType. Use 'pdf' or 'text' only." });
     }
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Internal server error." });
+    console.error("[monthly-summary/send] error:", err?.response?.data || err);
+    return res.status(500).json({
+      message: "Internal server error.",
+      detail: err?.response?.data || err?.message || String(err),
+    });
   }
 });
 

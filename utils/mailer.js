@@ -9,15 +9,18 @@ const mailjet = Mailjet.apiConnect(
 );
 
 /**
- * Send generic email via Mailjet HTTPS API
- * @param {string|string[]} to
- * @param {string} subject
- * @param {string} html
+ * Generic mailer using Mailjet HTTPS API
+ * @param {string|string[]} to - Recipient email(s)
+ * @param {string} subject - Email subject
+ * @param {string} html - HTML body
+ * @param {string} [text] - Plain text fallback
+ * @param {Array} [attachments] - Optional attachments [{Filename, ContentType, Base64Content}]
  */
-async function sendEmail(to, subject, html) {
+async function sendEmail(to, subject, html, text = "", attachments = []) {
   try {
     const toList = Array.isArray(to) ? to : [to];
-    const result = await mailjet.post("send", { version: "v3.1" }).request({
+
+    const request = await mailjet.post("send", { version: "v3.1" }).request({
       Messages: [
         {
           From: {
@@ -26,24 +29,23 @@ async function sendEmail(to, subject, html) {
           },
           To: toList.map((email) => ({ Email: email })),
           Subject: subject,
+          TextPart: text,
           HTMLPart: html,
+          Attachments: attachments,
         },
       ],
     });
 
-    console.log("✅ Mailjet email sent:", result.body.Messages[0].To);
-    return result.body;
+    console.log("✅ Mailjet email sent:", request.body.Messages[0].To);
+    return request.body;
   } catch (error) {
     console.error("❌ Mailjet send failed:", error?.response?.data || error);
-    throw new Error("Email sending failed");
+    throw new Error("Email sending failed via Mailjet API");
   }
 }
 
 /**
- * Send OTP email (My_App branding)
- * @param {string} to
- * @param {string|number} otp
- * @param {number} [expiresInMins=10]
+ * Send OTP Email (branded)
  */
 async function sendOTP(to, otp, expiresInMins = 10) {
   const subject = `Your My_App OTP: ${otp}`;
@@ -62,7 +64,6 @@ async function sendOTP(to, otp, expiresInMins = 10) {
       <p style="font-size:11px; color:#999; text-align:center;">© ${new Date().getFullYear()} My_App</p>
     </div>
   `;
-
   return sendEmail(to, subject, html);
 }
 
