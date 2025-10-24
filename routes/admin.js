@@ -5,7 +5,7 @@ const jwt = require('jsonwebtoken');
 const upload = require('../middleware/multer');
 const bcrypt = require('bcryptjs');
 
-// <-- NEW: use your OAuth2 mailer helpers
+// Mailer (Mailjet HTTPS API): sendOTP / sendEmail
 const { sendOTP, sendEmail } = require('../utils/mailer');
 
 const router = express.Router();
@@ -268,7 +268,6 @@ router.get('/get-names-and-profiles', async (req, res) => {
 //                         FORGOT PASSWORD (OTP) FLOW
 // ============================================================================
 
-// Util: create OTP
 function generateOtp() {
   return Math.floor(100000 + Math.random() * 900000).toString(); // 6 digits
 }
@@ -309,16 +308,16 @@ router.post('/forgot/request-otp', async (req, res) => {
       [email, otpHash]
     );
 
-    // Send email via OAuth2 mailer -> sender name = "My_App"
+    // Send email via Mailjet HTTPS mailer -> sender name = "My_App"
     try {
       await sendOTP(email, otp, 20);
     } catch (e) {
-      console.error('[forgot/request-otp] sendOTP failed:', e?.message || e);
-      // Continue response; client can retry; we already stored OTP
+      console.error('[forgot/request-otp] sendOTP failed:', e?.response?.data || e?.message || e);
+      return res.status(502).json({ error: 'Email sending failed', detail: e?.response?.data || e?.message || String(e) });
     }
 
     return res.status(200).json({
-      message: 'OTP generated; email sent if configured',
+      message: 'OTP generated; email sent',
       request_id: ins[0].id,
       expires_at: ins[0].expires_at,
     });
