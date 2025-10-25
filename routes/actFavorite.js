@@ -453,4 +453,110 @@ router.delete("/:id", async (req, res) => {
   }
 });
 
+// DELETE images (ALL / by URLs / by indexes)
+// POST /api/act_favorite/:id/images/delete
+// Body:
+// { "all": true }                                  // delete ALL (sets images = NULL)
+// { "urls": ["https://a.jpg","https://b.jpg"] }    // delete by exact URLs
+// { "indexes": [0, 3, 5] }                         // delete by 0-based indexes
+// You may combine "urls" and "indexes". If "all" is true, others are ignored.
+router.post("/:id/images/delete", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
+
+  try {
+    const { all } = req.body || {};
+
+    // normalize urls (optional)
+    let urls = null;
+    if (req.body?.urls !== undefined) {
+      try {
+        const arr = safeNormalizeImages(req.body.urls); // array or null
+        urls = arr && arr.length ? arr : null;
+      } catch (e) {
+        return res.status(400).json({ error: String(e.message || "Invalid urls") });
+      }
+    }
+
+    // normalize indexes (optional) -> convert client 0-based to SQL 1-based ordinality
+    let idxs = null;
+    if (req.body?.indexes !== undefined) {
+      if (!Array.isArray(req.body.indexes)) {
+        return res.status(400).json({ error: "indexes must be an array of integers" });
+      }
+      const cleaned = [];
+      for (const v of req.body.indexes) {
+        const n = Number(v);
+        if (!Number.isInteger(n) || n < 0) {
+          return res.status(400).json({ error: "indexes must be non-negative integers (0-based)" });
+        }
+        cleaned.push(n + 1); // 1-based for WITH ORDINALITY
+      }
+      idxs = cleaned.length ? cleaned : null;
+    }
+
+    if (!all && !urls && !idxs) {
+      return res.status(400).json({ error: "Provide one of: all=true, urls, indexes" });
+    }
+
+    // 1) Delete ALL -> set images = NULL
+    if (all === true) {
+      const { rows } = await pool.query(
+        `UPDATE user_act_favorite
+            SET images = NULL,
+                updated_at = NOW()
+          WHERE id = $1
+      RETURNING *`,
+        [id]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: "Not found" });
+
+      const { rows: c } = await pool.query("SELECT country_name FROM country_list WHERE id=$1", [
+        rows[0].country_id,
+      ]);
+      return res.json(mapRow({ ...rows[0], country_name: c[0]?.country_name || null }));
+    }
+
+    // 2) Partial delete -> filter JSONB array using URLs and/or indexes
+    const { rows } = await pool.query(
+      `
+      WITH curr AS (
+        SELECT e, ord::int
+        FROM jsonb_array_elements(
+               COALESCE((SELECT images FROM user_act_favorite WHERE id=$1), '[]'::jsonb)
+             ) WITH ORDINALITY AS t(e, ord)
+      ),
+      filtered AS (
+        SELECT e
+        FROM curr
+        WHERE
+          ($2::text[] IS NULL OR NOT ((e #>> '{}') = ANY($2::text[])))
+          AND
+          ($3::int[]  IS NULL OR NOT (ord = ANY($3::int[])))
+      ),
+      upd AS (
+        UPDATE user_act_favorite
+           SET images = (SELECT CASE WHEN COUNT(*) = 0 THEN '[]'::jsonb ELSE jsonb_agg(e) END FROM filtered),
+               updated_at = NOW()
+         WHERE id = $1
+     RETURNING *
+      )
+      SELECT * FROM upd
+      `,
+      [id, urls, idxs]
+    );
+
+    if (rows.length === 0) return res.status(404).json({ error: "Not found" });
+
+    const { rows: c } = await pool.query("SELECT country_name FROM country_list WHERE id=$1", [
+      rows[0].country_id,
+    ]);
+    return res.json(mapRow({ ...rows[0], country_name: c[0]?.country_name || null }));
+  } catch (err) {
+    const { status, message } = normalizePgError(err);
+    return res.status(status).json({ error: message });
+  }
+});
+
+
 module.exports = router;
