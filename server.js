@@ -28,6 +28,7 @@ const libraryRouter = require("./routes/library");
 
 
 
+
 // Documents
 const documentRouter = require("./routes/document");
 
@@ -65,6 +66,9 @@ const investmentTradingJournalRouter = require("./routes/investment_tradingjourn
 
 const userInvestmentRoutes = require('./routes/user_investment');
 const passwordManagerRoutes = require("./routes/passwordManager"); // <- see file below
+// const adminImpDocumentRouter = require("./routes/admin_impdocument");
+const adminImpDocumentRouter = require("./routes/imodocument");
+
 
 /* ---------------- Routes ---------------- */
 // Media
@@ -116,6 +120,11 @@ app.use("/api", require("./routes/passwordManager"));
 app.use("/api/act_favorite", require("./routes/actFavorite"));
 app.use("/api/notes", require("./routes/notes")); // ✅ Mount Notes API
 app.use("/api", require("./routes/websites")); // ✅ your router
+
+
+app.use("/api/admin_impdocument", adminImpDocumentRouter);
+
+
 
 /* ---------------- Health Check ---------------- */
 app.get("/health", (_req, res) => res.json({ status: "OK" }));

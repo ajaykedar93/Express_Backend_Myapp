@@ -21,7 +21,7 @@ const fileFilter = (req, file, cb) => {
 const upload = multer({
   storage: storage,                           // Store files in memory
   fileFilter: fileFilter,                     // Validate file types
-  limits: { fileSize: 5 * 1024 * 1024 },      // Max file size of 5MB
+  limits: { fileSize: 100 * 1024 * 1024 },      // Max file size of 100MB
 }).single('profile_photo');                    // Handle single file upload with field name 'profile_photo'
 
 // Middleware to handle Multer errors more clearly
