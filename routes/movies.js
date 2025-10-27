@@ -315,16 +315,7 @@ router.post("/", async (req, res) => {
   const yr = toInt(release_year);
   const subId = (subcategory_id == null || subcategory_id === "") ? null : toInt(subcategory_id);
   const pgId = (primary_genre_id == null || primary_genre_id === "") ? null : toInt(primary_genre_id);
-  const iwParsed = parseBoolLoose(is_watched);
-  const iw = iwParsed === null ? false : iwParsed;
-
-  // normalize genres to int[]
-  let normGenreIds = [];
-  if (Array.isArray(genre_ids)) {
-    normGenreIds = genre_ids
-      .map((x) => Number.parseInt(x, 10))
-      .filter((n) => Number.isInteger(n));
-  }
+  const iw = parseBoolLoose(is_watched); // null => not provided
 
   if (!isInt(catId)) return res.status(400).json({ error: "category_id must be integer" });
   if (!between(yr, 1888, 2100))
@@ -345,17 +336,6 @@ router.post("/", async (req, res) => {
     if (!c.rowCount) {
       await client.query("ROLLBACK");
       return res.status(400).json({ error: "Category does not exist" });
-    }
-
-    if (subId != null) {
-      const sc = await client.query(
-        `SELECT 1 FROM subcategories WHERE subcategory_id=$1 AND category_id=$2`,
-        [subId, catId]
-      );
-      if (!sc.rowCount) {
-        await client.query("ROLLBACK");
-        return res.status(400).json({ error: "subcategory_id does not belong to category_id" });
-      }
     }
 
     if (pgId != null) {
@@ -385,23 +365,33 @@ router.post("/", async (req, res) => {
       return res.status(409).json({ error: "Duplicate movie exists (name+category+year+subcategory)" });
     }
 
+    // name-only dup
+    const dupNameOnly = await client.query(
+      `SELECT 1 FROM movies WHERE INITCAP(movie_name)=INITCAP($1) LIMIT 1;`,
+      [movieNameNorm]
+    );
+    if (dupNameOnly.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Duplicate movie name exists" });
+    }
+
     // insert
     const ins = await client.query(
       `INSERT INTO movies
          (movie_name, category_id, subcategory_id, release_year, poster_url, is_watched, primary_genre_id)
        VALUES (INITCAP($1), $2, $3, $4, $5, $6, $7)
        RETURNING movie_id;`,
-      [movieNameNorm, catId, subId, yr, poster_url, iw, pgId]
+      [movieNameNorm, catId, subId, yr, poster_url, iw === null ? false : iw, pgId]
     );
     const movieId = ins.rows[0].movie_id;
 
     // genres
-    if (normGenreIds.length) {
+    if (Array.isArray(genre_ids) && genre_ids.length) {
       await client.query(
         `INSERT INTO movie_genres (movie_id, genre_id)
          SELECT $1, UNNEST($2::int[])
          ON CONFLICT DO NOTHING;`,
-        [movieId, normGenreIds]
+        [movieId, genre_ids]
       );
     }
 
