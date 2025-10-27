@@ -2,6 +2,7 @@
 // Professional APIs for websites + websitecategory, using pg pool and multer for uploads.
 
 const express = require("express");
+const crypto = require("crypto");
 const multer = require("multer");
 
 const router = express.Router();
@@ -14,7 +15,7 @@ const upload = multer({
   fileFilter: (req, file, cb) => {
     const ok =
       file.mimetype &&
-      /^image\/(png|jpeg|jpg|webp|gif|bmp|svg\+xml)$/.test(file.mimetype);
+      /^image\/(png|jpeg|jpg|webp|gif|bmp|svg\+xml)$/i.test(file.mimetype);
     if (!ok) return cb(new Error("Only image files are allowed."));
     cb(null, true);
   },
@@ -27,6 +28,20 @@ const toInt = (v, def) => {
   const n = Number.parseInt(v, 10);
   return Number.isFinite(n) && n > 0 ? n : def;
 };
+const statusFromMsg = (msg) =>
+  /not found/i.test(msg) ? 404 :
+  /invalid|bad request|validation/i.test(msg) ? 400 : 500;
+
+function handleError(res, err, fallbackMsg = "Internal server error") {
+  // Keep messages user-safe (DB details can leak via err.detail/hint)
+  const raw =
+    err?.message ||
+    err?.code ||
+    String(fallbackMsg);
+  const status = statusFromMsg(raw);
+  return res.status(status).json({ error: raw });
+}
+
 const mapWebsiteRow = (r, { withImageBytes = false } = {}) => {
   const {
     id,
@@ -64,18 +79,15 @@ const mapWebsiteRow = (r, { withImageBytes = false } = {}) => {
   return base;
 };
 
-function handleError(res, err, fallbackMsg = "Internal server error") {
-  const msg =
-    err?.message ||
-    err?.detail ||
-    err?.hint ||
-    err?.code ||
-    String(fallbackMsg);
-  const status =
-    /not found/i.test(msg) ? 404 :
-    /invalid|bad request|validation/i.test(msg) ? 400 :
-    500;
-  return res.status(status).json({ error: msg });
+// Small utility: set cache/etag headers for image responses
+function setImageHeaders(res, bytes, mime, filename) {
+  const etag = crypto.createHash("sha1").update(bytes).digest("hex");
+  res.setHeader("Content-Type", mime || "application/octet-stream");
+  res.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(filename || "image")}"`);
+  res.setHeader("ETag", etag);
+  res.setHeader("Cache-Control", "public, max-age=86400, immutable"); // 1 day
+  res.setHeader("Content-Length", Buffer.byteLength(bytes));
+  return etag;
 }
 
 // ======================================================
@@ -111,17 +123,13 @@ router.get("/websites", async (req, res) => {
     const params = [];
 
     if (q) {
-      params.push(`%${q}%`);
-      params.push(`%${q}%`);
-      where.push(
-        `(url ILIKE $${params.length - 1} OR name ILIKE $${params.length})`
-      );
+      params.push(`%${q}%`, `%${q}%`);
+      where.push(`(url ILIKE $${params.length - 1} OR name ILIKE $${params.length})`);
     }
     if (category) {
       params.push(category);
       where.push(`category = $${params.length}`);
     }
-
     const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
     const countSql = `SELECT COUNT(*)::int AS total FROM user_websites ${whereSql}`;
@@ -161,8 +169,8 @@ router.get("/websites/:id", async (req, res) => {
 
     const { rows } = await pool.query(
       `SELECT *
-       FROM user_websites
-       WHERE id = $1`,
+         FROM user_websites
+        WHERE id = $1`,
       [id]
     );
 
@@ -172,6 +180,38 @@ router.get("/websites/:id", async (req, res) => {
 
     const row = rows[0];
     return res.json(mapWebsiteRow(row, { withImageBytes: withImage }));
+  } catch (err) {
+    return handleError(res, err);
+  }
+});
+
+/**
+ * HEAD /websites/:id/image
+ * Quick metadata check (cache/etag) without body
+ */
+router.head("/websites/:id/image", async (req, res) => {
+  try {
+    const id = Number.parseInt(req.params.id, 10);
+    if (!Number.isFinite(id)) throw new Error("Invalid id");
+
+    const { rows } = await pool.query(
+      `SELECT image_bytes, image_mime, image_name
+         FROM user_websites
+        WHERE id = $1`,
+      [id]
+    );
+
+    if (!rows.length || !rows[0].image_bytes) {
+      return res.status(404).end();
+    }
+
+    const { image_bytes, image_mime, image_name } = rows[0];
+    const etag = setImageHeaders(res, image_bytes, image_mime, image_name);
+    if (req.headers["if-none-match"] === etag) {
+      return res.status(304).end();
+    }
+    // HEAD -> no body
+    return res.status(200).end();
   } catch (err) {
     return handleError(res, err);
   }
@@ -188,8 +228,8 @@ router.get("/websites/:id/image", async (req, res) => {
 
     const { rows } = await pool.query(
       `SELECT image_bytes, image_mime, image_name
-       FROM user_websites
-       WHERE id = $1`,
+         FROM user_websites
+        WHERE id = $1`,
       [id]
     );
 
@@ -198,11 +238,10 @@ router.get("/websites/:id/image", async (req, res) => {
     }
 
     const { image_bytes, image_mime, image_name } = rows[0];
-    res.setHeader("Content-Type", image_mime || "application/octet-stream");
-    res.setHeader(
-      "Content-Disposition",
-      `inline; filename="${encodeURIComponent(image_name || `screenshot_${id}`)}"`
-    );
+    const etag = setImageHeaders(res, image_bytes, image_mime, image_name);
+    if (req.headers["if-none-match"] === etag) {
+      return res.status(304).end();
+    }
     return res.send(image_bytes);
   } catch (err) {
     return handleError(res, err);
@@ -211,7 +250,7 @@ router.get("/websites/:id/image", async (req, res) => {
 
 /**
  * POST /websites
- * Accepts either:
+ * Accepts:
  *  - multipart/form-data with fields: url, name?, category?, image?
  *  - application/json: { url, name?, category?, image_base64?, image_mime?, image_name? }
  */
@@ -228,7 +267,7 @@ router.post("/websites", upload.single("image"), async (req, res) => {
         .json({ error: "Invalid or missing URL (must start with http/https)" });
     }
 
-    // Handle image: either from multipart file or JSON base64
+    // Image: from multipart file OR JSON base64
     let imageBytes = null;
     let imageMime = null;
     let imageName = null;
@@ -340,7 +379,6 @@ router.put("/websites/:id", upload.single("image"), async (req, res) => {
       return res.status(400).json({ error: "No fields to update" });
     }
 
-    // updated_at will be set by trigger
     const sql = `
       UPDATE user_websites
          SET ${sets.join(", ")}
@@ -379,7 +417,7 @@ router.delete("/websites/:id", async (req, res) => {
 });
 
 // ======================================================
-// WEBSITE CATEGORY  (no /categories; using /websitecategory)
+// WEBSITE CATEGORY (no /categories; using /websitecategory)
 // ======================================================
 
 /**
@@ -400,7 +438,7 @@ router.get("/websitecategory", async (_req, res) => {
 
 /**
  * POST /websitecategory
- * Body: { name }git add .
+ * Body: { name }
  */
 router.post("/websitecategory", async (req, res) => {
   try {

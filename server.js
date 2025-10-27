@@ -125,6 +125,9 @@ app.use("/api", require("./routes/websites")); // ✅ your router
 app.use("/api/admin_impdocument", adminImpDocumentRouter);
 
 
+const userActFavoriteRoutes = require("./routes/userActFavorite");
+app.use("/api", userActFavoriteRoutes);
+
 
 /* ---------------- Health Check ---------------- */
 app.get("/health", (_req, res) => res.json({ status: "OK" }));
