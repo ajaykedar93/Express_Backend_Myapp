@@ -10,22 +10,33 @@ const pool = require("../db");
 const isNonEmptyString = (v) => typeof v === "string" && v.trim().length > 0;
 const isPositiveInt = (n) => Number.isInteger(n) && n > 0;
 
+// Try to parse JSON; if it fails, return null
 function parseJSONMaybe(s) {
-  try { return JSON.parse(s); } catch { return null; }
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
 }
 
-// Normalize images input: accept string, JSON array, CSV, or array → array|string[] or null
+// Normalize images input: accept string, JSON array, CSV, or array
+// Returns: array of strings (no empties) OR null
 function safeNormalizeImages(input) {
   if (input == null) return null;
 
+  // Array direct
   if (Array.isArray(input)) {
-    return input.map((x) => (x == null ? "" : String(x).trim())).filter(Boolean);
+    return input
+      .map((x) => (x == null ? "" : String(x).trim()))
+      .filter(Boolean);
   }
 
+  // String input
   if (typeof input === "string") {
     const s = input.trim();
     if (!s) return null;
 
+    // Try JSON parse
     const parsed = parseJSONMaybe(s);
     if (parsed != null) {
       return Array.isArray(parsed)
@@ -33,14 +44,17 @@ function safeNormalizeImages(input) {
         : [String(parsed).trim()].filter(Boolean);
     }
 
+    // Fallback: comma-separated
     if (s.includes(",")) {
-      return s.split(",").map((x) => x.trim()).filter(Boolean);
+      return s
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean);
     }
+
+    // Single string URL/value
     return [s];
   }
-
-  // allow numbers to pass-through as single string
-  if (typeof input === "number" && Number.isFinite(input)) return [String(input)];
 
   throw new Error("Invalid format for images");
 }
@@ -48,25 +62,23 @@ function safeNormalizeImages(input) {
 // Convert DB row's images / images_raw into arrays consistently
 function coerceImagesOut(value) {
   if (value == null) return null;
-  if (Array.isArray(value)) return value;
+  if (Array.isArray(value)) return value; // jsonb[] parsed by pg as JS array
 
   if (typeof value === "string") {
-    // Try parse JSON-array; else CSV; else wrap
     const parsed = parseJSONMaybe(value);
     if (Array.isArray(parsed)) return parsed;
     if (parsed != null) return [String(parsed)];
-    if (value.includes(",")) return value.split(",").map((x) => x.trim()).filter(Boolean);
+    if (value.includes(",")) {
+      return value.split(",").map((x) => x.trim()).filter(Boolean);
+    }
     return [value];
   }
-
-  // jsonb / objectish
+  // jsonb objects from pg
   try {
-    const s = JSON.stringify(value);
-    const parsed = parseJSONMaybe(s);
-    if (Array.isArray(parsed)) return parsed;
-    if (parsed != null) return [String(parsed)];
-  } catch {}
-  return [String(value)];
+    return Array.isArray(value) ? value : [String(value)];
+  } catch {
+    return [String(value)];
+  }
 }
 
 // PostgreSQL error → HTTP
@@ -108,7 +120,7 @@ async function resolveCountryId(countryField) {
   return rows[0].id;
 }
 
-// Row mapper
+// Row mapper (produces consistent JSON structure out)
 const mapRow = (r) => ({
   id: r.id,
   country_id: r.country_id,
@@ -128,83 +140,64 @@ const mapRow = (r) => ({
 /* ---------------- Routes ---------------- */
 
 /**
- * GET /            → list all (filters + pagination: ?q=&country=&name=&series=&page=&limit=)
+ * GET /            → list all (optional filters: ?q=, ?country=, ?name=, ?series=)
  * GET /countries   → list countries
  * GET /:id         → get single
  * POST /           → create (images accepted as array/CSV/JSON/string)
  * PATCH /:id       → update (replace images if provided)
  * POST /:id/images/append → append images only (no replacement, no double-append)
- * POST /:id/images/delete → delete images (all / by urls / by indexes)
- * DELETE /:id      → delete record
+ * DELETE /:id      → delete
  */
 
-// GET / → list all (filters + pagination)
+// GET / → list all (with simple filters)
 router.get("/", async (req, res) => {
   try {
     const { q, country, name, series } = req.query;
-
-    // pagination
-    let page = parseInt(req.query.page, 10);
-    let limit = parseInt(req.query.limit, 10);
-    if (!Number.isFinite(page) || page < 1) page = 1;
-    if (!Number.isFinite(limit) || limit < 1) limit = 12;
-    if (limit > 50) limit = 50; // safety cap
-    const offset = (page - 1) * limit;
 
     const where = [];
     const params = [];
     let i = 1;
 
     if (country) {
+      // allow id or exact country name
       const maybeNum = Number(country);
       if (Number.isFinite(maybeNum) && maybeNum > 0) {
         where.push(`f.country_id = $${i++}`);
         params.push(Math.trunc(maybeNum));
       } else {
-        where.push(`LOWER(c.country_name) = LOWER($${i++})`);
+        where.push(`c.country_name = $${i++}`);
         params.push(String(country).trim());
       }
     }
     if (name) {
-      where.push(`LOWER(f.favorite_actress_name) LIKE LOWER($${i++})`);
+      where.push(`lower(f.favorite_actress_name) LIKE lower($${i++})`);
       params.push(String(name).trim() + "%");
     }
     if (series) {
-      where.push(`LOWER(f.favorite_movie_series) LIKE LOWER($${i++})`);
+      where.push(`lower(f.favorite_movie_series) LIKE lower($${i++})`);
       params.push(String(series).trim() + "%");
     }
     if (q) {
+      // broad text search on name, series, notes
       where.push(`(
-        LOWER(f.favorite_actress_name)   LIKE LOWER($${i})
-        OR LOWER(f.favorite_movie_series) LIKE LOWER($${i})
-        OR LOWER(COALESCE(f.notes, ''))   LIKE LOWER($${i})
+        lower(f.favorite_actress_name) LIKE lower($${i})
+        OR lower(f.favorite_movie_series) LIKE lower($${i})
+        OR lower(COALESCE(f.notes, '')) LIKE lower($${i})
       )`);
       params.push(`%${String(q).trim()}%`);
       i++;
     }
 
-    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
-
-    // Use COUNT(*) OVER() to get total in one roundtrip
     const sql = `
-      SELECT
-        f.*,
-        c.country_name,
-        COUNT(*) OVER() AS total_count
-      FROM user_act_favorite f
-      LEFT JOIN country_list c ON c.id = f.country_id
-      ${whereSql}
-      ORDER BY f.created_at DESC, f.id DESC
-      LIMIT $${i++} OFFSET $${i++}
+      SELECT f.*, c.country_name
+        FROM user_act_favorite f
+   LEFT JOIN country_list c ON c.id = f.country_id
+       ${where.length ? "WHERE " + where.join(" AND ") : ""}
+    ORDER BY f.created_at DESC, f.id DESC
     `;
-    params.push(limit, offset);
 
     const { rows } = await pool.query(sql, params);
-    const total = rows.length ? Number(rows[0].total_count) : 0;
-    const items = rows.map(mapRow);
-    const hasMore = page * limit < total;
-
-    res.json({ items, total, page, limit, hasMore, nextPage: hasMore ? page + 1 : null });
+    res.json(rows.map(mapRow));
   } catch (err) {
     const { status, message } = normalizePgError(err);
     res.status(status).json({ error: message });
@@ -268,7 +261,7 @@ router.post("/", async (req, res) => {
     if (!isNonEmptyString(profile_image))
       return res.status(400).json({ error: "profile_image is required" });
 
-    // optional: age
+    // optional fields
     let ageVal = null;
     if (age !== undefined && age !== null && String(age).trim() !== "") {
       const n = Number(age);
@@ -277,7 +270,6 @@ router.post("/", async (req, res) => {
       ageVal = Math.trunc(n);
     }
 
-    // images → json array (or null)
     let imagesVal = null;
     try {
       imagesVal = safeNormalizeImages(images);
@@ -285,6 +277,9 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ error: String(e.message || "Invalid images") });
     }
 
+    // IMPORTANT:
+    // We set BOTH images_raw and images to the same JSON array/string.
+    // The DB trigger will ensure 'images' is an array and keeps it consistent.
     const sql = `
       INSERT INTO user_act_favorite
         (country_id, favorite_actress_name, age, actress_dob,
@@ -316,6 +311,7 @@ router.post("/", async (req, res) => {
 });
 
 // PATCH /:id (update fields; replaces images if provided)
+// If you want append-only, use POST /:id/images/append
 router.patch("/:id", async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
@@ -332,7 +328,12 @@ router.patch("/:id", async (req, res) => {
       values.push(newCountryId);
     }
 
-    const updatable = ["favorite_actress_name", "favorite_movie_series", "profile_image", "notes"];
+    const updatable = [
+      "favorite_actress_name",
+      "favorite_movie_series",
+      "profile_image",
+      "notes",
+    ];
     for (const key of updatable) {
       if (req.body[key] !== undefined) {
         const val = req.body[key];
@@ -364,6 +365,7 @@ router.patch("/:id", async (req, res) => {
     }
 
     if (req.body.images !== undefined) {
+      // REPLACE images completely (not append)
       let imagesVal = null;
       try {
         imagesVal = safeNormalizeImages(req.body.images);
@@ -376,7 +378,8 @@ router.patch("/:id", async (req, res) => {
       values.push(imagesVal ? JSON.stringify(imagesVal) : null);
     }
 
-    if (fields.length === 0) return res.status(400).json({ error: "No fields to update" });
+    if (fields.length === 0)
+      return res.status(400).json({ error: "No fields to update" });
 
     fields.push("updated_at = NOW()");
     const sql = `
@@ -390,7 +393,9 @@ router.patch("/:id", async (req, res) => {
     if (rows.length === 0) return res.status(404).json({ error: "Not found" });
 
     const cid = newCountryId ?? rows[0].country_id;
-    const { rows: c } = await pool.query("SELECT country_name FROM country_list WHERE id=$1", [cid]);
+    const { rows: c } = await pool.query("SELECT country_name FROM country_list WHERE id=$1", [
+      cid,
+    ]);
     res.json(mapRow({ ...rows[0], country_name: c[0]?.country_name || null }));
   } catch (err) {
     const { status, message } = normalizePgError(err);
@@ -399,6 +404,7 @@ router.patch("/:id", async (req, res) => {
 });
 
 // POST /:id/images/append → append images (no replacement)
+// IMPORTANT: we update images directly (NOT images_raw), to avoid trigger re-appending.
 router.post("/:id/images/append", async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
@@ -409,33 +415,19 @@ router.post("/:id/images/append", async (req, res) => {
       return res.status(400).json({ error: "images required (array/CSV/JSON/string)" });
     }
 
-    // De-dup on append: combine existing + new, unique
-    const { rows: currentRows } = await pool.query(
-      "SELECT images FROM user_act_favorite WHERE id=$1",
-      [id]
-    );
-    if (currentRows.length === 0) return res.status(404).json({ error: "Not found" });
-
-    const existing = coerceImagesOut(currentRows[0].images) || [];
-    const seen = new Set(existing.map((s) => String(s)));
-    const merged = existing.concat(toAppend.filter((s) => {
-      const t = String(s);
-      if (seen.has(t)) return false;
-      seen.add(t);
-      return true;
-    }));
-
-    const asJson = JSON.stringify(merged);
+    // Build JSON array once
+    const asJson = JSON.stringify(toAppend);
 
     const sql = `
       UPDATE user_act_favorite
-         SET images = $1::jsonb,
+         SET images = COALESCE(images, '[]'::jsonb) || $1::jsonb,
              updated_at = NOW()
        WHERE id = $2
    RETURNING *`;
     const { rows } = await pool.query(sql, [asJson, id]);
     if (rows.length === 0) return res.status(404).json({ error: "Not found" });
 
+    // Fetch country_name for mapper
     const { rows: c } = await pool.query("SELECT country_name FROM country_list WHERE id=$1", [
       rows[0].country_id,
     ]);
@@ -461,7 +453,13 @@ router.delete("/:id", async (req, res) => {
   }
 });
 
-// POST /:id/images/delete → delete ALL / by URLs / by indexes
+// DELETE images (ALL / by URLs / by indexes)
+// POST /api/act_favorite/:id/images/delete
+// Body:
+// { "all": true }                                  // delete ALL (sets images = NULL)
+// { "urls": ["https://a.jpg","https://b.jpg"] }    // delete by exact URLs
+// { "indexes": [0, 3, 5] }                         // delete by 0-based indexes
+// You may combine "urls" and "indexes". If "all" is true, others are ignored.
 router.post("/:id/images/delete", async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
@@ -473,14 +471,14 @@ router.post("/:id/images/delete", async (req, res) => {
     let urls = null;
     if (req.body?.urls !== undefined) {
       try {
-        const arr = safeNormalizeImages(req.body.urls);
+        const arr = safeNormalizeImages(req.body.urls); // array or null
         urls = arr && arr.length ? arr : null;
       } catch (e) {
         return res.status(400).json({ error: String(e.message || "Invalid urls") });
       }
     }
 
-    // normalize indexes (optional) -> client 0-based → SQL 1-based
+    // normalize indexes (optional) -> convert client 0-based to SQL 1-based ordinality
     let idxs = null;
     if (req.body?.indexes !== undefined) {
       if (!Array.isArray(req.body.indexes)) {
@@ -492,7 +490,7 @@ router.post("/:id/images/delete", async (req, res) => {
         if (!Number.isInteger(n) || n < 0) {
           return res.status(400).json({ error: "indexes must be non-negative integers (0-based)" });
         }
-        cleaned.push(n + 1);
+        cleaned.push(n + 1); // 1-based for WITH ORDINALITY
       }
       idxs = cleaned.length ? cleaned : null;
     }
@@ -501,7 +499,7 @@ router.post("/:id/images/delete", async (req, res) => {
       return res.status(400).json({ error: "Provide one of: all=true, urls, indexes" });
     }
 
-    // 1) Delete ALL
+    // 1) Delete ALL -> set images = NULL
     if (all === true) {
       const { rows } = await pool.query(
         `UPDATE user_act_favorite
@@ -519,7 +517,7 @@ router.post("/:id/images/delete", async (req, res) => {
       return res.json(mapRow({ ...rows[0], country_name: c[0]?.country_name || null }));
     }
 
-    // 2) Partial delete via urls and/or indexes
+    // 2) Partial delete -> filter JSONB array using URLs and/or indexes
     const { rows } = await pool.query(
       `
       WITH curr AS (
@@ -559,5 +557,6 @@ router.post("/:id/images/delete", async (req, res) => {
     return res.status(status).json({ error: message });
   }
 });
+
 
 module.exports = router;
