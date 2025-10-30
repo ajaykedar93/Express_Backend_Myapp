@@ -1,10 +1,10 @@
 const express = require("express");
 const router = express.Router();
 const db = require("../db"); // PostgreSQL client
-const jsPDF = require("jspdf");
-const html2canvas = require("html2canvas");
 
-// Utility: Normalize Input for extras
+// ----------------------
+// Utility: Normalize Input
+// ----------------------
 function normalizeExtrasArray(extras) {
   if (!extras || !Array.isArray(extras)) return [];
   return extras
@@ -20,7 +20,9 @@ function normalizeExtrasArray(extras) {
 }
 
 // ----------------------
-// GET all with optional filters (transactions API)
+
+// ----------------------
+// GET all with optional filters
 // ----------------------
 router.get("/sitekharch", async (req, res, next) => {
   try {
@@ -54,7 +56,11 @@ router.get("/sitekharch", async (req, res, next) => {
     }
 
     const where = conditions.length ? "WHERE " + conditions.join(" AND ") : "";
-    const query = `SELECT * FROM site_kharch ${where} ORDER BY kharch_date ASC, seq_no ASC, id ASC`;
+    const query = `
+      SELECT * FROM site_kharch
+      ${where}
+      ORDER BY kharch_date ASC, seq_no ASC, id ASC
+    `;
     const { rows } = await db.query(query, values);
     res.json(rows);
   } catch (err) {
@@ -63,93 +69,125 @@ router.get("/sitekharch", async (req, res, next) => {
 });
 
 // ----------------------
-// GET all sitekharch data (to export to PDF)
+// GET by ID
 // ----------------------
-router.get("/download-sitekharch-pdf", async (req, res, next) => {
+router.get("/sitekharch/:id", async (req, res, next) => {
   try {
-    const { category_id, from, to, min_amount, max_amount, q } = req.query;
-    let conditions = [];
-    let values = [];
-
-    if (category_id) {
-      values.push(Number(category_id));
-      conditions.push(`category_id = $${values.length}`);
-    }
-    if (from) {
-      values.push(from);
-      conditions.push(`kharch_date >= $${values.length}`);
-    }
-    if (to) {
-      values.push(to);
-      conditions.push(`kharch_date <= $${values.length}`);
-    }
-    if (min_amount) {
-      values.push(Number(min_amount));
-      conditions.push(`amount >= $${values.length}`);
-    }
-    if (max_amount) {
-      values.push(Number(max_amount));
-      conditions.push(`amount <= $${values.length}`);
-    }
-    if (q && String(q).trim() !== "") {
-      values.push(`%${q}%`);
-      conditions.push(`details ILIKE $${values.length}`);
-    }
-
-    const where = conditions.length ? "WHERE " + conditions.join(" AND ") : "";
-    const query = `SELECT * FROM site_kharch ${where} ORDER BY kharch_date ASC, seq_no ASC, id ASC`;
-    const { rows } = await db.query(query, values);
-
-    if (!rows.length) {
-      return res.status(404).json({ error: "No records found" });
-    }
-
-    // Calculate total amount for all transactions
-    const totalAmount = rows.reduce((total, item) => {
-      const itemAmount = Number(item.amount || 0);
-      const extraAmount = item.extra_items
-        ? item.extra_items.reduce((sum, e) => sum + Number(e.amount || 0), 0)
-        : 0;
-      return total + itemAmount + extraAmount;
-    }, 0);
-
-    // Generate PDF
-    const doc = new jsPDF();
-
-    // Header
-    doc.setFontSize(16);
-    doc.text("Site Kharch Transactions", 10, 10);
-
-    // Table
-    let y = 20;
-    doc.setFontSize(12);
-    rows.forEach((item, idx) => {
-      doc.text(`${idx + 1}. ${item.kharch_date} - ${item.category_name}: ₹${item.amount}`, 10, y);
-      y += 10;
-      if (item.extra_items) {
-        item.extra_items.forEach((extra) => {
-          doc.text(`   Extra: ₹${extra.amount} - ${extra.details}`, 15, y);
-          y += 10;
-        });
-      }
-    });
-
-    // Footer (Total)
-    y += 10;
-    doc.setFontSize(14);
-    doc.text(`Total Amount: ₹${totalAmount}`, 10, y);
-
-    // Download PDF
-    doc.save("sitekharch_transactions.pdf");
-
+    const { id } = req.params;
+    const { rows } = await db.query(
+      `SELECT * FROM site_kharch WHERE id = $1`,
+      [Number(id)]
+    );
+    if (!rows.length) return res.status(404).json({ error: "Not found" });
+    res.json(rows[0]);
   } catch (err) {
     next(err);
   }
 });
 
 // ----------------------
-// ADD received amount (previous implementation)
+// CREATE
 // ----------------------
+router.post("/sitekharch", async (req, res, next) => {
+  try {
+    let {
+      category_id,
+      kharch_date,
+      amount,
+      details,
+      extra_amount,
+      extra_details,
+      extras_all,
+    } = req.body;
+
+    if (!category_id || !amount || !details) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    const normalizedExtras = normalizeExtrasArray(extras_all);
+    const { rows } = await db.query(
+      `INSERT INTO site_kharch
+       (category_id, kharch_date, amount, details, extra_amount, extra_details, extra_items)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+       RETURNING *`,
+      [
+        category_id,
+        kharch_date || new Date(),
+        amount,
+        details,
+        extra_amount || null,
+        extra_details || null,
+        JSON.stringify(normalizedExtras),
+      ]
+    );
+    res.json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ----------------------
+// UPDATE
+// ----------------------
+router.put("/sitekharch/:id", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    let {
+      category_id,
+      kharch_date,
+      amount,
+      details,
+      extra_amount,
+      extra_details,
+      extras_all,
+    } = req.body;
+
+    const normalizedExtras = normalizeExtrasArray(extras_all);
+
+    const { rows } = await db.query(
+      `UPDATE site_kharch SET
+         category_id = COALESCE($1, category_id),
+         kharch_date = COALESCE($2, kharch_date),
+         amount = COALESCE($3, amount),
+         details = COALESCE($4, details),
+         extra_amount = $5,
+         extra_details = $6,
+         extra_items = $7::jsonb
+       WHERE id = $8
+       RETURNING *`,
+      [
+        category_id || null,
+        kharch_date || null,
+        amount || null,
+        details || null,
+        extra_amount || null,
+        extra_details || null,
+        JSON.stringify(normalizedExtras),
+        id,
+      ]
+    );
+    if (!rows.length) return res.status(404).json({ error: "Not found" });
+    res.json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ----------------------
+// DELETE
+// ----------------------
+router.delete("/sitekharch/:id", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { rows } = await db.query(`DELETE FROM site_kharch WHERE id = $1 RETURNING *`, [id]);
+    if (!rows.length) return res.status(404).json({ error: "Not found" });
+    res.json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Add received amount
 router.post("/add-received-amount", async (req, res) => {
   try {
     const { amount_received, payment_date } = req.body;
@@ -181,12 +219,10 @@ router.post("/add-received-amount", async (req, res) => {
   }
 });
 
-// ----------------------
-// Monthly summary for sitekharch
-// ----------------------
+// Monthly summary for site kharch
 router.get("/monthly-summary-sitekharch", async (req, res) => { 
   try {
-    const { month } = req.query;
+    const { month } = req.query; // Optional filter: 1-12
     const values = [];
     let monthFilter = "";
 
@@ -234,6 +270,8 @@ router.get("/monthly-summary-sitekharch", async (req, res) => {
   }
 });
 
+
+
 // ----------------------
 // RESEQUENCE (per kharch_date)
 // ----------------------
@@ -256,6 +294,54 @@ router.post("/sitekharch/resequence", async (req, res, next) => {
     `);
 
     res.json({ success: true, message: "Resequenced seq_no per kharch_date" });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ----------------------
+// BULK INSERT
+// ----------------------
+router.post("/sitekharch/bulk", async (req, res, next) => {
+  try {
+    const { category_id, kharch_date, entries } = req.body;
+    if (!category_id || !kharch_date || !Array.isArray(entries)) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+
+      const results = [];
+      for (const e of entries) {
+        const normalizedExtras = normalizeExtrasArray(e.extras_all);
+        const { rows } = await client.query(
+          `INSERT INTO site_kharch
+           (category_id, kharch_date, amount, details, extra_amount, extra_details, extra_items)
+           VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+           RETURNING *`,
+          [
+            category_id,
+            kharch_date,
+            e.amount,
+            e.details,
+            e.extra_amount || null,
+            e.extra_details || null,
+            JSON.stringify(normalizedExtras),
+          ]
+        );
+        results.push(rows[0]);
+      }
+
+      await client.query("COMMIT");
+      res.json({ success: true, inserted: results });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
   } catch (err) {
     next(err);
   }
