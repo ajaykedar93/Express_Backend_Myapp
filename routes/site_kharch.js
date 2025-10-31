@@ -22,51 +22,141 @@ function normalizeExtrasArray(extras) {
 // ----------------------
 
 // ----------------------
-// GET all with optional filters
 // ----------------------
-router.get("/sitekharch", async (req, res, next) => {
-  try {
-    let { category_id, from, to, min_amount, max_amount, q } = req.query;
-    let conditions = [];
-    let values = [];
+// GET /api/sitekharch
+router.get("/sitekharch", async (req, res) => {
+  const { category_id, from, to, min_amount, max_amount, q } = req.query;
 
-    if (category_id) {
-      values.push(Number(category_id));
-      conditions.push(`category_id = $${values.length}`);
-    }
+  const whereParts = [];
+  const values = [];
+
+  // ---------- filters for site_kharch ----------
+  if (category_id) {
+    values.push(Number(category_id));
+    whereParts.push(`s.category_id = $${values.length}`);
+  }
+
+  if (from) {
+    values.push(from);
+    whereParts.push(`s.kharch_date >= $${values.length}`);
+  }
+
+  if (to) {
+    values.push(to);
+    whereParts.push(`s.kharch_date <= $${values.length}`);
+  }
+
+  if (min_amount) {
+    values.push(Number(min_amount));
+    whereParts.push(`s.amount >= $${values.length}`);
+  }
+
+  if (max_amount) {
+    values.push(Number(max_amount));
+    whereParts.push(`s.amount <= $${values.length}`);
+  }
+
+  if (q && String(q).trim() !== "") {
+    values.push(`%${q}%`);
+    // search in details OR in extra_details (from legacy columns)
+    whereParts.push(`(s.details ILIKE $${values.length} OR s.extra_details ILIKE $${values.length})`);
+  }
+
+  const whereClause = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
+
+  try {
+    // 1️⃣ get EXPENSE rows (site_kharch) with category + JSON extras
+    const expenseQuery = `
+      SELECT
+        s.id,
+        s.seq_no,
+        s.kharch_date,
+        s.category_id,
+        wc.category_name,
+        s.amount,
+        s.details,
+        s.extra_amount,
+        s.extra_details,
+        s.extra_items
+      FROM site_kharch s
+      LEFT JOIN workcategory wc ON wc.id = s.category_id
+      ${whereClause}
+      ORDER BY s.kharch_date ASC, s.seq_no ASC, s.id ASC;
+    `;
+
+    const { rows: expenseRows } = await db.query(expenseQuery, values);
+
+    // 2️⃣ calculate total_expense in Node (because of JSONB extras)
+    let totalExpense = 0;
+    const normalizedData = expenseRows.map((row) => {
+      const base = Number(row.amount || 0);
+
+      // legacy single extra
+      const legacyExtra = Number(row.extra_amount || 0);
+
+      // JSON extras
+      const extras = Array.isArray(row.extra_items) ? row.extra_items : JSON.parse(row.extra_items || "[]");
+      const extrasTotal = extras.reduce(
+        (sum, e) => sum + Number(e.amount || 0),
+        0
+      );
+
+      const rowTotal = base + legacyExtra + extrasTotal;
+      totalExpense += rowTotal;
+
+      return {
+        ...row,
+        extra_items: extras,
+        row_total: rowTotal
+      };
+    });
+
+    // 3️⃣ get RECEIVED amount from user_sitekharch_amount
+    //    If user gave from/to → apply same filter
+    const incomeWhere = [];
+    const incomeValues = [];
     if (from) {
-      values.push(from);
-      conditions.push(`kharch_date >= $${values.length}`);
+      incomeValues.push(from);
+      incomeWhere.push(`payment_date >= $${incomeValues.length}`);
     }
     if (to) {
-      values.push(to);
-      conditions.push(`kharch_date <= $${values.length}`);
+      incomeValues.push(to);
+      incomeWhere.push(`payment_date <= $${incomeValues.length}`);
     }
-    if (min_amount) {
-      values.push(Number(min_amount));
-      conditions.push(`amount >= $${values.length}`);
-    }
-    if (max_amount) {
-      values.push(Number(max_amount));
-      conditions.push(`amount <= $${values.length}`);
-    }
-    if (q && String(q).trim() !== "") {
-      values.push(`%${q}%`);
-      conditions.push(`details ILIKE $${values.length}`);
-    }
+    const incomeWhereClause = incomeWhere.length ? `WHERE ${incomeWhere.join(" AND ")}` : "";
 
-    const where = conditions.length ? "WHERE " + conditions.join(" AND ") : "";
-    const query = `
-      SELECT * FROM site_kharch
-      ${where}
-      ORDER BY kharch_date ASC, seq_no ASC, id ASC
+    const incomeQuery = `
+      SELECT COALESCE(SUM(amount_received), 0) AS total_received
+      FROM user_sitekharch_amount
+      ${incomeWhereClause};
     `;
-    const { rows } = await db.query(query, values);
-    res.json(rows);
+    const { rows: incomeRows } = await db.query(incomeQuery, incomeValues);
+    const totalReceived = Number(incomeRows[0].total_received || 0);
+
+    // 4️⃣ final response
+    res.json({
+      filters: {
+        category_id: category_id || null,
+        from: from || null,
+        to: to || null,
+        min_amount: min_amount || null,
+        max_amount: max_amount || null,
+        q: q || null,
+      },
+      totals: {
+        expense: totalExpense,
+        received: totalReceived,
+        balance: totalReceived - totalExpense,
+      },
+      count: normalizedData.length,
+      data: normalizedData,
+    });
   } catch (err) {
-    next(err);
+    console.error("Error in /api/sitekharch:", err);
+    res.status(500).json({ error: "Internal Server Error" });
   }
 });
+
 
 // ----------------------
 // GET by ID
