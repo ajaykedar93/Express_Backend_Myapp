@@ -1,35 +1,23 @@
 // routes/inward.js
 const express = require("express");
 const router = express.Router();
-const db = require("../db"); // Your db.query function
+const db = require("../db");
 const PDFDocument = require("pdfkit");
 const moment = require("moment");
 
 const TABLE = "inward";
 const PK = "id";
 
-const ALLOWED_FIELDS = [
-  "category_id",
-  "work_date",
-  "work_time",
-  "details",
-  "quantity",
-  "quantity_type",
-  "extra_details",
-  "extra_quantity",
-  "extra_quantity_type",
-  "extra_items",
-];
-
-// ---------------------------
-// Helpers
-// ---------------------------
+// ==========================
+// Helper functions
+// ==========================
 function normalizeExtrasArray(extrasAll) {
   if (!Array.isArray(extrasAll)) return [];
   return extrasAll
     .map((e) => ({
       details: e?.details ?? null,
-      quantity: e?.quantity === "" || e?.quantity == null ? null : Number(e.quantity),
+      quantity:
+        e?.quantity === "" || e?.quantity == null ? null : Number(e.quantity),
       quantity_type: e?.quantity_type ?? null,
     }))
     .filter(
@@ -70,10 +58,7 @@ function ensureLegacyFromExtras(data) {
 }
 
 function prepareDataFromBody(body) {
-  const out = {};
-  for (const k of ALLOWED_FIELDS) {
-    if (Object.prototype.hasOwnProperty.call(body, k)) out[k] = body[k];
-  }
+  const out = { ...body };
 
   if (Object.prototype.hasOwnProperty.call(body, "extras_all")) {
     out.extra_items = normalizeExtrasArray(body.extras_all);
@@ -95,155 +80,158 @@ function prepareDataFromBody(body) {
   return ensureLegacyFromExtras(out);
 }
 
-function buildInsert(data) {
-  const cols = [];
-  const vals = [];
-  const ph = [];
-  let i = 1;
-
-  for (const k of ALLOWED_FIELDS) {
-    if (!Object.prototype.hasOwnProperty.call(data, k)) continue;
-    const v = data[k];
-    if (v === undefined) continue;
-
-    cols.push(k);
-    if (k === "extra_items") {
-      vals.push(JSON.stringify(v));
-      ph.push(`$${i++}::jsonb`);
-    } else {
-      vals.push(v);
-      ph.push(`$${i++}`);
-    }
-  }
-
-  if (cols.length === 0) return null;
-
-  return {
-    text: `INSERT INTO ${TABLE} (${cols.join(",")}) VALUES (${ph.join(",")}) RETURNING *`,
-    values: vals,
-  };
-}
-
-function buildUpdate(id, data) {
-  const sets = [];
-  const vals = [];
-  let i = 1;
-
-  for (const k of ALLOWED_FIELDS) {
-    if (!Object.prototype.hasOwnProperty.call(data, k)) continue;
-    const v = data[k];
-    if (v === undefined) continue;
-
-    if (k === "extra_items") {
-      vals.push(JSON.stringify(v));
-      sets.push(`${k} = $${i++}::jsonb`);
-    } else {
-      vals.push(v);
-      sets.push(`${k} = $${i++}`);
-    }
-  }
-
-  if (sets.length === 0) return null;
-
-  vals.push(id);
-  return {
-    text: `UPDATE ${TABLE} SET ${sets.join(", ")} WHERE ${PK} = $${i} RETURNING *`,
-    values: vals,
-  };
-}
-
-// ---------------------------
-// Routes
-// ---------------------------
-
-// ---------------------------
-// Export PDF (must be first, before /:id)
-// ---------------------------
+// ==========================
+// EXPORT PDF (Professional Table)
+// ==========================
 router.get("/inward/export", async (req, res) => {
   try {
     const { date, month } = req.query;
 
-    // Build SQL query
-    let query = `SELECT seq_no, work_date, work_time, details, quantity, quantity_type FROM ${TABLE}`;
-    const conditions = [];
+    let query = `
+      SELECT seq_no, work_date, details, quantity, quantity_type
+      FROM ${TABLE}
+    `;
+    const vals = [];
+    const cond = [];
 
-    if (date) conditions.push(`work_date = '${date}'`);
-    else if (month) conditions.push(`TO_CHAR(work_date, 'Month') = '${month}'`);
+    if (date) {
+      cond.push(`work_date = $1`);
+      vals.push(date);
+    } else if (month) {
+      cond.push(`TRIM(TO_CHAR(work_date, 'Month')) ILIKE TRIM($1)`);
+      vals.push(month);
+    }
 
-    if (conditions.length > 0) query += " WHERE " + conditions.join(" AND ");
+    if (cond.length) query += ` WHERE ${cond.join(" AND ")}`;
+    query += ` ORDER BY work_date ASC, seq_no ASC`;
 
-    query += " ORDER BY work_date ASC, seq_no ASC";
-
-    const result = await db.query(query);
+    const result = await db.query(query, vals);
     const records = result.rows;
 
-    // PDF setup
+    // ========== PDF setup ==========
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename=inward_export_${moment().format("YYYYMMDD")}.pdf`
+      `attachment; filename=inward_export_${moment().format("YYYYMMDD_HHmm")}.pdf`
     );
 
     const doc = new PDFDocument({ size: "A4", margin: 40 });
     doc.pipe(res);
 
-    // --- PDF Header ---
-    doc.fontSize(22).fillColor("#333333").text("Inward Details", { align: "center" });
-    doc.moveDown(0.5);
-    doc.fontSize(12).fillColor("#555555")
-       .text(`Generated on: ${moment().format("YYYY-MM-DD")}`, { align: "right" });
-    doc.moveDown(1);
+    // ---- HEADER ----
+    doc
+      .font("Helvetica-Bold")
+      .fontSize(18)
+      .fillColor("black")
+      .text("Inward Material Report", { align: "center" });
 
-    // --- Table Layout ---
-    const tableTop = 120;
-    const rowHeight = 22;
+    doc.moveDown(0.3);
+    doc
+      .font("Helvetica")
+      .fontSize(11)
+      .fillColor("gray")
+      .text(`Month: ${month || "All"} | Generated on: ${moment().format("DD MMM YYYY, h:mm A")}`, {
+        align: "right",
+      });
+    doc.moveDown(0.7);
 
-    // Fixed equal column widths (A4 width ~ 595, minus margins ~ 40*2 = 515 usable space)
-    const colWidth = 80; // ~6 equal columns
-    const colX = [50, 130, 210, 290, 370, 450]; // X positions for 6 columns
+    // ---- TABLE ----
+    const tableWidth = 445; // total width of table
+    const startX = (doc.page.width - tableWidth) / 2; // center the table
+    let cursorY = doc.y;
+    const pageHeight = doc.page.height - doc.page.margins.bottom;
 
-    // --- Table Header ---
-    const headers = ["Seq", "Date", "Details", "Quantity", "Qty Type", "Work Time"];
-    doc.fontSize(10).fillColor("#000000").font("Helvetica-Bold");
+    const COLS = [
+      { key: "seq", label: "#", width: 35 },
+      { key: "date", label: "Date", width: 90 },
+      { key: "details", label: "Details", width: 215 },
+      { key: "qty", label: "Qty", width: 55 },
+      { key: "type", label: "Type", width: 50 },
+    ];
 
-    headers.forEach((h, i) => {
-      doc.text(h, colX[i], tableTop, { width: colWidth, align: "center" });
-    });
+    function drawHeader() {
+      let x = startX;
+      const h = 22;
 
-    // --- Table Rows ---
-    let y = tableTop + 20;
-    doc.font("Helvetica").fontSize(9).fillColor("#000000");
+      if (cursorY + h > pageHeight) {
+        doc.addPage();
+        cursorY = doc.y;
+      }
 
-    records.forEach((rec, idx) => {
-      const row = [
-        rec.seq_no ?? idx + 1,
-        moment(rec.work_date).format("YYYY-MM-DD"), // only date
-        rec.details || "-",
-        rec.quantity ?? "-",
-        rec.quantity_type ?? "-",
-        rec.work_time ?? "-"
-      ];
+      doc.font("Helvetica-Bold").fontSize(10).fillColor("black");
+      COLS.forEach((col) => {
+        doc.rect(x, cursorY, col.width, h).stroke();
+        doc.text(col.label, x + 3, cursorY + 6, {
+          width: col.width - 6,
+          align: "center",
+        });
+        x += col.width;
+      });
+      cursorY += h;
+    }
 
-      row.forEach((val, i) => {
-        doc.text(String(val), colX[i], y, { width: colWidth, align: "center" });
+    function drawRow(rowObj) {
+      doc.font("Helvetica").fontSize(9).fillColor("black");
+
+      const heights = COLS.map((col) => {
+        const text = rowObj[col.key] || "";
+        return doc.heightOfString(text, { width: col.width - 6 }) + 6;
       });
 
-      y += rowHeight;
-
-      // New page check
-      if (y > 750) {
+      const rowHeight = Math.max(20, ...heights);
+      if (cursorY + rowHeight > pageHeight) {
         doc.addPage();
-        y = 50;
-
-        // Repeat table header
-        headers.forEach((h, i) => {
-          doc.font("Helvetica-Bold");
-          doc.text(h, colX[i], y, { width: colWidth, align: "center" });
-        });
-        doc.font("Helvetica");
-        y += rowHeight;
+        cursorY = doc.y;
+        drawHeader();
       }
-    });
+
+      let x = startX;
+      COLS.forEach((col) => {
+        const text = rowObj[col.key] || "";
+        doc.rect(x, cursorY, col.width, rowHeight).stroke();
+        doc.text(text, x + 3, cursorY + 3, {
+          width: col.width - 6,
+          align: "center",
+        });
+        x += col.width;
+      });
+      cursorY += rowHeight;
+    }
+
+    drawHeader();
+
+    if (!records.length) {
+      drawRow({
+        seq: "",
+        date: "",
+        details: "No inward records found.",
+        qty: "",
+        type: "",
+      });
+    } else {
+      records.forEach((rec, i) => {
+        drawRow({
+          seq: String(i + 1),
+          date: moment(rec.work_date).format("DD MMM YYYY"),
+          details: rec.details || "-",
+          qty: rec.quantity ?? "-",
+          type: rec.quantity_type ?? "-",
+        });
+      });
+    }
+
+    // ---- FOOTER ----
+    doc.moveDown(1.5);
+    doc
+      .font("Helvetica-Bold")
+      .fontSize(10)
+      .fillColor("gray")
+      .text("Authorized By:", { align: "right" });
+    doc
+      .font("Helvetica-Bold")
+      .fontSize(12)
+      .fillColor("black")
+      .text("Ajay Kedar", { align: "right" });
 
     doc.end();
   } catch (err) {
@@ -252,10 +240,9 @@ router.get("/inward/export", async (req, res) => {
   }
 });
 
-// ---------------------------
-// List / Filters
-// GET /inward?category_id=&date=&month=
-// ---------------------------
+// ==========================
+// REST APIs
+// ==========================
 router.get("/inward", async (req, res) => {
   try {
     const { category_id, date, month } = req.query;
@@ -272,132 +259,113 @@ router.get("/inward", async (req, res) => {
       cond.push(`work_date = $${i++}`);
       vals.push(date);
     } else if (month) {
-      const months = [
-        "January","February","March","April","May","June",
-        "July","August","September","October","November","December"
-      ];
+      const months = moment.months();
       const monthIndex = months.indexOf(month);
       if (monthIndex >= 0) {
         const year = new Date().getFullYear();
-        const firstDay = `${year}-${String(monthIndex+1).padStart(2,"0")}-01`;
-        const lastDay = new Date(year, monthIndex+1, 0);
-        const lastDayStr = `${year}-${String(monthIndex+1).padStart(2,"0")}-${String(lastDay.getDate()).padStart(2,"0")}`;
-        cond.push(`work_date >= $${i++}`);
-        vals.push(firstDay);
-        cond.push(`work_date <= $${i++}`);
-        vals.push(lastDayStr);
+        const firstDay = moment([year, monthIndex, 1]).format("YYYY-MM-DD");
+        const lastDay = moment(firstDay).endOf("month").format("YYYY-MM-DD");
+        cond.push(`work_date BETWEEN $${i++} AND $${i++}`);
+        vals.push(firstDay, lastDay);
       }
     }
 
     const where = cond.length ? `WHERE ${cond.join(" AND ")}` : "";
     const sql = `SELECT ${PK}, seq_no, work_date, work_time, details, quantity, quantity_type 
-                 FROM ${TABLE} ${where} ORDER BY work_date ASC, seq_no ASC, ${PK} ASC`;
+                 FROM ${TABLE} ${where} 
+                 ORDER BY work_date ASC, seq_no ASC, ${PK} ASC`;
 
     const result = await db.query(sql, vals);
-
-    const flatData = result.rows.map((row, idx) => ({
-      id: row.id,
-      seq_no: row.seq_no ?? idx+1,
-      work_date: row.work_date,
-      work_time: row.work_time,
-      details: row.details,
-      quantity: row.quantity,
-      quantity_type: row.quantity_type
-    }));
-
-    res.json({ data: flatData });
-  } catch (e) {
-    console.error("GET /inward", e);
+    res.json({ data: result.rows });
+  } catch (err) {
+    console.error("GET /inward", err);
     res.status(500).json({ error: "Failed to fetch inward records" });
   }
 });
 
-// ---------------------------
-// GET /inward/:id
-// ---------------------------
-router.get("/inward/:id", async (req,res)=>{
-  try{
+router.get("/inward/:id", async (req, res) => {
+  try {
     const id = Number(req.params.id);
-    if(isNaN(id)) return res.status(400).json({error:"Invalid ID"});
-    const result = await db.query(`SELECT * FROM ${TABLE} WHERE ${PK}=$1`,[id]);
-    if(result.rows.length===0) return res.status(404).json({error:"Not found"});
+    if (isNaN(id)) return res.status(400).json({ error: "Invalid ID" });
+    const result = await db.query(`SELECT * FROM ${TABLE} WHERE ${PK}=$1`, [id]);
+    if (!result.rows.length) return res.status(404).json({ error: "Not found" });
     res.json(result.rows[0]);
-  }catch(e){
-    console.error("GET /inward/:id",e);
-    res.status(500).json({error:"Failed to fetch inward record"});
+  } catch (err) {
+    console.error("GET /inward/:id", err);
+    res.status(500).json({ error: "Failed to fetch inward record" });
   }
 });
 
-// ---------------------------
-// POST /inward
-// ---------------------------
-router.post("/inward", async (req,res)=>{
-  try{
-    const raw = req.body||{};
-    if(raw.category_id==null) return res.status(400).json({error:"category_id is required"});
-    if(!raw.details || String(raw.details).trim()==="") return res.status(400).json({error:"details is required"});
+router.post("/inward", async (req, res) => {
+  try {
+    const raw = req.body || {};
+    if (raw.category_id == null)
+      return res.status(400).json({ error: "category_id is required" });
+    if (!raw.details?.trim())
+      return res.status(400).json({ error: "details is required" });
 
     const data = prepareDataFromBody(raw);
-    const ins = buildInsert(data);
-    if(!ins) return res.status(400).json({error:"No valid fields provided"});
+    const cols = Object.keys(data);
+    const placeholders = cols.map((_, i) => `$${i + 1}`);
+    const vals = cols.map((k) => (k === "extra_items" ? JSON.stringify(data[k]) : data[k]));
 
-    const result = await db.query(ins.text, ins.values);
+    const result = await db.query(
+      `INSERT INTO ${TABLE} (${cols.join(",")}) VALUES (${placeholders.join(",")}) RETURNING *`,
+      vals
+    );
     res.status(201).json(result.rows[0]);
-  }catch(e){
-    console.error("POST /inward",e);
-    res.status(500).json({error:"Failed to create inward record"});
+  } catch (err) {
+    console.error("POST /inward", err);
+    res.status(500).json({ error: "Failed to create inward record" });
   }
 });
 
-// ---------------------------
-// PUT /inward/:id
-// ---------------------------
-router.put("/inward/:id", async (req,res)=>{
-  try{
+router.put("/inward/:id", async (req, res) => {
+  try {
     const id = Number(req.params.id);
-    if(isNaN(id)) return res.status(400).json({error:"Invalid ID"});
+    if (isNaN(id)) return res.status(400).json({ error: "Invalid ID" });
 
-    const data = prepareDataFromBody(req.body||{});
-    const upd = buildUpdate(id,data);
-    if(!upd) return res.status(400).json({error:"No updatable fields provided"});
+    const data = prepareDataFromBody(req.body || {});
+    const sets = Object.keys(data).map((k, i) => `${k}=$${i + 1}`);
+    const vals = Object.values(data).map((v) =>
+      typeof v === "object" ? JSON.stringify(v) : v
+    );
 
-    const result = await db.query(upd.text,upd.values);
-    if(result.rows.length===0) return res.status(404).json({error:"Record not found"});
+    if (!sets.length) return res.status(400).json({ error: "No updatable fields provided" });
+
+    vals.push(id);
+    const result = await db.query(
+      `UPDATE ${TABLE} SET ${sets.join(", ")} WHERE ${PK}=$${sets.length + 1} RETURNING *`,
+      vals
+    );
+    if (!result.rows.length) return res.status(404).json({ error: "Record not found" });
 
     res.json(result.rows[0]);
-  }catch(e){
-    console.error("PUT /inward/:id",e);
-    res.status(500).json({error:"Failed to update inward record"});
+  } catch (err) {
+    console.error("PUT /inward/:id", err);
+    res.status(500).json({ error: "Failed to update inward record" });
   }
 });
 
-// ---------------------------
-// DELETE /inward/:id
-// ---------------------------
-router.delete("/inward/:id", async (req,res)=>{
-  try{
+router.delete("/inward/:id", async (req, res) => {
+  try {
     const id = Number(req.params.id);
-    if(isNaN(id)) return res.status(400).json({error:"Invalid ID"});
-
-    const result = await db.query(`DELETE FROM ${TABLE} WHERE ${PK}=$1 RETURNING *`,[id]);
-    if(result.rows.length===0) return res.status(404).json({error:"Record not found"});
-
-    res.json({ok:true, deleted: result.rows[0]});
-  }catch(e){
-    console.error("DELETE /inward/:id",e);
-    res.status(500).json({error:"Failed to delete inward record"});
+    if (isNaN(id)) return res.status(400).json({ error: "Invalid ID" });
+    const result = await db.query(`DELETE FROM ${TABLE} WHERE ${PK}=$1 RETURNING *`, [id]);
+    if (!result.rows.length) return res.status(404).json({ error: "Record not found" });
+    res.json({ ok: true, deleted: result.rows[0] });
+  } catch (err) {
+    console.error("DELETE /inward/:id", err);
+    res.status(500).json({ error: "Failed to delete inward record" });
   }
 });
 
-// ---------------------------
-// POST /inward/resequence
-// ---------------------------
-router.post("/inward/resequence", async (req,res)=>{
-  try{
-    const orderBy = String(req.body?.orderBy||"").toLowerCase();
+router.post("/inward/resequence", async (req, res) => {
+  try {
+    const orderBy = String(req.body?.orderBy || "").toLowerCase();
     let orderExpr = `work_date ASC, ${PK} ASC`;
-    if(orderBy==="id") orderExpr = `${PK} ASC`;
-    else if(orderBy==="category_id") orderExpr = `category_id ASC, ${PK} ASC`;
+    if (orderBy === "id") orderExpr = `${PK} ASC`;
+    else if (orderBy === "category_id") orderExpr = `category_id ASC, ${PK} ASC`;
 
     const sql = `
       WITH ordered AS (
@@ -407,14 +375,14 @@ router.post("/inward/resequence", async (req,res)=>{
       UPDATE ${TABLE} t
       SET seq_no = o.rn
       FROM ordered o
-      WHERE t.${PK}=o.${PK}
+      WHERE t.${PK} = o.${PK}
       RETURNING t.${PK};
     `;
     const result = await db.query(sql);
-    res.json({ok:true, resequenced: result.rows.length});
-  }catch(e){
-    console.error("POST /inward/resequence",e);
-    res.status(500).json({error:"Failed to resequence"});
+    res.json({ ok: true, resequenced: result.rows.length });
+  } catch (err) {
+    console.error("POST /inward/resequence", err);
+    res.status(500).json({ error: "Failed to resequence" });
   }
 });
 

@@ -1,303 +1,518 @@
+// routes/workdetails.js
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
 const PDFDocument = require("pdfkit");
 
+/* =========================
+   SMALL HELPERS
+   ========================= */
 
+// small helpers
+function formatNiceDate(isoLike) {
+  // input: "2025-10-01"
+  if (!isoLike) return "";
+  const d = new Date(isoLike);
+  if (Number.isNaN(d.getTime())) return isoLike;
+  // 1 Oct 2025
+  const day = d.getDate();
+  const month = d.toLocaleString("en-US", { month: "short" }); // Oct
+  const year = d.getFullYear();
+  return `${day} ${month} ${year}`;
+}
 
-// ===== GET DPR entries (optionally by category_id) =====
-router.get("/dpr", async (req, res) => {
-  const { category_id } = req.query;
-  try {
-    let query = "SELECT * FROM dpr ORDER BY work_date DESC, seq_no ASC";
-    const params = [];
-    if (category_id) {
-      query = "SELECT * FROM dpr WHERE category_id=$1 ORDER BY work_date DESC, seq_no ASC";
-      params.push(category_id);
+function toTextArray(val) {
+  if (!val) return [];
+  if (Array.isArray(val)) return val;
+  // in case it is stored as PG array text like {a,b}
+  if (typeof val === "string") {
+    try {
+      // try JSON first
+      const parsed = JSON.parse(val);
+      if (Array.isArray(parsed)) return parsed;
+    } catch (e) {
+      // fallback: split by comma
+      return val.split(",").map((x) => x.trim()).filter(Boolean);
     }
-    const result = await db.query(query, params);
-    res.json(result.rows);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to fetch DPR entries" });
   }
-});// DELETE /api/dpr/delete/:date
-router.delete("/dpr/delete/:date", async (req, res) => {
-  try {
-    const { date } = req.params;
-    const dateObj = new Date(date);
-    if (isNaN(dateObj.getTime())) return res.status(400).json({ error: "Invalid date" });
+  return [];
+}
 
-    await db.query("DELETE FROM dpr WHERE work_date = $1", [dateObj]);
-    res.json({ success: true });
+/* =========================
+   1. CATEGORY APIS
+   ========================= */
+
+// GET all categories
+router.get("/dpr/categories", async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      "SELECT id, category_name FROM workcategory ORDER BY category_name ASC"
+    );
+    res.json({ ok: true, data: rows });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to delete DPR entries" });
+    console.error("Error fetching categories:", err);
+    res.status(500).json({ ok: false, error: "Failed to fetch categories" });
   }
 });
 
-// ===== ADD new DPR entry =====
+// ADD a category
+router.post("/dpr/categories", async (req, res) => {
+  const { category_name } = req.body;
+  if (!category_name || !category_name.trim()) {
+    return res.status(400).json({ ok: false, error: "category_name is required" });
+  }
+  try {
+    const { rows } = await db.query(
+      "INSERT INTO workcategory (category_name) VALUES ($1) RETURNING id, category_name",
+      [category_name.trim()]
+    );
+    res.json({ ok: true, data: rows[0] });
+  } catch (err) {
+    console.error("Error adding category:", err);
+    res.status(500).json({ ok: false, error: "Failed to add category" });
+  }
+});
+
+/* =========================
+   2. DPR CRUD
+   ========================= */
+
+/**
+ * GET /api/dpr
+ * optional:
+ *   ?category_id=1
+ *   ?from=2025-10-01
+ *   ?to=2025-10-31
+ */
+router.get("/dpr", async (req, res) => {
+  const { category_id, from, to } = req.query;
+
+  let where = [];
+  let params = [];
+  let idx = 1;
+
+  if (category_id) {
+    where.push(`d.category_id = $${idx++}`);
+    params.push(category_id);
+  }
+  if (from) {
+    where.push(`d.work_date >= $${idx++}`);
+    params.push(from);
+  }
+  if (to) {
+    where.push(`d.work_date <= $${idx++}`);
+    params.push(to);
+  }
+
+  let sql = `
+    SELECT d.id, d.seq_no, d.category_id,
+           TO_CHAR(d.work_date, 'YYYY-MM-DD') AS work_date,
+           d.details, d.work_time, d.extra_details, d.extra_times,
+           d.month_name,
+           c.category_name
+    FROM dpr d
+    LEFT JOIN workcategory c ON d.category_id = c.id
+  `;
+
+  if (where.length) sql += " WHERE " + where.join(" AND ");
+
+  sql += " ORDER BY d.work_date DESC, d.seq_no ASC";
+
+  try {
+    const { rows } = await db.query(sql, params);
+    res.json({ ok: true, data: rows });
+  } catch (err) {
+    console.error("Error fetching DPR entries:", err);
+    res.status(500).json({ ok: false, error: "Failed to fetch DPR entries" });
+  }
+});
+
+/**
+ * GET /api/dpr/month/October
+ * (month_name is filled by trigger)
+ */
+router.get("/dpr/month/:month", async (req, res) => {
+  const { month } = req.params;
+  try {
+    const { rows } = await db.query(
+      `
+      SELECT d.id, d.seq_no, d.category_id,
+             TO_CHAR(d.work_date, 'YYYY-MM-DD') AS work_date,
+             d.details, d.work_time, d.extra_details, d.extra_times,
+             d.month_name,
+             c.category_name
+      FROM dpr d
+      LEFT JOIN workcategory c ON d.category_id = c.id
+      WHERE d.month_name = $1
+      ORDER BY d.work_date ASC, d.seq_no ASC
+      `,
+      [month]
+    );
+    res.json({ ok: true, data: rows });
+  } catch (err) {
+    console.error("Error fetching DPR by month:", err);
+    res.status(500).json({ ok: false, error: "Failed to fetch month DPR" });
+  }
+});
+
+/**
+ * POST /api/dpr
+ * body: { category_id, work_date, details, work_time, extra_entries: [{detail,time}, ...] }
+ */
 router.post("/dpr", async (req, res) => {
   try {
-    let { category_id, work_date, extra_entries, details, work_time } = req.body;
+    let { category_id, work_date, details, work_time, extra_entries } = req.body;
 
-    // Validate required fields
-    if (!work_date) return res.status(400).json({ error: "work_date is required" });
-    if (!details || !details.trim()) return res.status(400).json({ error: "details is required" });
-    if (!work_time || !work_time.trim()) return res.status(400).json({ error: "work_time is required" });
+    if (!work_date) return res.status(400).json({ ok: false, error: "work_date is required" });
+    if (!details?.trim()) return res.status(400).json({ ok: false, error: "details is required" });
+    if (!work_time?.trim()) return res.status(400).json({ ok: false, error: "work_time is required" });
 
-    let dateObj = new Date(work_date);
+    const dateObj = new Date(work_date);
     if (isNaN(dateObj.getTime())) {
-      return res.status(400).json({ error: "Invalid work_date format" });
+      return res.status(400).json({ ok: false, error: "Invalid work_date format" });
     }
 
-    // Process extra_entries if provided
+    // build arrays from extra_entries
     let extraDetails = [];
     let extraTimes = [];
-
     if (Array.isArray(extra_entries)) {
       extra_entries.forEach((e) => {
-        if (e.detail?.trim() || e.time?.trim()) {
+        if (e?.detail?.trim() || e?.time?.trim()) {
           extraDetails.push(e.detail?.trim() || "");
           extraTimes.push(e.time?.trim() || "");
         }
       });
     }
 
-    // Insert into DB
-    const result = await db.query(
-      `INSERT INTO dpr
-       (category_id, work_date, details, work_time, extra_details, extra_times)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING *`,
-      [category_id || null, dateObj, details.trim(), work_time.trim(), extraDetails, extraTimes]
+    const { rows } = await db.query(
+      `
+      INSERT INTO dpr
+        (category_id, work_date, details, work_time, extra_details, extra_times)
+      VALUES
+        ($1, $2, $3, $4, $5, $6)
+      RETURNING *
+      `,
+      [
+        category_id || null,
+        dateObj,
+        details.trim(),
+        work_time.trim(),
+        extraDetails,
+        extraTimes,
+      ]
     );
 
-    res.json({ success: true, dpr: result.rows[0] });
+    res.json({ ok: true, data: rows[0] });
   } catch (err) {
-    console.error("Error adding DPR entry:", err);
-    res.status(500).json({ error: "Failed to add DPR entry" });
+    console.error("Error adding DPR:", err);
+    res.status(500).json({ ok: false, error: "Failed to add DPR entry" });
   }
 });
 
-
-// ===== UPDATE DPR entry =====
+/**
+ * PUT /api/dpr/:id
+ */
 router.put("/dpr/:id", async (req, res) => {
   const { id } = req.params;
   let { category_id, work_date, details, work_time, extra_details, extra_times } = req.body;
 
-  if (!details || !work_time) {
-    return res.status(400).json({ error: "Details and work_time are required" });
+  if (!details?.trim() || !work_time?.trim()) {
+    return res.status(400).json({ ok: false, error: "details and work_time are required" });
   }
 
   try {
-    const existing = await db.query("SELECT * FROM dpr WHERE id=$1", [id]);
-    if (existing.rows.length === 0) {
-      return res.status(404).json({ error: "DPR entry not found" });
+    // get existing
+    const existing = await db.query("SELECT * FROM dpr WHERE id = $1", [id]);
+    if (!existing.rows.length) {
+      return res.status(404).json({ ok: false, error: "DPR entry not found" });
     }
 
-    // Validate date if provided
+    // date
+    let finalDate;
     if (work_date) {
-      work_date = new Date(work_date);
-      if (isNaN(work_date.getTime())) {
-        return res.status(400).json({ error: "Invalid work_date format" });
+      const dt = new Date(work_date);
+      if (isNaN(dt.getTime())) {
+        return res.status(400).json({ ok: false, error: "Invalid work_date format" });
       }
+      finalDate = dt;
     } else {
-      work_date = existing.rows[0].work_date;
+      finalDate = existing.rows[0].work_date;
     }
 
-    const result = await db.query(
-      `UPDATE dpr
-       SET category_id=$1,
-           work_date=$2,
-           details=$3,
-           work_time=$4,
-           extra_details=$5,
-           extra_times=$6
-       WHERE id=$7
-       RETURNING *`,
+    const { rows } = await db.query(
+      `
+      UPDATE dpr
+      SET category_id = $1,
+          work_date   = $2,
+          details     = $3,
+          work_time   = $4,
+          extra_details = $5,
+          extra_times   = $6
+      WHERE id = $7
+      RETURNING *
+      `,
       [
         category_id || existing.rows[0].category_id,
-        work_date,
-        details,
-        work_time,
+        finalDate,
+        details.trim(),
+        work_time.trim(),
         Array.isArray(extra_details) ? extra_details : existing.rows[0].extra_details,
         Array.isArray(extra_times) ? extra_times : existing.rows[0].extra_times,
-        id
+        id,
       ]
     );
 
-    res.json(result.rows[0]);
+    res.json({ ok: true, data: rows[0] });
   } catch (err) {
-    console.error("Error updating DPR entry:", err);
-    res.status(500).json({ error: "Failed to update DPR entry" });
+    console.error("Error updating DPR:", err);
+    res.status(500).json({ ok: false, error: "Failed to update DPR entry" });
   }
 });
 
-// ✅ 1. GET DPR entries by month (arranged by date + sequence)
-router.get("/dpr/month/:month", async (req, res) => {
-  const { month } = req.params; // Example: January, February, etc.
-
+/**
+ * DELETE /api/dpr/:id
+ */
+router.delete("/dpr/:id", async (req, res) => {
+  const { id } = req.params;
   try {
-    const result = await db.query(
-      `SELECT id, seq_no, category_id, details, work_time, extra_details, extra_times,
-              TO_CHAR(work_date, 'YYYY-MM-DD') AS work_date, month_name
-       FROM dpr
-       WHERE month_name = $1
-       ORDER BY work_date ASC, seq_no ASC`,
-      [month]
-    );
-
-    res.json(result.rows);
+    await db.query("DELETE FROM dpr WHERE id = $1", [id]);
+    res.json({ ok: true });
   } catch (err) {
-    console.error("Error fetching DPR by month:", err);
-    res.status(500).json({ error: "Failed to fetch DPR entries" });
+    console.error("Error deleting DPR:", err);
+    res.status(500).json({ ok: false, error: "Failed to delete DPR entry" });
   }
 });
 
+/**
+ * (optional) DELETE whole day
+ * DELETE /api/dpr/delete/2025-10-03
+ */
+router.delete("/dpr/delete/:date", async (req, res) => {
+  try {
+    const { date } = req.params;
+    const dt = new Date(date);
+    if (isNaN(dt.getTime())) {
+      return res.status(400).json({ ok: false, error: "Invalid date" });
+    }
+    // use ISO date only (no time)
+    const onlyDate = dt.toISOString().slice(0, 10);
+    await db.query("DELETE FROM dpr WHERE work_date = $1", [onlyDate]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Error deleting DPR by date:", err);
+    res.status(500).json({ ok: false, error: "Failed to delete DPR for this date" });
+  }
+});
 
-// ✅ 2. EXPORT DPR entries by month (same but for export use)
-
-// ===== EXPORT DPR entries by month as professional PDF =====
+/* =========================
+   3. PROFESSIONAL PDF EXPORT
+   ========================= */
+/**
+ * GET /api/dpr/export/October
+ * -> returns a clean, black-text, table-style PDF
+ */
 router.get("/dpr/export/:month", async (req, res) => {
-  const { month } = req.params;
+  const { month } = req.params; // e.g. "October"
 
   try {
-    // Fetch DPR data with category names
-    const result = await db.query(
-      `SELECT d.seq_no, d.details, d.work_time, d.extra_details, d.extra_times,
-              TO_CHAR(d.work_date, 'YYYY-MM-DD') AS work_date,
-              c.category_name
-       FROM dpr d
-       LEFT JOIN workcategory c ON d.category_id = c.id
-       WHERE d.month_name = $1
-       ORDER BY d.work_date ASC, d.seq_no ASC`,
+    // 1) fetch rows for that month
+    const { rows } = await db.query(
+      `
+      SELECT d.id,
+             d.seq_no,
+             d.details,
+             d.work_time,
+             d.extra_details,
+             d.extra_times,
+             TO_CHAR(d.work_date, 'YYYY-MM-DD') AS work_date,
+             d.month_name,
+             c.category_name
+      FROM dpr d
+      LEFT JOIN workcategory c ON d.category_id = c.id
+      WHERE d.month_name = $1
+      ORDER BY d.work_date ASC, d.seq_no ASC, d.id ASC
+      `,
       [month]
     );
 
-    const dprData = result.rows;
+    // 2) setup PDF
+    const doc = new PDFDocument({
+      margin: 35,
+      size: "A4",
+    });
 
-    // Create PDF
-    const doc = new PDFDocument({ margin: 30, size: "A4" });
     const filename = encodeURIComponent(`DPR_${month}.pdf`);
-
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
     res.setHeader("Content-Type", "application/pdf");
 
     doc.pipe(res);
 
-    // Title
-    doc.fontSize(20).font("Helvetica-Bold").text(`DPR Records - ${month}`, { align: "center" });
-    doc.moveDown(1);
+    // 3) main heading
+    doc
+      .font("Helvetica-Bold")
+      .fontSize(18)
+      .fillColor("black")
+      .text("Daily Progress Report (DPR)", { align: "left" });
 
-    // Table settings
-    const table = {
-      x: 40,
-      y: doc.y,
-      rowHeight: 25,
-      colWidths: {
-        seq: 40,
-        date: 80,
-        category: 100,
-        details: 220,
-        time: 90,
-      },
-      pageHeight: doc.page.height - doc.page.margins.bottom,
-    };
+    doc.moveDown(0.35);
+    doc
+      .font("Helvetica")
+      .fontSize(11)
+      .fillColor("black")
+      .text(`Month: ${month}`, { align: "left" });
 
-    // Draw table header
-    const drawTableHeader = () => {
-      if (table.y + table.rowHeight > table.pageHeight) doc.addPage();
-      doc.fontSize(12).font("Helvetica-Bold");
-      let x = table.x;
-      let y = table.y;
+    doc.moveDown(0.8);
 
-      doc.rect(x, y, table.colWidths.seq, table.rowHeight).stroke();
-      doc.text("Seq", x + 5, y + 7, { width: table.colWidths.seq - 10 });
+    // 4) table config
+    const startX = 35;
+    let cursorY = doc.y;
+    const pageHeight = doc.page.height - doc.page.margins.bottom;
 
-      x += table.colWidths.seq;
-      doc.rect(x, y, table.colWidths.date, table.rowHeight).stroke();
-      doc.text("Date", x + 5, y + 7, { width: table.colWidths.date - 10 });
+    // columns (total ≈ 35 + 28 + 80 + 95 + 215 + 90 = fits A4)
+    const COLS = [
+      { key: "seq", label: "#", width: 28 },
+      { key: "date", label: "Date", width: 80 },
+      { key: "cat", label: "Category", width: 95 },
+      { key: "details", label: "Details", width: 215 },
+      { key: "time", label: "Time", width: 90 },
+    ];
 
-      x += table.colWidths.date;
-      doc.rect(x, y, table.colWidths.category, table.rowHeight).stroke();
-      doc.text("Category", x + 5, y + 7, { width: table.colWidths.category - 10 });
+    // draw table header
+    function drawHeader() {
+      let x = startX;
+      const h = 22;
 
-      x += table.colWidths.category;
-      doc.rect(x, y, table.colWidths.details, table.rowHeight).stroke();
-      doc.text("Details", x + 5, y + 7, { width: table.colWidths.details - 10 });
-
-      x += table.colWidths.details;
-      doc.rect(x, y, table.colWidths.time, table.rowHeight).stroke();
-      doc.text("Time", x + 5, y + 7, { width: table.colWidths.time - 10 });
-
-      table.y += table.rowHeight;
-    };
-
-    // Draw table row
-    const drawRow = (seq, date, category, details, time) => {
-      if (table.y + table.rowHeight > table.pageHeight) {
+      if (cursorY + h > pageHeight) {
         doc.addPage();
-        table.y = 30;
-        drawTableHeader();
+        cursorY = doc.y;
       }
 
-      let x = table.x;
-      let y = table.y;
-      const rowHeight = table.rowHeight;
-      const colWidths = table.colWidths;
+      doc
+        .font("Helvetica-Bold")
+        .fontSize(10)
+        .fillColor("black");
 
-      doc.rect(x, y, colWidths.seq, rowHeight).stroke();
-      doc.font("Helvetica").text(seq, x + 5, y + 7, { width: colWidths.seq - 10 });
+      COLS.forEach((col) => {
+        doc.rect(x, cursorY, col.width, h).stroke();
+        doc.text(col.label, x + 3, cursorY + 6, {
+          width: col.width - 6,
+          align: col.key === "seq" ? "center" : "left",
+        });
+        x += col.width;
+      });
 
-      x += colWidths.seq;
-      doc.rect(x, y, colWidths.date, rowHeight).stroke();
-      doc.text(date, x + 5, y + 7, { width: colWidths.date - 10 });
+      cursorY += h;
+    }
 
-      x += colWidths.date;
-      doc.rect(x, y, colWidths.category, rowHeight).stroke();
-      doc.text(category || "-", x + 5, y + 7, { width: colWidths.category - 10 });
+    // draw single row with auto height
+    function drawRow(rowObj) {
+      doc.font("Helvetica").fontSize(9).fillColor("black");
 
-      x += colWidths.category;
-      doc.rect(x, y, colWidths.details, rowHeight).stroke();
-      doc.text(details || "-", x + 5, y + 7, { width: colWidths.details - 10 });
+      // compute height based on each column text
+      const heights = COLS.map((col) => {
+        const text = rowObj[col.key] || "";
+        return (
+          doc.heightOfString(text, {
+            width: col.width - 6,
+          }) + 6
+        );
+      });
 
-      x += colWidths.details;
-      doc.rect(x, y, colWidths.time, rowHeight).stroke();
-      doc.text(time || "-", x + 5, y + 7, { width: colWidths.time - 10 });
+      const rowHeight = Math.max(20, ...heights);
 
-      table.y += rowHeight;
-    };
+      // check page break
+      if (cursorY + rowHeight > pageHeight) {
+        doc.addPage();
+        cursorY = doc.y;
+        drawHeader();
+      }
 
-    drawTableHeader();
+      let x = startX;
+      COLS.forEach((col) => {
+        const text = rowObj[col.key] || "";
+        doc.rect(x, cursorY, col.width, rowHeight).stroke();
+        doc.text(text, x + 3, cursorY + 3, {
+          width: col.width - 6,
+          align: col.key === "seq" ? "center" : "left",
+        });
+        x += col.width;
+      });
 
-    if (dprData.length === 0) {
-      doc.moveDown(1);
-      doc.fontSize(12).text("No DPR entries found for this month.", { align: "center" });
+      cursorY += rowHeight;
+    }
+
+    // 5) print table
+    drawHeader();
+
+    if (!rows.length) {
+      // no data row
+      drawRow({
+        seq: "",
+        date: "",
+        cat: "",
+        details: "No DPR entries found for this month.",
+        time: "",
+      });
     } else {
-      let seqCounter = 1;
-      dprData.forEach((item) => {
-        drawRow(seqCounter++, item.work_date, item.category_name, item.details, item.work_time);
+      let seq = 1;
+      rows.forEach((item) => {
+        // main row
+        drawRow({
+          seq: String(seq),
+          date: formatNiceDate(item.work_date),
+          cat: item.category_name || "-",
+          details: item.details || "-",
+          time: item.work_time || "-",
+        });
+        seq++;
 
-        if (Array.isArray(item.extra_details)) {
-          item.extra_details.forEach((extra, eIdx) => {
-            drawRow("", "", "", extra, item.extra_times[eIdx] || "");
+        // extra rows (bullets)
+        const extrasD = toTextArray(item.extra_details);
+        const extrasT = toTextArray(item.extra_times);
+        if (extrasD.length) {
+          extrasD.forEach((ex, idx) => {
+            drawRow({
+              seq: "",
+              date: "",
+              cat: "",
+              details: `• ${ex}`,
+              time: extrasT[idx] || "",
+            });
           });
         }
       });
     }
 
-    // Footer
-    doc.moveDown(2);
-    doc.fontSize(10).fillColor("gray").text(
-      `Generated on: ${new Date().toLocaleString()}`,
-      { align: "right" }
-    );
+    // 6) footer (only once, at the very end)
+    // if we're too close to bottom, move to new page
+    if (cursorY + 40 > pageHeight) {
+      doc.addPage();
+      cursorY = doc.y;
+    }
 
+    doc.moveDown(1);
+    doc
+      .font("Helvetica")
+      .fontSize(9)
+      .fillColor("gray")
+      .text("Ajay Kedar — DPR Export", {
+        align: "right",
+      });
+    doc
+      .font("Helvetica")
+      .fontSize(9)
+      .fillColor("gray")
+      .text(`Generated on: ${new Date().toLocaleString()}`, {
+        align: "right",
+      });
+
+    // 7) end
     doc.end();
   } catch (err) {
     console.error("Error exporting DPR:", err);
-    res.status(500).json({ error: "Failed to export DPR entries" });
+    return res
+      .status(500)
+      .json({ ok: false, error: "Failed to export DPR PDF" });
   }
 });
 
