@@ -87,33 +87,55 @@ router.get("/:id/file", async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
-
-// VIEW DOCUMENT BY ID (Browser-viewable only)
+// VIEW DOCUMENT BY ID — works on Web + Mobile App WebView
 router.get("/view/:id", async (req, res) => {
   try {
     const { id } = req.params;
+
     const result = await db.query(
       "SELECT file_name, file_type, file_data FROM documents WHERE document_id=$1",
       [id]
     );
 
-    if (result.rows.length === 0) return res.status(404).json({ error: "Document not found" });
-
-    const doc = result.rows[0];
-    const viewableTypes = ["application/pdf", "image/jpeg", "image/png", "image/gif", "text/plain"];
-
-    if (!viewableTypes.includes(doc.file_type)) {
-      return res.status(400).json({ error: "This file type cannot be viewed in browser" });
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Document not found" });
     }
 
-    res.setHeader("Content-Disposition", `inline; filename="${doc.file_name}"`);
-    res.setHeader("Content-Type", doc.file_type);
-    res.send(doc.file_data);
+    const doc = result.rows[0];
+    const mime = doc.file_type || "application/octet-stream";
+    const filename = doc.file_name || "document";
+
+    // For safety, allow all major doc types to render or download in-app browsers
+    const inlineTypes = [
+      "application/pdf",
+      "image/jpeg",
+      "image/png",
+      "image/gif",
+      "text/plain",
+    ];
+
+    // ✅ Always include correct Content-Type
+    res.setHeader("Content-Type", mime);
+
+    // ✅ For viewable types → render inline (works in web + in-app browsers)
+    // ✅ For other types (Word, Excel, ZIP, etc.) → suggest download
+    if (inlineTypes.includes(mime)) {
+      res.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(filename)}"`);
+    } else {
+      res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(filename)}"`);
+    }
+
+    // ✅ Cache headers for performance (optional)
+    res.setHeader("Cache-Control", "private, max-age=0, must-revalidate");
+
+    // ✅ Send file buffer directly (binary-safe)
+    res.end(doc.file_data);
   } catch (err) {
     console.error("View document error:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
+
 
 // ------------------
 // DELETE DOCUMENT
