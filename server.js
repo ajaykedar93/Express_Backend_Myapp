@@ -37,7 +37,6 @@ const documentRouter = require("./routes/document");
 // Work-related
 const workDetailsRouter = require("./routes/workdetails");
 const inwardRouter = require("./routes/inward");
-const siteKharchRouter = require("./routes/site_kharch");
 const workCategoryRouter = require("./routes/workcategory");
 
 
@@ -92,7 +91,6 @@ app.use("/api/documents", documentRouter);
 // Work-related
 app.use("/api", workDetailsRouter);
 app.use("/api", inwardRouter);
-app.use("/api", siteKharchRouter);
 app.use("/api/workcategory", workCategoryRouter);
 
 // Finance / transactions (legacy)
@@ -127,6 +125,12 @@ app.use("/api/admin_impdocument", adminImpDocumentRouter);
 
 const userActFavoriteRoutes = require("./routes/userActFavorite");
 app.use("/api", userActFavoriteRoutes);
+
+// ✅ keep only new defensive one
+app.use("/api/sitekharch", require("./routes/sitekharch_new"));
+
+
+
 
 
 /* ---------------- Health Check ---------------- */
