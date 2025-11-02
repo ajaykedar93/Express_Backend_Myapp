@@ -320,14 +320,15 @@ router.get("/inward/:id", async (req, res) => {
 
 router.post("/inward", async (req, res) => {
   try {
-    // force the category to INWARD always
+    // 👇 force it here
     const raw = {
       ...req.body,
-      category_id: INWARD_CATEGORY_ID,
+      category_id: 2, // INWARD – change if your id is different
     };
 
-    if (!raw.details?.trim())
+    if (!raw.details?.trim()) {
       return res.status(400).json({ error: "details is required" });
+    }
 
     const data = prepareDataFromBody(raw);
     const cols = Object.keys(data);
@@ -337,17 +338,19 @@ router.post("/inward", async (req, res) => {
     );
 
     const result = await db.query(
-      `INSERT INTO ${TABLE} (${cols.join(",")}) VALUES (${placeholders.join(
+      `INSERT INTO inward (${cols.join(",")}) VALUES (${placeholders.join(
         ","
       )}) RETURNING *`,
       vals
     );
-    res.status(201).json(result.rows[0]);
+
+    return res.status(201).json(result.rows[0]);
   } catch (err) {
     console.error("POST /inward", err);
-    res.status(500).json({ error: "Failed to create inward record" });
+    return res.status(500).json({ error: "Failed to create inward record" });
   }
 });
+
 
 router.put("/inward/:id", async (req, res) => {
   try {
