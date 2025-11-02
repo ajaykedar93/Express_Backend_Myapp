@@ -7,7 +7,6 @@ const moment = require("moment");
 
 const TABLE = "inward";
 const PK = "id";
-const INWARD_CATEGORY_ID = 2; // 👈 change if your INWARD id is different
 
 // ==========================
 // Helper functions
@@ -29,6 +28,8 @@ function normalizeExtrasArray(extrasAll) {
     );
 }
 
+// if extra_details / extra_quantity / extra_quantity_type
+// are not given but extra_items has something, we copy the 1st to legacy cols
 function ensureLegacyFromExtras(data) {
   const legacyProvided =
     data.extra_details !== undefined ||
@@ -61,12 +62,12 @@ function ensureLegacyFromExtras(data) {
 function prepareDataFromBody(body) {
   const out = { ...body };
 
-  // 1) new style array
+  // new style: extras_all → extra_items (array)
   if (Object.prototype.hasOwnProperty.call(body, "extras_all")) {
     out.extra_items = normalizeExtrasArray(body.extras_all);
   }
 
-  // 2) normalize string → array
+  // if extra_items came as string, parse it
   if (typeof out.extra_items === "string") {
     try {
       out.extra_items = JSON.parse(out.extra_items);
@@ -76,7 +77,7 @@ function prepareDataFromBody(body) {
   }
   if (!Array.isArray(out.extra_items)) out.extra_items = [];
 
-  // empty work_date → remove (let DB default or allow null)
+  // empty date → drop it
   if (out.work_date !== undefined && String(out.work_date).trim() === "") {
     delete out.work_date;
   }
@@ -97,17 +98,12 @@ router.get("/inward/export", async (req, res) => {
     `;
     const vals = [];
     const cond = [];
-    let i = 1;
-
-    // always restrict to INWARD (2) unless someone wants another
-    cond.push(`category_id = $${i++}`);
-    vals.push(INWARD_CATEGORY_ID);
 
     if (date) {
-      cond.push(`work_date = $${i++}`);
+      cond.push(`work_date = $1`);
       vals.push(date);
     } else if (month) {
-      cond.push(`TRIM(TO_CHAR(work_date, 'Month')) ILIKE TRIM($${i++})`);
+      cond.push(`TRIM(TO_CHAR(work_date, 'Month')) ILIKE TRIM($1)`);
       vals.push(month);
     }
 
@@ -121,7 +117,9 @@ router.get("/inward/export", async (req, res) => {
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename=inward_export_${moment().format("YYYYMMDD_HHmm")}.pdf`
+      `attachment; filename=inward_export_${moment().format(
+        "YYYYMMDD_HHmm"
+      )}.pdf`
     );
 
     const doc = new PDFDocument({ size: "A4", margin: 40 });
@@ -257,27 +255,20 @@ router.get("/inward/export", async (req, res) => {
 // ==========================
 // REST APIs
 // ==========================
+
+// LIST (with optional date / month)
 router.get("/inward", async (req, res) => {
   try {
-    const { category_id, date, month } = req.query;
+    const { date, month } = req.query;
     const cond = [];
     const vals = [];
     let i = 1;
-
-    // if user sends ?category_id=.. → use it
-    // otherwise, default to INWARD
-    if (category_id) {
-      cond.push(`category_id = $${i++}`);
-      vals.push(Number(category_id));
-    } else {
-      cond.push(`category_id = $${i++}`);
-      vals.push(INWARD_CATEGORY_ID);
-    }
 
     if (date) {
       cond.push(`work_date = $${i++}`);
       vals.push(date);
     } else if (month) {
+      // month = "January", "Feb", etc
       const months = moment.months();
       const monthIndex = months.indexOf(month);
       if (monthIndex >= 0) {
@@ -286,13 +277,21 @@ router.get("/inward", async (req, res) => {
         const lastDay = moment(firstDay).endOf("month").format("YYYY-MM-DD");
         cond.push(`work_date BETWEEN $${i++} AND $${i++}`);
         vals.push(firstDay, lastDay);
+      } else {
+        // fallback to text match
+        cond.push(`TRIM(TO_CHAR(work_date, 'Month')) ILIKE TRIM($${i++})`);
+        vals.push(month);
       }
     }
 
     const where = cond.length ? `WHERE ${cond.join(" AND ")}` : "";
-    const sql = `SELECT ${PK}, seq_no, work_date, work_time, details, quantity, quantity_type 
-                 FROM ${TABLE} ${where} 
-                 ORDER BY work_date ASC, seq_no ASC, ${PK} ASC`;
+    const sql = `
+      SELECT ${PK}, seq_no, work_date, work_time, details, quantity, quantity_type,
+             extra_details, extra_quantity, extra_quantity_type, extra_items
+      FROM ${TABLE}
+      ${where}
+      ORDER BY work_date ASC, seq_no ASC, ${PK} ASC
+    `;
 
     const result = await db.query(sql, vals);
     res.json({ data: result.rows });
@@ -302,15 +301,19 @@ router.get("/inward", async (req, res) => {
   }
 });
 
+// GET BY ID
 router.get("/inward/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (isNaN(id)) return res.status(400).json({ error: "Invalid ID" });
-    const result = await db.query(`SELECT * FROM ${TABLE} WHERE ${PK}=$1`, [
-      id,
-    ]);
+
+    const result = await db.query(
+      `SELECT * FROM ${TABLE} WHERE ${PK} = $1`,
+      [id]
+    );
     if (!result.rows.length)
       return res.status(404).json({ error: "Not found" });
+
     res.json(result.rows[0]);
   } catch (err) {
     console.error("GET /inward/:id", err);
@@ -318,14 +321,12 @@ router.get("/inward/:id", async (req, res) => {
   }
 });
 
+// CREATE
 router.post("/inward", async (req, res) => {
   try {
-    // 👇 force it here
-    const raw = {
-      ...req.body,
-      category_id: 2, // INWARD – change if your id is different
-    };
+    const raw = req.body || {};
 
+    // now we do NOT require category_id because table doesn't have it
     if (!raw.details?.trim()) {
       return res.status(400).json({ error: "details is required" });
     }
@@ -338,47 +339,47 @@ router.post("/inward", async (req, res) => {
     );
 
     const result = await db.query(
-      `INSERT INTO inward (${cols.join(",")}) VALUES (${placeholders.join(
+      `INSERT INTO ${TABLE} (${cols.join(",")}) VALUES (${placeholders.join(
         ","
       )}) RETURNING *`,
       vals
     );
 
-    return res.status(201).json(result.rows[0]);
+    res.status(201).json(result.rows[0]);
   } catch (err) {
     console.error("POST /inward", err);
-    return res.status(500).json({ error: "Failed to create inward record" });
+    res.status(500).json({ error: "Failed to create inward record" });
   }
 });
 
-
+// UPDATE
 router.put("/inward/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (isNaN(id)) return res.status(400).json({ error: "Invalid ID" });
 
-    // 👇 even on update, keep it INWARD
-    const body = {
-      ...req.body,
-      category_id: INWARD_CATEGORY_ID,
-    };
+    const data = prepareDataFromBody(req.body || {});
+    const keys = Object.keys(data);
 
-    const data = prepareDataFromBody(body);
-    const sets = Object.keys(data).map((k, i) => `${k}=$${i + 1}`);
-    const vals = Object.values(data).map((v) =>
-      typeof v === "object" ? JSON.stringify(v) : v
+    if (!keys.length) {
+      return res
+        .status(400)
+        .json({ error: "No updatable fields provided" });
+    }
+
+    const sets = keys.map((k, i) => `${k}=$${i + 1}`);
+    const vals = keys.map((k) =>
+      typeof data[k] === "object" ? JSON.stringify(data[k]) : data[k]
     );
-
-    if (!sets.length)
-      return res.status(400).json({ error: "No updatable fields provided" });
-
     vals.push(id);
+
     const result = await db.query(
-      `UPDATE ${TABLE} SET ${sets.join(", ")} WHERE ${PK}=$${
+      `UPDATE ${TABLE} SET ${sets.join(", ")} WHERE ${PK} = $${
         sets.length + 1
       } RETURNING *`,
       vals
     );
+
     if (!result.rows.length)
       return res.status(404).json({ error: "Record not found" });
 
@@ -389,16 +390,20 @@ router.put("/inward/:id", async (req, res) => {
   }
 });
 
+// DELETE
 router.delete("/inward/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (isNaN(id)) return res.status(400).json({ error: "Invalid ID" });
+
     const result = await db.query(
-      `DELETE FROM ${TABLE} WHERE ${PK}=$1 RETURNING *`,
+      `DELETE FROM ${TABLE} WHERE ${PK} = $1 RETURNING *`,
       [id]
     );
+
     if (!result.rows.length)
       return res.status(404).json({ error: "Record not found" });
+
     res.json({ ok: true, deleted: result.rows[0] });
   } catch (err) {
     console.error("DELETE /inward/:id", err);
@@ -406,13 +411,20 @@ router.delete("/inward/:id", async (req, res) => {
   }
 });
 
+// RESEQUENCE
 router.post("/inward/resequence", async (req, res) => {
   try {
     const orderBy = String(req.body?.orderBy || "").toLowerCase();
     let orderExpr = `work_date ASC, ${PK} ASC`;
-    if (orderBy === "id") orderExpr = `${PK} ASC`;
-    else if (orderBy === "category_id")
-      orderExpr = `category_id ASC, ${PK} ASC`;
+
+    if (orderBy === "id") {
+      orderExpr = `${PK} ASC`;
+    } else if (orderBy === "date") {
+      orderExpr = `work_date ASC, ${PK} ASC`;
+    } else if (orderBy === "seq") {
+      // if someone wants to resequence based on current seq
+      orderExpr = `seq_no ASC, ${PK} ASC`;
+    }
 
     const sql = `
       WITH ordered AS (
@@ -425,6 +437,7 @@ router.post("/inward/resequence", async (req, res) => {
       WHERE t.${PK} = o.${PK}
       RETURNING t.${PK};
     `;
+
     const result = await db.query(sql);
     res.json({ ok: true, resequenced: result.rows.length });
   } catch (err) {
