@@ -8,6 +8,19 @@ const moment = require("moment");
 const TABLE = "inward";
 const PK = "id";
 
+// columns that actually exist in your inward table
+const ALLOWED_COLUMNS = new Set([
+  "work_date",
+  "work_time",
+  "details",
+  "quantity",
+  "quantity_type",
+  "extra_details",
+  "extra_quantity",
+  "extra_quantity_type",
+  "extra_items",
+]);
+
 // ==========================
 // Helper functions
 // ==========================
@@ -28,8 +41,6 @@ function normalizeExtrasArray(extrasAll) {
     );
 }
 
-// if extra_details / extra_quantity / extra_quantity_type
-// are not given but extra_items has something, we copy the 1st to legacy cols
 function ensureLegacyFromExtras(data) {
   const legacyProvided =
     data.extra_details !== undefined ||
@@ -62,12 +73,14 @@ function ensureLegacyFromExtras(data) {
 function prepareDataFromBody(body) {
   const out = { ...body };
 
-  // new style: extras_all → extra_items (array)
+  // 1) convert extras_all -> extra_items
   if (Object.prototype.hasOwnProperty.call(body, "extras_all")) {
     out.extra_items = normalizeExtrasArray(body.extras_all);
+    // very important: remove extras_all so we don't try to insert that column
+    delete out.extras_all;
   }
 
-  // if extra_items came as string, parse it
+  // 2) make sure extra_items is an array
   if (typeof out.extra_items === "string") {
     try {
       out.extra_items = JSON.parse(out.extra_items);
@@ -77,16 +90,17 @@ function prepareDataFromBody(body) {
   }
   if (!Array.isArray(out.extra_items)) out.extra_items = [];
 
-  // empty date → drop it
+  // 3) clean empty date
   if (out.work_date !== undefined && String(out.work_date).trim() === "") {
     delete out.work_date;
   }
 
+  // 4) copy first extra to legacy
   return ensureLegacyFromExtras(out);
 }
 
 // ==========================
-// EXPORT PDF (Professional Table)
+// EXPORT PDF
 // ==========================
 router.get("/inward/export", async (req, res) => {
   try {
@@ -113,7 +127,6 @@ router.get("/inward/export", async (req, res) => {
     const result = await db.query(query, vals);
     const records = result.rows;
 
-    // ========== PDF setup ==========
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader(
       "Content-Disposition",
@@ -125,7 +138,6 @@ router.get("/inward/export", async (req, res) => {
     const doc = new PDFDocument({ size: "A4", margin: 40 });
     doc.pipe(res);
 
-    // ---- HEADER ----
     doc
       .font("Helvetica-Bold")
       .fontSize(18)
@@ -147,9 +159,8 @@ router.get("/inward/export", async (req, res) => {
       );
     doc.moveDown(0.7);
 
-    // ---- TABLE ----
-    const tableWidth = 445; // total width of table
-    const startX = (doc.page.width - tableWidth) / 2; // center the table
+    const tableWidth = 445;
+    const startX = (doc.page.width - tableWidth) / 2;
     let cursorY = doc.y;
     const pageHeight = doc.page.height - doc.page.margins.bottom;
 
@@ -232,7 +243,6 @@ router.get("/inward/export", async (req, res) => {
       });
     }
 
-    // ---- FOOTER ----
     doc.moveDown(1.5);
     doc
       .font("Helvetica-Bold")
@@ -256,7 +266,7 @@ router.get("/inward/export", async (req, res) => {
 // REST APIs
 // ==========================
 
-// LIST (with optional date / month)
+// LIST
 router.get("/inward", async (req, res) => {
   try {
     const { date, month } = req.query;
@@ -268,7 +278,6 @@ router.get("/inward", async (req, res) => {
       cond.push(`work_date = $${i++}`);
       vals.push(date);
     } else if (month) {
-      // month = "January", "Feb", etc
       const months = moment.months();
       const monthIndex = months.indexOf(month);
       if (monthIndex >= 0) {
@@ -278,7 +287,6 @@ router.get("/inward", async (req, res) => {
         cond.push(`work_date BETWEEN $${i++} AND $${i++}`);
         vals.push(firstDay, lastDay);
       } else {
-        // fallback to text match
         cond.push(`TRIM(TO_CHAR(work_date, 'Month')) ILIKE TRIM($${i++})`);
         vals.push(month);
       }
@@ -306,14 +314,12 @@ router.get("/inward/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (isNaN(id)) return res.status(400).json({ error: "Invalid ID" });
-
     const result = await db.query(
-      `SELECT * FROM ${TABLE} WHERE ${PK} = $1`,
+      `SELECT * FROM ${TABLE} WHERE ${PK}=$1`,
       [id]
     );
     if (!result.rows.length)
       return res.status(404).json({ error: "Not found" });
-
     res.json(result.rows[0]);
   } catch (err) {
     console.error("GET /inward/:id", err);
@@ -326,12 +332,19 @@ router.post("/inward", async (req, res) => {
   try {
     const raw = req.body || {};
 
-    // now we do NOT require category_id because table doesn't have it
+    // only check what is real
     if (!raw.details?.trim()) {
       return res.status(400).json({ error: "details is required" });
     }
 
-    const data = prepareDataFromBody(raw);
+    // convert extras_all -> extra_items, drop extras_all
+    let data = prepareDataFromBody(raw);
+
+    // keep only columns that exist in the table
+    data = Object.fromEntries(
+      Object.entries(data).filter(([key]) => ALLOWED_COLUMNS.has(key))
+    );
+
     const cols = Object.keys(data);
     const placeholders = cols.map((_, i) => `$${i + 1}`);
     const vals = cols.map((k) =>
@@ -344,7 +357,6 @@ router.post("/inward", async (req, res) => {
       )}) RETURNING *`,
       vals
     );
-
     res.status(201).json(result.rows[0]);
   } catch (err) {
     console.error("POST /inward", err);
@@ -358,23 +370,24 @@ router.put("/inward/:id", async (req, res) => {
     const id = Number(req.params.id);
     if (isNaN(id)) return res.status(400).json({ error: "Invalid ID" });
 
-    const data = prepareDataFromBody(req.body || {});
-    const keys = Object.keys(data);
+    let data = prepareDataFromBody(req.body || {});
+    // strip extras_all here also
+    data = Object.fromEntries(
+      Object.entries(data).filter(([key]) => ALLOWED_COLUMNS.has(key))
+    );
 
-    if (!keys.length) {
-      return res
-        .status(400)
-        .json({ error: "No updatable fields provided" });
-    }
+    const keys = Object.keys(data);
+    if (!keys.length)
+      return res.status(400).json({ error: "No updatable fields provided" });
 
     const sets = keys.map((k, i) => `${k}=$${i + 1}`);
     const vals = keys.map((k) =>
-      typeof data[k] === "object" ? JSON.stringify(data[k]) : data[k]
+      k === "extra_items" ? JSON.stringify(data[k]) : data[k]
     );
     vals.push(id);
 
     const result = await db.query(
-      `UPDATE ${TABLE} SET ${sets.join(", ")} WHERE ${PK} = $${
+      `UPDATE ${TABLE} SET ${sets.join(", ")} WHERE ${PK}=$${
         sets.length + 1
       } RETURNING *`,
       vals
@@ -397,10 +410,9 @@ router.delete("/inward/:id", async (req, res) => {
     if (isNaN(id)) return res.status(400).json({ error: "Invalid ID" });
 
     const result = await db.query(
-      `DELETE FROM ${TABLE} WHERE ${PK} = $1 RETURNING *`,
+      `DELETE FROM ${TABLE} WHERE ${PK}=$1 RETURNING *`,
       [id]
     );
-
     if (!result.rows.length)
       return res.status(404).json({ error: "Record not found" });
 
@@ -411,7 +423,7 @@ router.delete("/inward/:id", async (req, res) => {
   }
 });
 
-// RESEQUENCE
+// RESEQUENCE (no category_id now)
 router.post("/inward/resequence", async (req, res) => {
   try {
     const orderBy = String(req.body?.orderBy || "").toLowerCase();
@@ -419,10 +431,7 @@ router.post("/inward/resequence", async (req, res) => {
 
     if (orderBy === "id") {
       orderExpr = `${PK} ASC`;
-    } else if (orderBy === "date") {
-      orderExpr = `work_date ASC, ${PK} ASC`;
     } else if (orderBy === "seq") {
-      // if someone wants to resequence based on current seq
       orderExpr = `seq_no ASC, ${PK} ASC`;
     }
 
