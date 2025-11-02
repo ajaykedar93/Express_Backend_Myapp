@@ -7,6 +7,7 @@ const moment = require("moment");
 
 const TABLE = "inward";
 const PK = "id";
+const INWARD_CATEGORY_ID = 2; // 👈 change if your INWARD id is different
 
 // ==========================
 // Helper functions
@@ -60,10 +61,12 @@ function ensureLegacyFromExtras(data) {
 function prepareDataFromBody(body) {
   const out = { ...body };
 
+  // 1) new style array
   if (Object.prototype.hasOwnProperty.call(body, "extras_all")) {
     out.extra_items = normalizeExtrasArray(body.extras_all);
   }
 
+  // 2) normalize string → array
   if (typeof out.extra_items === "string") {
     try {
       out.extra_items = JSON.parse(out.extra_items);
@@ -73,6 +76,7 @@ function prepareDataFromBody(body) {
   }
   if (!Array.isArray(out.extra_items)) out.extra_items = [];
 
+  // empty work_date → remove (let DB default or allow null)
   if (out.work_date !== undefined && String(out.work_date).trim() === "") {
     delete out.work_date;
   }
@@ -93,12 +97,17 @@ router.get("/inward/export", async (req, res) => {
     `;
     const vals = [];
     const cond = [];
+    let i = 1;
+
+    // always restrict to INWARD (2) unless someone wants another
+    cond.push(`category_id = $${i++}`);
+    vals.push(INWARD_CATEGORY_ID);
 
     if (date) {
-      cond.push(`work_date = $1`);
+      cond.push(`work_date = $${i++}`);
       vals.push(date);
     } else if (month) {
-      cond.push(`TRIM(TO_CHAR(work_date, 'Month')) ILIKE TRIM($1)`);
+      cond.push(`TRIM(TO_CHAR(work_date, 'Month')) ILIKE TRIM($${i++})`);
       vals.push(month);
     }
 
@@ -130,9 +139,14 @@ router.get("/inward/export", async (req, res) => {
       .font("Helvetica")
       .fontSize(11)
       .fillColor("gray")
-      .text(`Month: ${month || "All"} | Generated on: ${moment().format("DD MMM YYYY, h:mm A")}`, {
-        align: "right",
-      });
+      .text(
+        `Month: ${month || "All"} | Generated on: ${moment().format(
+          "DD MMM YYYY, h:mm A"
+        )}`,
+        {
+          align: "right",
+        }
+      );
     doc.moveDown(0.7);
 
     // ---- TABLE ----
@@ -250,9 +264,14 @@ router.get("/inward", async (req, res) => {
     const vals = [];
     let i = 1;
 
+    // if user sends ?category_id=.. → use it
+    // otherwise, default to INWARD
     if (category_id) {
       cond.push(`category_id = $${i++}`);
       vals.push(Number(category_id));
+    } else {
+      cond.push(`category_id = $${i++}`);
+      vals.push(INWARD_CATEGORY_ID);
     }
 
     if (date) {
@@ -287,8 +306,11 @@ router.get("/inward/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (isNaN(id)) return res.status(400).json({ error: "Invalid ID" });
-    const result = await db.query(`SELECT * FROM ${TABLE} WHERE ${PK}=$1`, [id]);
-    if (!result.rows.length) return res.status(404).json({ error: "Not found" });
+    const result = await db.query(`SELECT * FROM ${TABLE} WHERE ${PK}=$1`, [
+      id,
+    ]);
+    if (!result.rows.length)
+      return res.status(404).json({ error: "Not found" });
     res.json(result.rows[0]);
   } catch (err) {
     console.error("GET /inward/:id", err);
@@ -298,19 +320,26 @@ router.get("/inward/:id", async (req, res) => {
 
 router.post("/inward", async (req, res) => {
   try {
-    const raw = req.body || {};
-    if (raw.category_id == null)
-      return res.status(400).json({ error: "category_id is required" });
+    // force the category to INWARD always
+    const raw = {
+      ...req.body,
+      category_id: INWARD_CATEGORY_ID,
+    };
+
     if (!raw.details?.trim())
       return res.status(400).json({ error: "details is required" });
 
     const data = prepareDataFromBody(raw);
     const cols = Object.keys(data);
     const placeholders = cols.map((_, i) => `$${i + 1}`);
-    const vals = cols.map((k) => (k === "extra_items" ? JSON.stringify(data[k]) : data[k]));
+    const vals = cols.map((k) =>
+      k === "extra_items" ? JSON.stringify(data[k]) : data[k]
+    );
 
     const result = await db.query(
-      `INSERT INTO ${TABLE} (${cols.join(",")}) VALUES (${placeholders.join(",")}) RETURNING *`,
+      `INSERT INTO ${TABLE} (${cols.join(",")}) VALUES (${placeholders.join(
+        ","
+      )}) RETURNING *`,
       vals
     );
     res.status(201).json(result.rows[0]);
@@ -325,20 +354,30 @@ router.put("/inward/:id", async (req, res) => {
     const id = Number(req.params.id);
     if (isNaN(id)) return res.status(400).json({ error: "Invalid ID" });
 
-    const data = prepareDataFromBody(req.body || {});
+    // 👇 even on update, keep it INWARD
+    const body = {
+      ...req.body,
+      category_id: INWARD_CATEGORY_ID,
+    };
+
+    const data = prepareDataFromBody(body);
     const sets = Object.keys(data).map((k, i) => `${k}=$${i + 1}`);
     const vals = Object.values(data).map((v) =>
       typeof v === "object" ? JSON.stringify(v) : v
     );
 
-    if (!sets.length) return res.status(400).json({ error: "No updatable fields provided" });
+    if (!sets.length)
+      return res.status(400).json({ error: "No updatable fields provided" });
 
     vals.push(id);
     const result = await db.query(
-      `UPDATE ${TABLE} SET ${sets.join(", ")} WHERE ${PK}=$${sets.length + 1} RETURNING *`,
+      `UPDATE ${TABLE} SET ${sets.join(", ")} WHERE ${PK}=$${
+        sets.length + 1
+      } RETURNING *`,
       vals
     );
-    if (!result.rows.length) return res.status(404).json({ error: "Record not found" });
+    if (!result.rows.length)
+      return res.status(404).json({ error: "Record not found" });
 
     res.json(result.rows[0]);
   } catch (err) {
@@ -351,8 +390,12 @@ router.delete("/inward/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (isNaN(id)) return res.status(400).json({ error: "Invalid ID" });
-    const result = await db.query(`DELETE FROM ${TABLE} WHERE ${PK}=$1 RETURNING *`, [id]);
-    if (!result.rows.length) return res.status(404).json({ error: "Record not found" });
+    const result = await db.query(
+      `DELETE FROM ${TABLE} WHERE ${PK}=$1 RETURNING *`,
+      [id]
+    );
+    if (!result.rows.length)
+      return res.status(404).json({ error: "Record not found" });
     res.json({ ok: true, deleted: result.rows[0] });
   } catch (err) {
     console.error("DELETE /inward/:id", err);
@@ -365,7 +408,8 @@ router.post("/inward/resequence", async (req, res) => {
     const orderBy = String(req.body?.orderBy || "").toLowerCase();
     let orderExpr = `work_date ASC, ${PK} ASC`;
     if (orderBy === "id") orderExpr = `${PK} ASC`;
-    else if (orderBy === "category_id") orderExpr = `category_id ASC, ${PK} ASC`;
+    else if (orderBy === "category_id")
+      orderExpr = `category_id ASC, ${PK} ASC`;
 
     const sql = `
       WITH ordered AS (
