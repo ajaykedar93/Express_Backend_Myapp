@@ -36,7 +36,6 @@ const documentRouter = require("./routes/document");
 
 // Work-related
 const workDetailsRouter = require("./routes/workdetails");
-const inwardRouter = require("./routes/inward");
 const workCategoryRouter = require("./routes/workcategory");
 
 
@@ -90,7 +89,9 @@ app.use("/api/documents", documentRouter);
 
 // Work-related
 app.use("/api", workDetailsRouter);
-app.use("/api", inwardRouter);
+const inwardRoutes = require("./routes/inward");
+app.use("/api", inwardRoutes); // so endpoints become /api/inward, /api/inward/export, etc.
+
 app.use("/api/workcategory", workCategoryRouter);
 
 // Finance / transactions (legacy)
