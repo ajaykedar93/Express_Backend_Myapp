@@ -127,6 +127,9 @@ app.use("/api/admin_impdocument", adminImpDocumentRouter);
 const userActFavoriteRoutes = require("./routes/userActFavorite");
 app.use("/api", userActFavoriteRoutes);
 
+app.use("/api/act_favorite", require("./routes/actFavorite"));
+
+
 // ✅ keep only new defensive one
 app.use("/api/sitekharch", require("./routes/sitekharch_new"));
 
