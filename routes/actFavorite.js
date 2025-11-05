@@ -26,6 +26,7 @@ function safeNormalizeImages(input) {
     const s = input.trim();
     if (!s) return null;
 
+    // Try JSON first
     const parsed = parseJSONMaybe(s);
     if (parsed != null) {
       return Array.isArray(parsed)
@@ -33,6 +34,7 @@ function safeNormalizeImages(input) {
         : [String(parsed).trim()].filter(Boolean);
     }
 
+    // CSV fallback
     if (s.includes(",")) {
       return s.split(",").map((x) => x.trim()).filter(Boolean);
     }
@@ -130,7 +132,7 @@ const mapRowWithImages = (r) => ({
  * GET /:id/images  → paged images only { total, offset, limit, images[] }
  * POST /           → create
  * PATCH /:id       → update (replace images if provided)
- * POST /:id/images/append → append images only
+ * POST /:id/images/append → append images (JSON only: array/CSV/JSON string)
  * POST /:id/images/delete → delete images (all / by urls / by indexes)
  * DELETE /:id      → delete record
  */
@@ -215,11 +217,12 @@ async function fetchPagedImagesJson(id, offset = 0, limit = 30) {
       FROM user_act_favorite WHERE id=$1
     ),
     exploded AS (
-      SELECT e, ord
-      FROM src, LATERAL jsonb_array_elements(src.images) WITH ORDINALITY AS t(e, ord)
+      SELECT val, ord
+      FROM src,
+           LATERAL jsonb_array_elements(src.images) WITH ORDINALITY AS t(val, ord)
     ),
     page AS (
-      SELECT e
+      SELECT val
       FROM exploded
       WHERE ord > $2
       ORDER BY ord
@@ -227,10 +230,12 @@ async function fetchPagedImagesJson(id, offset = 0, limit = 30) {
     )
     SELECT
       (SELECT COUNT(*)::int FROM exploded) AS total,
-      COALESCE(jsonb_agg(e), '[]'::jsonb) AS page_images
-  `,
+      COALESCE(jsonb_agg(val), '[]'::jsonb) AS page_images
+    FROM page
+    `,
     [id, offset, limit]
   );
+
   if (rows.length === 0) return { total: 0, images: [] };
   return {
     total: Number(rows[0].total || 0),
@@ -270,7 +275,7 @@ router.get("/:id", async (req, res) => {
 
     if (imagesMode === "count") {
       const { rows: c } = await pool.query(
-        "SELECT COALESCE(jsonb_array_length(images),0) AS images_count, images FROM user_act_favorite WHERE id=$1",
+        "SELECT COALESCE(jsonb_array_length(images),0) AS images_count FROM user_act_favorite WHERE id=$1",
         [id]
       );
       return res.json({
@@ -450,7 +455,7 @@ router.patch("/:id", async (req, res) => {
   }
 });
 
-// POST /:id/images/append → append images
+// POST /:id/images/append → append images (expects {images: [...] | "a,b" | json})
 router.post("/:id/images/append", async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
@@ -555,25 +560,30 @@ router.post("/:id/images/delete", async (req, res) => {
     }
 
     // 2) Partial delete by URL and/or index
+    // Use jsonb_array_elements_text to get clean TEXT values (no quotes),
+    // and WITH ORDINALITY to keep 1-based positions.
     const { rows } = await pool.query(
       `
-      WITH curr AS (
-        SELECT e, ord::int
-        FROM jsonb_array_elements(
-               COALESCE((SELECT images FROM user_act_favorite WHERE id=$1), '[]'::jsonb)
-             ) WITH ORDINALITY AS t(e, ord)
+      WITH src AS (
+        SELECT COALESCE(images, '[]'::jsonb) AS images
+        FROM user_act_favorite WHERE id = $1
+      ),
+      curr AS (
+        SELECT val::text AS url_text, ord::int
+        FROM src,
+             LATERAL jsonb_array_elements_text(src.images) WITH ORDINALITY AS t(val, ord)
       ),
       filtered AS (
-        SELECT e
+        SELECT url_text
         FROM curr
         WHERE
-          ($2::text[] IS NULL OR NOT ((e #>> '{}') = ANY($2::text[])))
+          ($2::text[] IS NULL OR NOT (url_text = ANY($2::text[])))
           AND
           ($3::int[]  IS NULL OR NOT (ord = ANY($3::int[])))
       ),
       upd AS (
         UPDATE user_act_favorite
-           SET images = (SELECT CASE WHEN COUNT(*) = 0 THEN '[]'::jsonb ELSE jsonb_agg(e) END FROM filtered),
+           SET images = COALESCE((SELECT jsonb_agg(to_jsonb(url_text)) FROM filtered), '[]'::jsonb),
                updated_at = NOW()
          WHERE id = $1
      RETURNING *
