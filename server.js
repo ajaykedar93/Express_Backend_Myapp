@@ -15,6 +15,11 @@ app.use(express.urlencoded({ limit: "50mb", extended: true }));
 const moviesRouter = require("./routes/movies");
 const seriesRouter = require("./routes/series");
 const downloadRouter = require("./routes/download");
+const compression = require('compression');
+app.use(compression());
+app.use(cors({ origin: ["http://localhost:5173","http://localhost:3000"], credentials: true }));
+app.use(compression());
+
 
 // Generic categories
 const allCategoriesRouter = require("./routes/Allcategories"); // mounted at /api
@@ -122,10 +127,6 @@ app.use("/api", require("./routes/websites")); // ✅ your router
 
 
 app.use("/api/admin_impdocument", adminImpDocumentRouter);
-
-
-const userActFavoriteRoutes = require("./routes/userActFavorite");
-app.use("/api", userActFavoriteRoutes);
 
 app.use("/api/act_favorite", require("./routes/actFavorite"));
 
