@@ -25,7 +25,7 @@ const seriesRouter = require("./routes/series");
 const downloadRouter = require("./routes/download");
 const compression = require('compression');
 app.use(compression());
-app.use(cors({ origin: ["http://localhost:5173","http://localhost:3000"], credentials: true }));
+app.use(cors({ origin: ["http://localhost:5173","https://express-backend-myapp.onrender.com","http://localhost:3000"], credentials: true }));
 app.use(compression());
 
 
