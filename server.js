@@ -136,6 +136,20 @@ app.use("/api/sitekharch", require("./routes/sitekharch_new"));
 app.use('/api', require('./routes/loan'));
 
 
+
+
+
+
+
+
+const addListFevActRoutes = require("./routes/addlistfevact");
+app.use("/api/add-list-actress", addListFevActRoutes);
+
+
+
+
+
+
 /* ---------------- Health Check ---------------- */
 app.get("/health", (_req, res) => res.json({ status: "OK" }));
 
