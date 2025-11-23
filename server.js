@@ -121,15 +121,14 @@ app.use("/api/trading_journal", investmentTradingJournalRouter);
 app.use("/api/user_investment", require("./routes/user_investment"));
 // Mount once at /api  (so /api/password-manager works)
 app.use("/api", require("./routes/passwordManager"));
-app.use("/api/act_favorite", require("./routes/actFavorite"));
+
 app.use("/api/notes", require("./routes/notes")); // ✅ Mount Notes API
 app.use("/api", require("./routes/websites")); // ✅ your router
 
 
 app.use("/api/admin_impdocument", adminImpDocumentRouter);
 
-app.use("/api/act_favorite", require("./routes/actFavorite"));
-
+app.use("/api/act_favorite", require("./routes/userActFavorite"));
 
 // ✅ keep only new defensive one
 app.use("/api/sitekharch", require("./routes/sitekharch_new"));

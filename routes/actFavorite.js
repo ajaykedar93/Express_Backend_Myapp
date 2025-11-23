@@ -5,6 +5,10 @@ const express = require("express");
 const router = express.Router();
 const pool = require("../db");
 
+/* ---------------- Flags (tweak if needed) ---------------- */
+const requireCountry = false;       // set true to require country on create/update
+const requireProfileImage = false;  // set true to require profile_image on create
+
 /* ---------------- Helpers ---------------- */
 
 const isNonEmptyString = (v) => typeof v === "string" && v.trim().length > 0;
@@ -13,6 +17,16 @@ const isPositiveInt = (n) => Number.isInteger(n) && n > 0;
 function parseJSONMaybe(s) {
   try { return JSON.parse(s); } catch { return null; }
 }
+
+function ok(res, data, meta) {
+  return res.json({ success: true, data, ...(meta ? { meta } : {}) });
+}
+function fail(res, code = 400, message = "Invalid request") {
+  return res.status(code).json({ success: false, message });
+}
+
+const asyncHandler = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
 
 // Normalize images input: accept string, JSON array, CSV, or array
 function safeNormalizeImages(input) {
@@ -73,8 +87,11 @@ function normalizePgError(err) {
   return { status: 500, message: "Internal Server Error" };
 }
 
-// Resolve country (by id or exact name)
+// Resolve country (by id or exact name). If optional, return null when undefined/blank.
 async function resolveCountryId(countryField) {
+  if (!requireCountry && (countryField == null || String(countryField).trim() === "")) {
+    return null; // optional
+  }
   if (countryField == null || String(countryField).trim() === "")
     throw new Error("country is required");
 
@@ -138,8 +155,9 @@ const mapRowWithImages = (r) => ({
  */
 
 // GET / → list all (SLIM; no images arrays)
-router.get("/", async (req, res) => {
-  try {
+router.get(
+  "/",
+  asyncHandler(async (req, res) => {
     const { q, country, name, series } = req.query;
 
     const where = [];
@@ -188,25 +206,20 @@ router.get("/", async (req, res) => {
     `;
 
     const { rows } = await pool.query(sql, params);
-    res.json(rows.map(mapRowSlim));
-  } catch (err) {
-    const { status, message } = normalizePgError(err);
-    res.status(status).json({ error: message });
-  }
-});
+    return ok(res, rows.map(mapRowSlim));
+  })
+);
 
 // GET /countries
-router.get("/countries", async (_req, res) => {
-  try {
+router.get(
+  "/countries",
+  asyncHandler(async (_req, res) => {
     const { rows } = await pool.query(
       "SELECT id, country_name FROM country_list ORDER BY country_name ASC"
     );
-    res.json(rows);
-  } catch (err) {
-    const { status, message } = normalizePgError(err);
-    res.status(status).json({ error: message });
-  }
-});
+    return ok(res, rows);
+  })
+);
 
 // helper: build paged images jsonb for a record id
 async function fetchPagedImagesJson(id, offset = 0, limit = 30) {
@@ -244,16 +257,17 @@ async function fetchPagedImagesJson(id, offset = 0, limit = 30) {
 }
 
 // GET /:id  (controllable images payload)
-router.get("/:id", async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
+router.get(
+  "/:id",
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return fail(res, 400, "Invalid id");
 
-  // images=none|count|all|page
-  const imagesMode = String(req.query.images || "none").toLowerCase();
-  const offset = Number.isFinite(Number(req.query.offset)) ? Math.max(0, Number(req.query.offset)) : 0;
-  const limit = Number.isFinite(Number(req.query.limit)) ? Math.min(100, Math.max(1, Number(req.query.limit))) : 30;
+    // images=none|count|all|page
+    const imagesMode = String(req.query.images || "none").toLowerCase();
+    const offset = Number.isFinite(Number(req.query.offset)) ? Math.max(0, Number(req.query.offset)) : 0;
+    const limit = Number.isFinite(Number(req.query.limit)) ? Math.min(100, Math.max(1, Number(req.query.limit))) : 30;
 
-  try {
     const { rows } = await pool.query(
       `SELECT f.*, c.country_name
          FROM user_act_favorite f
@@ -261,65 +275,47 @@ router.get("/:id", async (req, res) => {
         WHERE f.id = $1`,
       [id]
     );
-    if (rows.length === 0) return res.status(404).json({ error: "Not found" });
+    if (rows.length === 0) return fail(res, 404, "Not found");
 
     const base = mapRowCore(rows[0]);
 
-    if (imagesMode === "none") {
+    if (imagesMode === "none" || imagesMode === "count") {
       const { rows: c } = await pool.query(
         "SELECT COALESCE(jsonb_array_length(images),0) AS images_count FROM user_act_favorite WHERE id=$1",
         [id]
       );
-      return res.json({ ...base, images_count: Number(c[0]?.images_count || 0) });
-    }
-
-    if (imagesMode === "count") {
-      const { rows: c } = await pool.query(
-        "SELECT COALESCE(jsonb_array_length(images),0) AS images_count FROM user_act_favorite WHERE id=$1",
-        [id]
-      );
-      return res.json({
-        ...base,
-        images_count: Number(c[0]?.images_count || 0),
-      });
+      return ok(res, { ...base, images_count: Number(c[0]?.images_count || 0) });
     }
 
     if (imagesMode === "page") {
       const { total, images } = await fetchPagedImagesJson(id, offset, limit);
-      return res.json({
-        ...base,
-        images_page: { total, offset, limit, images },
-      });
+      return ok(res, { ...base, images_page: { total, offset, limit, images } });
     }
 
     // default fallback if images=all
-    return res.json(mapRowWithImages(rows[0]));
-  } catch (err) {
-    const { status, message } = normalizePgError(err);
-    res.status(status).json({ error: message });
-  }
-});
+    return ok(res, mapRowWithImages(rows[0]));
+  })
+);
 
 // GET /:id/images → paged images only
-router.get("/:id/images", async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
+router.get(
+  "/:id/images",
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return fail(res, 400, "Invalid id");
 
-  const offset = Number.isFinite(Number(req.query.offset)) ? Math.max(0, Number(req.query.offset)) : 0;
-  const limit = Number.isFinite(Number(req.query.limit)) ? Math.min(100, Math.max(1, Number(req.query.limit))) : 30;
+    const offset = Number.isFinite(Number(req.query.offset)) ? Math.max(0, Number(req.query.offset)) : 0;
+    const limit = Number.isFinite(Number(req.query.limit)) ? Math.min(100, Math.max(1, Number(req.query.limit))) : 30;
 
-  try {
     const { total, images } = await fetchPagedImagesJson(id, offset, limit);
-    res.json({ total, offset, limit, images });
-  } catch (err) {
-    const { status, message } = normalizePgError(err);
-    res.status(status).json({ error: message });
-  }
-});
+    return ok(res, { total, offset, limit, images });
+  })
+);
 
 // POST / (create)
-router.post("/", async (req, res) => {
-  try {
+router.post(
+  "/",
+  asyncHandler(async (req, res) => {
     const {
       country, favorite_actress_name, age, actress_dob,
       favorite_movie_series, profile_image, images, notes,
@@ -328,23 +324,23 @@ router.post("/", async (req, res) => {
     const country_id = await resolveCountryId(country);
 
     if (!isNonEmptyString(favorite_actress_name))
-      return res.status(400).json({ error: "favorite_actress_name is required" });
+      return fail(res, 400, "favorite_actress_name is required");
     if (!isNonEmptyString(favorite_movie_series))
-      return res.status(400).json({ error: "favorite_movie_series is required" });
-    if (!isNonEmptyString(profile_image))
-      return res.status(400).json({ error: "profile_image is required" });
+      return fail(res, 400, "favorite_movie_series is required");
+    if (requireProfileImage && !isNonEmptyString(profile_image))
+      return fail(res, 400, "profile_image is required");
 
     let ageVal = null;
     if (age !== undefined && age !== null && String(age).trim() !== "") {
       const n = Number(age);
       if (!Number.isFinite(n) || n <= 0)
-        return res.status(400).json({ error: "age must be positive" });
+        return fail(res, 400, "age must be positive");
       ageVal = Math.trunc(n);
     }
 
     let imagesVal = null;
     try { imagesVal = safeNormalizeImages(images); }
-    catch (e) { return res.status(400).json({ error: String(e.message || "Invalid images") }); }
+    catch (e) { return fail(res, 400, String(e.message || "Invalid images")); }
 
     const sql = `
       INSERT INTO user_act_favorite
@@ -359,7 +355,7 @@ router.post("/", async (req, res) => {
       ageVal,
       actress_dob || null,
       favorite_movie_series.trim(),
-      profile_image,
+      profile_image || null,
       imagesVal ? JSON.stringify(imagesVal) : null,
       imagesVal ? JSON.stringify(imagesVal) : null,
       notes || null,
@@ -367,23 +363,21 @@ router.post("/", async (req, res) => {
 
     const { rows } = await pool.query(sql, params);
     const { rows: c } = await pool.query("SELECT country_name FROM country_list WHERE id=$1", [country_id]);
-    res.status(201).json(mapRowWithImages({ ...rows[0], country_name: c[0]?.country_name || null }));
-  } catch (err) {
-    const { status, message } = normalizePgError(err);
-    res.status(status).json({ error: message });
-  }
-});
+    return ok(res, mapRowWithImages({ ...rows[0], country_name: c[0]?.country_name || null }));
+  })
+);
 
 // PATCH /:id (replace images if provided)
-router.patch("/:id", async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
+router.patch(
+  "/:id",
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return fail(res, 400, "Invalid id");
 
-  try {
     const fields = [];
     const values = [];
     let i = 1;
-    let newCountryId = null;
+    let newCountryId = undefined;
 
     if (req.body.country !== undefined) {
       newCountryId = await resolveCountryId(req.body.country);
@@ -396,7 +390,7 @@ router.patch("/:id", async (req, res) => {
       if (req.body[key] !== undefined) {
         const val = req.body[key];
         if (val === null || String(val).trim() === "")
-          return res.status(400).json({ error: `${key} cannot be empty` });
+          return fail(res, 400, `${key} cannot be empty`);
         fields.push(`${key} = $${i++}`);
         values.push(val);
       }
@@ -408,7 +402,7 @@ router.patch("/:id", async (req, res) => {
       } else {
         const n = Number(req.body.age);
         if (!Number.isFinite(n) || n <= 0)
-          return res.status(400).json({ error: "age must be positive" });
+          return fail(res, 400, "age must be positive");
         fields.push(`age = $${i++}`);
         values.push(Math.trunc(n));
       }
@@ -425,15 +419,15 @@ router.patch("/:id", async (req, res) => {
     if (req.body.images !== undefined) {
       let imagesVal = null;
       try { imagesVal = safeNormalizeImages(req.body.images); }
-      catch (e) { return res.status(400).json({ error: String(e.message || "Invalid images") }); }
-      fields.push(`images = $${i++}`);
+      catch (e) { return fail(res, 400, String(e.message || "Invalid images")); }
+      fields.push(`images = $${i++}::jsonb`);
       values.push(imagesVal ? JSON.stringify(imagesVal) : null);
       fields.push(`images_raw = $${i++}`);
       values.push(imagesVal ? JSON.stringify(imagesVal) : null);
     }
 
     if (fields.length === 0)
-      return res.status(400).json({ error: "No fields to update" });
+      return fail(res, 400, "No fields to update");
 
     fields.push("updated_at = NOW()");
     const sql = `
@@ -444,69 +438,52 @@ router.patch("/:id", async (req, res) => {
     values.push(id);
 
     const { rows } = await pool.query(sql, values);
-    if (rows.length === 0) return res.status(404).json({ error: "Not found" });
+    if (rows.length === 0) return fail(res, 404, "Not found");
 
-    const cid = newCountryId ?? rows[0].country_id;
+    const cid = newCountryId !== undefined ? newCountryId : rows[0].country_id;
     const { rows: c } = await pool.query("SELECT country_name FROM country_list WHERE id=$1", [cid]);
-    res.json(mapRowWithImages({ ...rows[0], country_name: c[0]?.country_name || null }));
-  } catch (err) {
-    const { status, message } = normalizePgError(err);
-    res.status(status).json({ error: message });
-  }
-});
+    return ok(res, mapRowWithImages({ ...rows[0], country_name: c[0]?.country_name || null }));
+  })
+);
 
 // POST /:id/images/append → append images (expects {images: [...] | "a,b" | json})
-router.post("/:id/images/append", async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
+router.post(
+  "/:id/images/append",
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return fail(res, 400, "Invalid id");
 
-  try {
     let toAppend = safeNormalizeImages(req.body?.images);
     if (!toAppend || toAppend.length === 0) {
-      return res.status(400).json({ error: "images required (array/CSV/JSON/string)" });
+      return fail(res, 400, "images required (array/CSV/JSON/string)");
     }
 
     const asJson = JSON.stringify(toAppend);
-    const sql = `
+    const { rows } = await pool.query(
+      `
       UPDATE user_act_favorite
          SET images = COALESCE(images, '[]'::jsonb) || $1::jsonb,
              updated_at = NOW()
        WHERE id = $2
-   RETURNING *`;
-    const { rows } = await pool.query(sql, [asJson, id]);
-    if (rows.length === 0) return res.status(404).json({ error: "Not found" });
+   RETURNING *`,
+      [asJson, id]
+    );
+    if (rows.length === 0) return fail(res, 404, "Not found");
 
     const { rows: c } = await pool.query("SELECT country_name FROM country_list WHERE id=$1", [
       rows[0].country_id,
     ]);
-    res.json(mapRowWithImages({ ...rows[0], country_name: c[0]?.country_name || null }));
-  } catch (err) {
-    const { status, message } = normalizePgError(err);
-    res.status(status).json({ error: message });
-  }
-});
-
-// DELETE /:id
-router.delete("/:id", async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
-
-  try {
-    const { rowCount } = await pool.query("DELETE FROM user_act_favorite WHERE id=$1", [id]);
-    if (rowCount === 0) return res.status(404).json({ error: "Not found" });
-    res.status(204).send();
-  } catch (err) {
-    const { status, message } = normalizePgError(err);
-    res.status(status).json({ error: message });
-  }
-});
+    return ok(res, mapRowWithImages({ ...rows[0], country_name: c[0]?.country_name || null }));
+  })
+);
 
 // POST /:id/images/delete  (all / by urls / by indexes)
-router.post("/:id/images/delete", async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
+router.post(
+  "/:id/images/delete",
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return fail(res, 400, "Invalid id");
 
-  try {
     const { all } = req.body || {};
 
     // normalize urls (optional)
@@ -516,7 +493,7 @@ router.post("/:id/images/delete", async (req, res) => {
         const arr = safeNormalizeImages(req.body.urls);
         urls = arr && arr.length ? arr : null;
       } catch (e) {
-        return res.status(400).json({ error: String(e.message || "Invalid urls") });
+        return fail(res, 400, String(e.message || "Invalid urls"));
       }
     }
 
@@ -524,13 +501,13 @@ router.post("/:id/images/delete", async (req, res) => {
     let idxs = null;
     if (req.body?.indexes !== undefined) {
       if (!Array.isArray(req.body.indexes)) {
-        return res.status(400).json({ error: "indexes must be an array of integers" });
+        return fail(res, 400, "indexes must be an array of integers");
       }
       const cleaned = [];
       for (const v of req.body.indexes) {
         const n = Number(v);
         if (!Number.isInteger(n) || n < 0) {
-          return res.status(400).json({ error: "indexes must be non-negative integers (0-based)" });
+          return fail(res, 400, "indexes must be non-negative integers (0-based)");
         }
         cleaned.push(n + 1);
       }
@@ -538,7 +515,7 @@ router.post("/:id/images/delete", async (req, res) => {
     }
 
     if (!all && !urls && !idxs) {
-      return res.status(400).json({ error: "Provide one of: all=true, urls, indexes" });
+      return fail(res, 400, "Provide one of: all=true, urls, indexes");
     }
 
     // 1) Delete ALL
@@ -551,17 +528,15 @@ router.post("/:id/images/delete", async (req, res) => {
       RETURNING *`,
         [id]
       );
-      if (rows.length === 0) return res.status(404).json({ error: "Not found" });
+      if (rows.length === 0) return fail(res, 404, "Not found");
 
       const { rows: c } = await pool.query("SELECT country_name FROM country_list WHERE id=$1", [
         rows[0].country_id,
       ]);
-      return res.json(mapRowWithImages({ ...rows[0], country_name: c[0]?.country_name || null }));
+      return ok(res, mapRowWithImages({ ...rows[0], country_name: c[0]?.country_name || null }));
     }
 
     // 2) Partial delete by URL and/or index
-    // Use jsonb_array_elements_text to get clean TEXT values (no quotes),
-    // and WITH ORDINALITY to keep 1-based positions.
     const { rows } = await pool.query(
       `
       WITH src AS (
@@ -593,16 +568,32 @@ router.post("/:id/images/delete", async (req, res) => {
       [id, urls, idxs]
     );
 
-    if (rows.length === 0) return res.status(404).json({ error: "Not found" });
+    if (rows.length === 0) return fail(res, 404, "Not found");
 
     const { rows: c } = await pool.query("SELECT country_name FROM country_list WHERE id=$1", [
       rows[0].country_id,
     ]);
-    return res.json(mapRowWithImages({ ...rows[0], country_name: c[0]?.country_name || null }));
-  } catch (err) {
-    const { status, message } = normalizePgError(err);
-    return res.status(status).json({ error: message });
-  }
+    return ok(res, mapRowWithImages({ ...rows[0], country_name: c[0]?.country_name || null }));
+  })
+);
+
+// DELETE /:id
+router.delete(
+  "/:id",
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return fail(res, 400, "Invalid id");
+
+    const { rowCount } = await pool.query("DELETE FROM user_act_favorite WHERE id=$1", [id]);
+    if (rowCount === 0) return fail(res, 404, "Not found");
+    return ok(res, { id });
+  })
+);
+
+/* ---------------- Router-local Error Handler ---------------- */
+router.use((err, _req, res, _next) => {
+  const { status, message } = normalizePgError(err);
+  return res.status(status).json({ success: false, message });
 });
 
 module.exports = router;
