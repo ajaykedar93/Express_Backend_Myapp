@@ -1,7 +1,38 @@
 // routes/userActFavorite.js
 const express = require("express");
 const router = express.Router();
-const pool = require("../db"); // <- as requested
+const pool = require("../db");
+
+// --- file uploads (for extra images) ---
+const multer = require("multer");
+const path = require("path");
+const fs = require("fs");
+
+// ensure uploads folder exists
+const uploadRoot = path.join(__dirname, "..", "uploads", "actress_images");
+fs.mkdirSync(uploadRoot, { recursive: true });
+
+// configure multer storage
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, uploadRoot);
+  },
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname) || ".jpg";
+    const base = path
+      .basename(file.originalname, ext)
+      .replace(/[^\w\-]+/g, "");
+    const unique = Date.now() + "-" + Math.round(Math.random() * 1e9);
+    cb(null, `${base || "img"}-${unique}${ext}`);
+  },
+});
+
+const upload = multer({
+  storage,
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB per file
+  },
+});
 
 // ---------------------------
 // Helpers
@@ -55,7 +86,7 @@ function toJsonbTextArray(arr) {
 // ---------------------------
 
 /**
- * GET /api/countries?search=uk&limit=20
+ * GET /api/act_favorite/countries?search=uk&limit=20
  */
 router.get(
   "/countries",
@@ -92,9 +123,9 @@ router.get(
 // ---------------------------
 
 /**
- * GET /api/user-act-favorite
+ * GET /api/act_favorite/user-act-favorite
  * Query:
- *  - q: search in name/movie/notes/username
+ *  - q: search in name/movie/notes/profile_image
  *  - country_id
  *  - page (default 1), limit (default 20, max 200)
  *  - sort (created_at|updated_at|name|movie), dir (asc|desc)
@@ -176,7 +207,7 @@ router.get(
 );
 
 /**
- * GET /api/user-act-favorite/:id
+ * GET /api/act_favorite/user-act-favorite/:id
  */
 router.get(
   "/user-act-favorite/:id",
@@ -199,7 +230,7 @@ router.get(
 );
 
 /**
- * POST /api/user-act-favorite
+ * POST /api/act_favorite/user-act-favorite
  * Body:
  *  - country_id? OR country_name?
  *  - favorite_actress_name* (text)
@@ -228,12 +259,15 @@ router.post(
     } = req.body || {};
 
     if (!favorite_actress_name || !favorite_movie_series) {
-      return fail(res, 400, "favorite_actress_name and favorite_movie_series are required");
+      return fail(
+        res,
+        400,
+        "favorite_actress_name and favorite_movie_series are required"
+      );
     }
 
     const cid = await resolveCountryId({ country_id, country_name });
 
-    // images can be set directly; images_raw (if present) will be parsed & appended by trigger
     const imagesJsonText = toJsonbTextArray(images); // or null
 
     const sql = `
@@ -251,8 +285,8 @@ router.post(
       actress_dob ?? null,
       favorite_movie_series,
       profile_image ?? null,
-      imagesJsonText, // may be null
-      images_raw ?? null, // trigger will append if provided
+      imagesJsonText,
+      images_raw ?? null,
       notes ?? null,
     ];
 
@@ -273,7 +307,6 @@ router.post(
 
       return ok(res, withCountry);
     } catch (e) {
-      // Unique violation, etc.
       if (e.code === "23505") {
         return fail(
           res,
@@ -287,7 +320,7 @@ router.post(
 );
 
 /**
- * PATCH /api/user-act-favorite/:id
+ * PATCH /api/act_favorite/user-act-favorite/:id
  * Body: any subset of columns.
  *  - If you include images_raw (string/CSV/JSON), trigger will APPEND to existing images
  *  - If you include images (string[]), set replaceImages=true to REPLACE entire images array
@@ -307,9 +340,9 @@ router.patch(
       actress_dob,
       favorite_movie_series,
       profile_image,
-      images, // replace?
+      images,
       replaceImages = false,
-      images_raw, // append via trigger
+      images_raw,
       notes,
     } = req.body || {};
 
@@ -318,12 +351,12 @@ router.patch(
         ? await resolveCountryId({ country_id, country_name })
         : undefined;
 
-    // Build dynamic UPDATE
     const sets = [];
     const params = [];
-    const add = (frag, val) => {
+    const add = (frag, val, castJsonb = false) => {
       params.push(val);
-      sets.push(`${frag} = $${params.length}`);
+      const idx = params.length;
+      sets.push(`${frag} = $${idx}${castJsonb ? "::jsonb" : ""}`);
     };
 
     if (cid !== undefined) add("country_id", cid);
@@ -339,11 +372,7 @@ router.patch(
 
     if (replaceImages && images !== undefined) {
       const imagesJsonText = toJsonbTextArray(images);
-      // Force array (or null)
-      add("images", imagesJsonText ? imagesJsonText + "::jsonb" : null);
-      // NOTE: we pass text and cast in query; below we’ll adapt to inline casting.
-      // To keep paramized: push text and in SQL use $X::jsonb.
-      sets[sets.length - 1] = "images = $" + params.length + "::jsonb";
+      add("images", imagesJsonText, true); // cast to jsonb
     }
 
     if (!sets.length) return fail(res, 400, "No updatable fields provided");
@@ -372,26 +401,79 @@ router.patch(
 );
 
 /**
- * PATCH /api/user-act-favorite/:id/images
- * Body:
- *  - add?: string[]     (append these)
- *  - remove?: string[]  (remove exact matches of these values)
+ * PATCH /api/act_favorite/user-act-favorite/:id/images
  *
- * Uses JSONB operators; does not rely on images_raw.
+ * Supports:
+ *  - multipart/form-data:
+ *      files: File[]  (field name "files")
+ *    -> uploaded to /uploads/actress_images
+ *    -> URLs stored in images[]
+ *
+ *  - JSON:
+ *      { add?: string[], remove?: string[] }
+ *
+ *  - Or combination via multipart fields `add` / `remove` (strings or JSON).
  */
 router.patch(
   "/user-act-favorite/:id/images",
+  upload.array("files"),
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
     if (!id) return fail(res, 400, "Invalid id");
 
-    const { add = [], remove = [] } = req.body || {};
-    const addText = toJsonbTextArray(add); // string or null
+    // Build base URL from request (e.g. https://express-backend-myapp.onrender.com)
+    const hostBase =
+      process.env.BASE_URL || `${req.protocol}://${req.get("host")}`;
+
+    // 1) URLs for uploaded files (if any)
+    const uploadedUrls = (req.files || []).map((file) => {
+      // file.path like .../uploads/actress_images/filename.jpg
+      const relative = path
+        .relative(path.join(__dirname, ".."), file.path)
+        .replace(/\\/g, "/");
+      // final url: BASE/uploads/actress_images/filename.jpg
+      return `${hostBase}/${relative}`;
+    });
+
+    // 2) Parse body (can be JSON or form fields)
+    const body = req.body || {};
+    let add = [];
+    let remove = [];
+
+    // handle "add"
+    if (Array.isArray(body.add)) {
+      add = body.add;
+    } else if (typeof body.add === "string") {
+      try {
+        const parsed = JSON.parse(body.add);
+        if (Array.isArray(parsed)) add = parsed;
+        else if (parsed) add = [String(parsed)];
+      } catch {
+        add = [body.add];
+      }
+    }
+
+    // handle "remove"
+    if (Array.isArray(body.remove)) {
+      remove = body.remove;
+    } else if (typeof body.remove === "string") {
+      try {
+        const parsed = JSON.parse(body.remove);
+        if (Array.isArray(parsed)) remove = parsed;
+        else if (parsed) remove = [String(parsed)];
+      } catch {
+        remove = [body.remove];
+      }
+    }
+
+    // Merge uploaded URLs into add[]
+    add = [...uploadedUrls, ...add];
+
+    const addText = toJsonbTextArray(add);
     const removeArr = Array.isArray(remove)
       ? remove.map((v) => String(v || "").trim()).filter(Boolean)
       : [];
 
-    // Start transaction to keep operations atomic
     await pool.query("BEGIN");
     try {
       if (addText) {
@@ -406,7 +488,6 @@ router.patch(
       }
 
       if (removeArr.length) {
-        // Remove any elements that match provided list (exact match on json text)
         await pool.query(
           `
           WITH vals AS (
@@ -444,7 +525,7 @@ router.patch(
 );
 
 /**
- * DELETE /api/user-act-favorite/:id
+ * DELETE /api/act_favorite/user-act-favorite/:id
  */
 router.delete(
   "/user-act-favorite/:id",
