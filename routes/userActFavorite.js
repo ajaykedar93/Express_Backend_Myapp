@@ -3,16 +3,21 @@ const express = require("express");
 const router = express.Router();
 const pool = require("../db");
 
-// --- file uploads (for extra images) ---
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 
-// ensure uploads folder exists
+/* =========================================================
+   FILE UPLOADS: extra images
+   ========================================================= */
+
+// physical folder:   <project-root>/uploads/actress_images
+// public URL prefix: /uploads/actress_images/...
 const uploadRoot = path.join(__dirname, "..", "uploads", "actress_images");
+const uploadPublicPrefix = "/uploads/actress_images";
+
 fs.mkdirSync(uploadRoot, { recursive: true });
 
-// configure multer storage
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, uploadRoot);
@@ -29,19 +34,22 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: {
-    fileSize: 10 * 1024 * 1024, // 10MB per file
-  },
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
 });
 
-// ---------------------------
-// Helpers
-// ---------------------------
-const asyncHandler = (fn) => (req, res, next) =>
-  Promise.resolve(fn(req, res, next)).catch(next);
+/* =========================================================
+   HELPERS
+   ========================================================= */
+
+const asyncHandler =
+  (fn) =>
+  (req, res, next) =>
+    Promise.resolve(fn(req, res, next)).catch(next);
 
 function ok(res, data, meta) {
-  return res.json({ success: true, data, ...(meta ? { meta } : {}) });
+  const payload = { success: true, data };
+  if (meta) payload.meta = meta;
+  return res.json(payload);
 }
 function fail(res, code = 400, message = "Invalid request") {
   return res.status(code).json({ success: false, message });
@@ -55,7 +63,6 @@ async function resolveCountryId({ country_id, country_name }) {
   if (country_id) return country_id;
   if (!country_name || !String(country_name).trim()) return null;
 
-  // Insert if missing; return id either way.
   const q = `
     WITH ins AS (
       INSERT INTO country_list (country_name)
@@ -69,10 +76,10 @@ async function resolveCountryId({ country_id, country_name }) {
     LIMIT 1;
   `;
   const { rows } = await pool.query(q, [country_name.trim()]);
-  return rows[0]?.id ?? null;
+  return rows[0] ? rows[0].id : null;
 }
 
-/** Normalize images input to JSON string (server will send as JSONB) */
+/** Normalize images input to JSON text for jsonb column */
 function toJsonbTextArray(arr) {
   if (!Array.isArray(arr)) return null;
   const filtered = arr
@@ -81,9 +88,9 @@ function toJsonbTextArray(arr) {
   return filtered.length ? JSON.stringify(filtered) : null;
 }
 
-// ---------------------------
-// Countries
-// ---------------------------
+/* =========================================================
+   COUNTRIES
+   ========================================================= */
 
 /**
  * GET /api/act_favorite/countries?search=uk&limit=20
@@ -93,42 +100,42 @@ router.get(
   asyncHandler(async (req, res) => {
     const { search = "", limit = 50 } = req.query;
     const lim = Math.max(1, Math.min(parseInt(limit, 10) || 50, 200));
-    const rows = search
-      ? (
-          await pool.query(
-            `SELECT id, country_name
-             FROM country_list
-             WHERE lower(country_name) LIKE lower($1)
-             ORDER BY country_name ASC
-             LIMIT $2`,
-            [`%${search}%`, lim]
-          )
-        ).rows
-      : (
-          await pool.query(
-            `SELECT id, country_name
-             FROM country_list
-             ORDER BY country_name ASC
-             LIMIT $1`,
-            [lim]
-          )
-        ).rows;
+
+    let rows;
+    if (search) {
+      const s = `%${search}%`;
+      rows = (
+        await pool.query(
+          `SELECT id, country_name
+           FROM country_list
+           WHERE lower(country_name) LIKE lower($1)
+           ORDER BY country_name ASC
+           LIMIT $2`,
+          [s, lim]
+        )
+      ).rows;
+    } else {
+      rows = (
+        await pool.query(
+          `SELECT id, country_name
+           FROM country_list
+           ORDER BY country_name ASC
+           LIMIT $1`,
+          [lim]
+        )
+      ).rows;
+    }
 
     return ok(res, rows);
   })
 );
 
-// ---------------------------
-// Favorites CRUD
-// ---------------------------
+/* =========================================================
+   FAVORITES CRUD
+   ========================================================= */
 
 /**
  * GET /api/act_favorite/user-act-favorite
- * Query:
- *  - q: search in name/movie/notes/profile_image
- *  - country_id
- *  - page (default 1), limit (default 20, max 200)
- *  - sort (created_at|updated_at|name|movie), dir (asc|desc)
  */
 router.get(
   "/user-act-favorite",
@@ -162,37 +169,41 @@ router.get(
       params.push(Number(country_id));
       where.push(`u.country_id = $${params.length}`);
     }
+
     if (q && q.trim()) {
       params.push(`%${q.trim().toLowerCase()}%`);
       const idx = params.length;
       where.push(
         `( lower(u.favorite_actress_name) LIKE $${idx}
-         OR lower(u.favorite_movie_series) LIKE $${idx}
-         OR lower(coalesce(u.notes,'')) LIKE $${idx}
-         OR lower(coalesce(u.profile_image,'')) LIKE $${idx} )`
+           OR lower(u.favorite_movie_series) LIKE $${idx}
+           OR lower(coalesce(u.notes, '')) LIKE $${idx}
+           OR lower(coalesce(u.profile_image, '')) LIKE $${idx} )`
       );
     }
 
     const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
-    // count
-    const countSql = `SELECT count(*)::int AS total FROM user_act_favorite u ${whereSql}`;
-    const total = (await pool.query(countSql, params)).rows[0]?.total ?? 0;
+    const total =
+      (
+        await pool.query(
+          `SELECT count(*)::int AS total FROM user_act_favorite u ${whereSql}`,
+          params
+        )
+      ).rows[0]?.total ?? 0;
 
-    // data
-    const dataSql = `
-      SELECT
-        u.*,
-        c.country_name
-      FROM user_act_favorite u
-      LEFT JOIN country_list c ON c.id = u.country_id
-      ${whereSql}
-      ORDER BY ${orderBy} ${orderDir}, u.id ${orderDir}
-      LIMIT $${params.length + 1}
-      OFFSET $${params.length + 2}
-    `;
     const data = (
-      await pool.query(dataSql, [...params, lim, offset])
+      await pool.query(
+        `
+        SELECT u.*, c.country_name
+        FROM user_act_favorite u
+        LEFT JOIN country_list c ON c.id = u.country_id
+        ${whereSql}
+        ORDER BY ${orderBy} ${orderDir}, u.id ${orderDir}
+        LIMIT $${params.length + 1}
+        OFFSET $${params.length + 2}
+      `,
+        [...params, lim, offset]
+      )
     ).rows;
 
     return ok(res, data, {
@@ -215,14 +226,16 @@ router.get(
     const id = Number(req.params.id);
     if (!id) return fail(res, 400, "Invalid id");
 
-    const sql = `
+    const { rows } = await pool.query(
+      `
       SELECT u.*, c.country_name
       FROM user_act_favorite u
       LEFT JOIN country_list c ON c.id = u.country_id
       WHERE u.id = $1
       LIMIT 1
-    `;
-    const { rows } = await pool.query(sql, [id]);
+    `,
+      [id]
+    );
     if (!rows.length) return fail(res, 404, "Not found");
 
     return ok(res, rows[0]);
@@ -231,16 +244,6 @@ router.get(
 
 /**
  * POST /api/act_favorite/user-act-favorite
- * Body:
- *  - country_id? OR country_name?
- *  - favorite_actress_name* (text)
- *  - age? (int>0)
- *  - actress_dob? (YYYY-MM-DD)
- *  - favorite_movie_series* (text)
- *  - profile_image? (text)
- *  - images? (string[])      -> replaces initial images exactly
- *  - images_raw? (text or "url1,url2" or JSON) -> will APPEND via trigger
- *  - notes? (text)
  */
 router.post(
   "/user-act-favorite",
@@ -253,8 +256,8 @@ router.post(
       actress_dob,
       favorite_movie_series,
       profile_image,
-      images, // array of strings
-      images_raw, // string/CSV/JSON text -> trigger appends
+      images,
+      images_raw,
       notes,
     } = req.body || {};
 
@@ -267,64 +270,49 @@ router.post(
     }
 
     const cid = await resolveCountryId({ country_id, country_name });
+    const imagesJsonText = toJsonbTextArray(images);
 
-    const imagesJsonText = toJsonbTextArray(images); // or null
-
-    const sql = `
+    const { rows } = await pool.query(
+      `
       INSERT INTO user_act_favorite (
         country_id, favorite_actress_name, age, actress_dob,
         favorite_movie_series, profile_image, images, images_raw, notes
       )
       VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9)
       RETURNING *;
-    `;
-    const params = [
-      cid,
-      favorite_actress_name,
-      age ?? null,
-      actress_dob ?? null,
-      favorite_movie_series,
-      profile_image ?? null,
-      imagesJsonText,
-      images_raw ?? null,
-      notes ?? null,
-    ];
+    `,
+      [
+        cid,
+        favorite_actress_name,
+        age ?? null,
+        actress_dob ?? null,
+        favorite_movie_series,
+        profile_image ?? null,
+        imagesJsonText,
+        images_raw ?? null,
+        notes ?? null,
+      ]
+    );
+    const created = rows[0];
 
-    try {
-      const { rows } = await pool.query(sql, params);
-      const created = rows[0];
+    const withCountry = (
+      await pool.query(
+        `
+        SELECT u.*, c.country_name
+        FROM user_act_favorite u
+        LEFT JOIN country_list c ON c.id = u.country_id
+        WHERE u.id = $1
+      `,
+        [created.id]
+      )
+    ).rows[0];
 
-      // fetch country name
-      const withCountry = (
-        await pool.query(
-          `SELECT u.*, c.country_name
-           FROM user_act_favorite u
-           LEFT JOIN country_list c ON c.id = u.country_id
-           WHERE u.id = $1`,
-          [created.id]
-        )
-      ).rows[0];
-
-      return ok(res, withCountry);
-    } catch (e) {
-      if (e.code === "23505") {
-        return fail(
-          res,
-          409,
-          "Duplicate: same actress + country + movie/series already exists"
-        );
-      }
-      throw e;
-    }
+    return ok(res, withCountry);
   })
 );
 
 /**
  * PATCH /api/act_favorite/user-act-favorite/:id
- * Body: any subset of columns.
- *  - If you include images_raw (string/CSV/JSON), trigger will APPEND to existing images
- *  - If you include images (string[]), set replaceImages=true to REPLACE entire images array
- *    otherwise it will be ignored (use the /images helper route to add/remove)
  */
 router.patch(
   "/user-act-favorite/:id",
@@ -372,26 +360,30 @@ router.patch(
 
     if (replaceImages && images !== undefined) {
       const imagesJsonText = toJsonbTextArray(images);
-      add("images", imagesJsonText, true); // cast to jsonb
+      add("images", imagesJsonText, true);
     }
 
     if (!sets.length) return fail(res, 400, "No updatable fields provided");
 
-    const sql = `
+    const { rows } = await pool.query(
+      `
       UPDATE user_act_favorite
       SET ${sets.join(", ")}
       WHERE id = $${params.length + 1}
       RETURNING *;
-    `;
-    const { rows } = await pool.query(sql, [...params, id]);
+    `,
+      [...params, id]
+    );
     if (!rows.length) return fail(res, 404, "Not found");
 
     const withCountry = (
       await pool.query(
-        `SELECT u.*, c.country_name
-         FROM user_act_favorite u
-         LEFT JOIN country_list c ON c.id = u.country_id
-         WHERE u.id = $1`,
+        `
+        SELECT u.*, c.country_name
+        FROM user_act_favorite u
+        LEFT JOIN country_list c ON c.id = u.country_id
+        WHERE u.id = $1
+      `,
         [id]
       )
     ).rows[0];
@@ -402,17 +394,8 @@ router.patch(
 
 /**
  * PATCH /api/act_favorite/user-act-favorite/:id/images
- *
- * Supports:
- *  - multipart/form-data:
- *      files: File[]  (field name "files")
- *    -> uploaded to /uploads/actress_images
- *    -> URLs stored in images[]
- *
- *  - JSON:
- *      { add?: string[], remove?: string[] }
- *
- *  - Or combination via multipart fields `add` / `remove` (strings or JSON).
+ *  - multipart: files[] (field "files") -> uploaded & appended
+ *  - JSON: { add?: string[], remove?: string[] }
  */
 router.patch(
   "/user-act-favorite/:id/images",
@@ -421,26 +404,23 @@ router.patch(
     const id = Number(req.params.id);
     if (!id) return fail(res, 400, "Invalid id");
 
-    // Build base URL from request (e.g. https://express-backend-myapp.onrender.com)
+    // base like: http://localhost:5000  OR https://express-backend-myapp.onrender.com
     const hostBase =
       process.env.BASE_URL || `${req.protocol}://${req.get("host")}`;
 
-    // 1) URLs for uploaded files (if any)
+    // 1) URLs for uploaded files
     const uploadedUrls = (req.files || []).map((file) => {
-      // file.path like .../uploads/actress_images/filename.jpg
-      const relative = path
-        .relative(path.join(__dirname, ".."), file.path)
-        .replace(/\\/g, "/");
-      // final url: BASE/uploads/actress_images/filename.jpg
-      return `${hostBase}/${relative}`;
+      const filename = path.basename(file.filename || file.path);
+      // final URL stored in DB:
+      //   http(s)://host/uploads/actress_images/<filename>
+      return `${hostBase}${uploadPublicPrefix}/${filename}`;
     });
 
-    // 2) Parse body (can be JSON or form fields)
+    // 2) parse add/remove from body
     const body = req.body || {};
     let add = [];
     let remove = [];
 
-    // handle "add"
     if (Array.isArray(body.add)) {
       add = body.add;
     } else if (typeof body.add === "string") {
@@ -453,7 +433,6 @@ router.patch(
       }
     }
 
-    // handle "remove"
     if (Array.isArray(body.remove)) {
       remove = body.remove;
     } else if (typeof body.remove === "string") {
@@ -466,7 +445,7 @@ router.patch(
       }
     }
 
-    // Merge uploaded URLs into add[]
+    // merge uploaded URLs into add[]
     add = [...uploadedUrls, ...add];
 
     const addText = toJsonbTextArray(add);
@@ -476,6 +455,7 @@ router.patch(
 
     await pool.query("BEGIN");
     try {
+      // append new images
       if (addText) {
         await pool.query(
           `
@@ -487,6 +467,7 @@ router.patch(
         );
       }
 
+      // remove specified
       if (removeArr.length) {
         await pool.query(
           `
@@ -507,16 +488,19 @@ router.patch(
       }
 
       const { rows } = await pool.query(
-        `SELECT u.*, c.country_name
-         FROM user_act_favorite u
-         LEFT JOIN country_list c ON c.id = u.country_id
-         WHERE u.id = $1`,
+        `
+        SELECT u.*, c.country_name
+        FROM user_act_favorite u
+        LEFT JOIN country_list c ON c.id = u.country_id
+        WHERE u.id = $1
+      `,
         [id]
       );
 
       await pool.query("COMMIT");
       if (!rows.length) return fail(res, 404, "Not found");
-      return ok(res, rows[0]);
+
+      return ok(res, rows[0]); // React DetailView expects full row here
     } catch (e) {
       await pool.query("ROLLBACK");
       throw e;
@@ -543,17 +527,16 @@ router.delete(
   })
 );
 
-// ---------------------------
-// Error handler (router-local)
-// ---------------------------
+/* =========================================================
+   ROUTER-LEVEL ERROR HANDLER
+   ========================================================= */
+
 router.use((err, req, res, _next) => {
   console.error("[user-act-favorite] Error:", err);
   if (err.code === "22P02") {
-    // invalid_text_representation (e.g., bad int/date)
     return fail(res, 400, "Invalid value for one of the fields");
   }
   if (err.code === "23505") {
-    // unique violation
     return fail(
       res,
       409,

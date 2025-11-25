@@ -6,10 +6,10 @@ const PDFDocument = require("pdfkit");
 
 /* ---------- helpers ---------- */
 
-// normalize actress name (extra safety; DB trigger also does INITCAP)
+// normalize actress name (extra safety; DB trigger may also INITCAP)
 function normalizeName(name) {
   if (!name) return "";
-  return name
+  return String(name)
     .trim()
     .toLowerCase()
     .split(/\s+/)
@@ -17,11 +17,10 @@ function normalizeName(name) {
     .join(" ");
 }
 
-// try to parse various date formats; store as JS Date or null
+// parse DOB into JS Date or null
 function parseDob(dob) {
   if (!dob) return null;
-  // accept "YYYY-MM-DD" or "2 Oct 2025" etc
-  const d = new Date(dob);
+  const d = new Date(dob); // supports "YYYY-MM-DD", "12 Sep 1997", etc.
   if (Number.isNaN(d.getTime())) return null;
   return d;
 }
@@ -30,21 +29,141 @@ function parseDob(dob) {
 function parseImageBase64(str) {
   if (!str) return null;
   try {
-    // allow "data:image/png;base64,AAAA" or pure base64
-    const base64 = str.includes("base64,")
-      ? str.split("base64,").pop()
-      : str;
+    const base64 = str.includes("base64,") ? str.split("base64,").pop() : str;
     return Buffer.from(base64, "base64");
   } catch {
     return null;
   }
 }
 
-/* ==================== CRUD API ==================== */
+/* ==================== EXPORT ENDPOINTS FIRST (avoid /:id conflict) ==================== */
+
+// Helper to fetch list with seq for exports
+async function fetchActressList() {
+  const result = await pool.query(
+    `
+    SELECT
+      ROW_NUMBER() OVER (ORDER BY id) AS seq,
+      id,
+      actress_name,
+      TO_CHAR(dob, 'FMDD Mon YYYY') AS dob,
+      best_movie,
+      best_thing,
+      country_name
+    FROM add_list_actress
+    ORDER BY id;
+  `
+  );
+  return result.rows;
+}
+
+/**
+ * GET /api/add-list-actress/export/txt
+ */
+router.get("/export/txt", async (req, res) => {
+  try {
+    const rows = await fetchActressList();
+
+    const lines = [];
+    lines.push("=== Actress Favourite List ===");
+    lines.push(`Total: ${rows.length}`);
+    lines.push("================================");
+    lines.push("");
+
+    rows.forEach((r) => {
+      lines.push(
+        `${r.seq}. ${r.actress_name || "N/A"}${
+          r.country_name ? "  |  Country: " + r.country_name : ""
+        }`
+      );
+      if (r.dob) lines.push(`   DOB: ${r.dob}`);
+      if (r.best_movie) lines.push(`   Best Movie/Series: ${r.best_movie}`);
+      if (r.best_thing) lines.push(`   Best Thing: ${r.best_thing}`);
+      lines.push("--------------------------------");
+    });
+
+    const content = lines.join("\n");
+
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.setHeader(
+      "Content-Disposition",
+      'attachment; filename="actress_list.txt"'
+    );
+    res.send(content);
+  } catch (err) {
+    console.error("GET /add-list-actress/export/txt error:", err);
+    res.status(500).json({
+      success: false,
+      message: "Failed to export text list",
+    });
+  }
+});
+
+/**
+ * GET /api/add-list-actress/export/pdf
+ */
+router.get("/export/pdf", async (req, res) => {
+  try {
+    const rows = await fetchActressList();
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      'attachment; filename="actress_list.pdf"'
+    );
+
+    const doc = new PDFDocument({ margin: 40 });
+    doc.pipe(res);
+
+    doc
+      .fontSize(18)
+      .text("Actress Favourite List", { align: "center" })
+      .moveDown(0.5);
+
+    doc
+      .fontSize(10)
+      .text(`Total: ${rows.length}`, { align: "center" })
+      .moveDown(1);
+
+    doc.moveTo(40, doc.y).lineTo(555, doc.y).stroke().moveDown(0.8);
+
+    doc.fontSize(11);
+
+    rows.forEach((r) => {
+      doc
+        .font("Helvetica-Bold")
+        .text(`${r.seq}. ${r.actress_name || "N/A"}`, { continued: true });
+
+      if (r.country_name) {
+        doc.font("Helvetica").text(`  (${r.country_name})`);
+      } else {
+        doc.font("Helvetica").text("");
+      }
+
+      if (r.dob) doc.text(`DOB: ${r.dob}`);
+      if (r.best_movie) doc.text(`Best Movie/Series: ${r.best_movie}`);
+      if (r.best_thing) doc.text(`Best Thing: ${r.best_thing}`);
+
+      doc.moveDown(0.3);
+      doc.moveTo(40, doc.y).lineTo(555, doc.y).stroke().moveDown(0.6);
+    });
+
+    doc.end();
+  } catch (err) {
+    console.error("GET /add-list-actress/export/pdf error:", err);
+    res.status(500).json({
+      success: false,
+      message: "Failed to export PDF list",
+    });
+  }
+});
+
+/* ==================== MAIN CRUD API ==================== */
 
 /**
  * GET /api/add-list-actress
  * List all actresses with continuous sequence numbers (seq: 1..N)
+ * Also expose a profile_image_path for the React page.
  */
 router.get("/", async (req, res) => {
   try {
@@ -54,12 +173,13 @@ router.get("/", async (req, res) => {
         ROW_NUMBER() OVER (ORDER BY id) AS seq,
         id,
         actress_name,
-        TO_CHAR(dob, 'FMDD Mon YYYY') AS dob,  -- e.g. 2 Oct 2025
+        TO_CHAR(dob, 'FMDD Mon YYYY') AS dob,
         best_movie,
         best_thing,
         country_name,
         created_at,
-        updated_at
+        updated_at,
+        '/api/add-list-actress/' || id || '/profile-image' AS profile_image_path
       FROM add_list_actress
       ORDER BY id;
     `
@@ -79,16 +199,101 @@ router.get("/", async (req, res) => {
 });
 
 /**
+ * GET /api/add-list-actress/:id/profile-image
+ * Raw binary image – used for small + full image in React.
+ */
+router.get("/:id/profile-image", async (req, res) => {
+  const { id } = req.params;
+
+  if (!id || Number.isNaN(Number(id))) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid id",
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT profile_image FROM add_list_actress WHERE id = $1 LIMIT 1`,
+      [id]
+    );
+
+    if (!result.rows.length || !result.rows[0].profile_image) {
+      return res.status(404).json({
+        success: false,
+        message: "No profile image",
+      });
+    }
+
+    const buf = result.rows[0].profile_image; // Buffer
+    // Simple default; you can detect type if you store mime_type.
+    res.setHeader("Content-Type", "image/jpeg");
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    return res.end(buf);
+  } catch (err) {
+    console.error("GET /add-list-actress/:id/profile-image error:", err);
+    res.status(500).json({
+      success: false,
+      message: "Failed to load profile image",
+    });
+  }
+});
+
+/**
+ * GET /api/add-list-actress/:id
+ * Optional detail endpoint.
+ */
+router.get("/:id", async (req, res) => {
+  const { id } = req.params;
+
+  if (!id || Number.isNaN(Number(id))) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid id",
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        actress_name,
+        TO_CHAR(dob, 'FMDD Mon YYYY') AS dob,
+        best_movie,
+        best_thing,
+        country_name,
+        created_at,
+        updated_at
+      FROM add_list_actress
+      WHERE id = $1
+      LIMIT 1;
+    `,
+      [id]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({
+        success: false,
+        message: "Actress not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      data: result.rows[0],
+    });
+  } catch (err) {
+    console.error("GET /add-list-actress/:id error:", err);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch actress",
+    });
+  }
+});
+
+/**
  * POST /api/add-list-actress
- * Body JSON:
- * {
- *   "actress_name": "sydney sweeney",          (required)
- *   "dob": "1997-09-12" OR "12 Sep 1997",     (optional)
- *   "best_movie": "...",                      (optional)
- *   "best_thing": "...",                      (optional)
- *   "country_name": "...",                    (optional)
- *   "profile_image_base64": "...."            (optional, base64 string)
- * }
  */
 router.post("/", async (req, res) => {
   try {
@@ -128,7 +333,14 @@ router.post("/", async (req, res) => {
         created_at,
         updated_at;
     `,
-      [nameNormalized, dobParsed, best_movie || null, best_thing || null, country_name || null, imageBuffer]
+      [
+        nameNormalized,
+        dobParsed,
+        best_movie || null,
+        best_thing || null,
+        country_name || null,
+        imageBuffer,
+      ]
     );
 
     res.status(201).json({
@@ -145,10 +357,9 @@ router.post("/", async (req, res) => {
 });
 
 /**
- * PUT /api/add-list-actress/:id
- * Update any fields (same body as POST, all optional)
+ * shared handler for updating by id (PUT / PATCH)
  */
-router.put("/:id", async (req, res) => {
+async function updateActressHandler(req, res) {
   const { id } = req.params;
 
   if (!id || Number.isNaN(Number(id))) {
@@ -168,7 +379,6 @@ router.put("/:id", async (req, res) => {
       profile_image_base64,
     } = req.body || {};
 
-    // build dynamic update set list
     const fields = [];
     const values = [];
     let idx = 1;
@@ -237,13 +447,16 @@ router.put("/:id", async (req, res) => {
       data: result.rows[0],
     });
   } catch (err) {
-    console.error("PUT /add-list-actress/:id error:", err);
+    console.error("UPDATE /add-list-actress/:id error:", err);
     res.status(500).json({
       success: false,
       message: "Failed to update actress",
     });
   }
-});
+}
+
+router.put("/:id", updateActressHandler);
+router.patch("/:id", updateActressHandler);
 
 /**
  * DELETE /api/add-list-actress/:id
@@ -280,135 +493,6 @@ router.delete("/:id", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to delete actress",
-    });
-  }
-});
-
-/* ==================== EXPORT: TEXT & PDF ==================== */
-
-// Helper to fetch list with seq
-async function fetchActressList() {
-  const result = await pool.query(
-    `
-    SELECT
-      ROW_NUMBER() OVER (ORDER BY id) AS seq,
-      id,
-      actress_name,
-      TO_CHAR(dob, 'FMDD Mon YYYY') AS dob,
-      best_movie,
-      best_thing,
-      country_name
-    FROM add_list_actress
-    ORDER BY id;
-  `
-  );
-  return result.rows;
-}
-
-/**
- * GET /api/add-list-actress/export/txt
- * Download a professional plain-text list
- */
-router.get("/export/txt", async (req, res) => {
-  try {
-    const rows = await fetchActressList();
-
-    let lines = [];
-    lines.push("=== Actress Favourite List ===");
-    lines.push(`Total: ${rows.length}`);
-    lines.push("================================");
-    lines.push("");
-
-    rows.forEach((r) => {
-      lines.push(
-        `${r.seq}. ${r.actress_name || "N/A"}${
-          r.country_name ? "  |  Country: " + r.country_name : ""
-        }`
-      );
-      if (r.dob) lines.push(`   DOB: ${r.dob}`);
-      if (r.best_movie) lines.push(`   Best Movie/Series: ${r.best_movie}`);
-      if (r.best_thing) lines.push(`   Best Thing: ${r.best_thing}`);
-      lines.push("--------------------------------");
-    });
-
-    const content = lines.join("\n");
-
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
-    res.setHeader(
-      "Content-Disposition",
-      'attachment; filename="actress_list.txt"'
-    );
-    res.send(content);
-  } catch (err) {
-    console.error("GET /add-list-actress/export/txt error:", err);
-    res.status(500).json({
-      success: false,
-      message: "Failed to export text list",
-    });
-  }
-});
-
-/**
- * GET /api/add-list-actress/export/pdf
- * Download a professional PDF list
- */
-router.get("/export/pdf", async (req, res) => {
-  try {
-    const rows = await fetchActressList();
-
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader(
-      "Content-Disposition",
-      'attachment; filename="actress_list.pdf"'
-    );
-
-    const doc = new PDFDocument({ margin: 40 });
-    doc.pipe(res);
-
-    // Title
-    doc
-      .fontSize(18)
-      .text("Actress Favourite List", { align: "center" })
-      .moveDown(0.5);
-
-    doc
-      .fontSize(10)
-      .text(`Total: ${rows.length}`, { align: "center" })
-      .moveDown(1);
-
-    doc.moveTo(40, doc.y).lineTo(555, doc.y).stroke().moveDown(0.8);
-
-    doc.fontSize(11);
-
-    rows.forEach((r) => {
-      doc
-        .font("Helvetica-Bold")
-        .text(`${r.seq}. ${r.actress_name || "N/A"}`, { continued: true });
-
-      if (r.country_name) {
-        doc.font("Helvetica").text(`  (${r.country_name})`);
-      } else {
-        doc.font("Helvetica").text("");
-      }
-
-      if (r.dob) doc.text(`DOB: ${r.dob}`);
-      if (r.best_movie) doc.text(`Best Movie/Series: ${r.best_movie}`);
-      if (r.best_thing) doc.text(`Best Thing: ${r.best_thing}`);
-
-      doc.moveDown(0.3);
-      doc
-        .moveTo(40, doc.y)
-        .lineTo(555, doc.y)
-        .stroke()
-        .moveDown(0.6);
-    });
-
-    doc.end();
-  } catch (err) {
-    console.error("GET /add-list-actress/export/pdf error:", err);
-    res.status(500).json({
-      success: false,
-      message: "Failed to export PDF list",
     });
   }
 });
