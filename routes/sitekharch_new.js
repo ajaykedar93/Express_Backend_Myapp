@@ -20,7 +20,6 @@ function makeError(msg = "Something went wrong", code = 500, extra = {}) {
  */
 function toIntId(v) {
   if (v === undefined || v === null) return null;
-  // e.g. "/kharch/NaN" -> v = "NaN"
   const n = Number(v);
   if (!Number.isFinite(n)) return null;
   if (!Number.isInteger(n)) return null;
@@ -79,6 +78,32 @@ function getMonthRange(ym) {
   return { start, end };
 }
 
+// safe date object from DB/string
+function toDateObj(d) {
+  if (!d) return null;
+  if (d instanceof Date) {
+    if (Number.isNaN(d.getTime())) return null;
+    return d;
+  }
+  const dt = new Date(d);
+  if (Number.isNaN(dt.getTime())) return null;
+  return dt;
+}
+
+// format date as "2 Oct 2025"
+function formatDateDMY(d) {
+  const dt = toDateObj(d);
+  if (!dt) return "";
+  const day = dt.getDate(); // 1..31
+  const monthsShort = [
+    "Jan","Feb","Mar","Apr","May","Jun",
+    "Jul","Aug","Sep","Oct","Nov","Dec",
+  ];
+  const month = monthsShort[dt.getMonth()];
+  const year = dt.getFullYear();
+  return `${day} ${month} ${year}`;
+}
+
 /* =========================
    NORMALISERS
 ========================= */
@@ -122,18 +147,20 @@ function normalizeKharchRow(row) {
 }
 
 /**
- * Global DB-error guard. We know user was getting:
- *   invalid input syntax for type bigint: "NaN"
- * So let’s convert it to a 400 with proper message.
+ * Global DB-error guard.
  */
 function handleDbError(err, res, fallbackMsg = "DB error") {
   console.error("DB ERROR:", err);
   const msg = String(err.message || "");
-  if (msg.includes("invalid input syntax for type bigint")
-      || msg.includes("NaN")) {
+  if (
+    msg.includes("invalid input syntax for type bigint") ||
+    msg.includes("NaN")
+  ) {
     return res
       .status(400)
-      .json(makeError("Invalid number (NaN) received. Check frontend payload.", 400));
+      .json(
+        makeError("Invalid number (NaN) received. Check frontend payload.", 400)
+      );
   }
   return res.status(500).json(makeError(fallbackMsg));
 }
@@ -349,7 +376,9 @@ router.post("/received", async (req, res) => {
     if (amtRec === null) {
       return res
         .status(400)
-        .json(makeError("amount_received is required and must be number", 400));
+        .json(
+          makeError("amount_received is required and must be number", 400)
+        );
     }
 
     const q = `
@@ -585,8 +614,18 @@ router.get("/summary", async (req, res) => {
 /* =========================================================
    4. DOWNLOAD PDF  (black, table-like)
    ========================================================= */
-// DOWNLOAD MONTHLY REPORT (PDF, table style, black only)
-// DOWNLOAD MONTHLY PDF (professional, black-only, received first, then kharch)
+
+/**
+ * GET /api/sitekharch/download?month=YYYY-MM
+ *
+ * Layout (black-only PDF):
+ *  1. Title + Month (CENTER)
+ *  2. KHARCH DETAILS (heading CENTER, table left)
+ *  3. RECEIVED DETAILS (heading CENTER, table left)
+ *  4. SUMMARY row (heading CENTER, totals CENTER)
+ *
+ * Dates in tables are shown as "2 Oct 2025"
+ */
 router.get("/download", async (req, res) => {
   try {
     const { month } = req.query;
@@ -634,7 +673,7 @@ router.get("/download", async (req, res) => {
       [start, end]
     );
 
-    // 3) TOTALS
+    // 3) TOTALS (using calcRowTotal for kharch)
     let totalKharch = 0;
     for (const r of kharchRows) {
       totalKharch += calcRowTotal(r);
@@ -658,10 +697,10 @@ router.get("/download", async (req, res) => {
     });
     doc.pipe(res);
 
-    // common helpers
     const pageWidth = doc.page.width;
     const left = doc.page.margins.left;
     const right = pageWidth - doc.page.margins.right;
+    const pageWidthInner = right - left;
 
     // draw row with auto-height and borders
     const drawRow = (cells, widths, opts = {}) => {
@@ -670,6 +709,7 @@ router.get("/download", async (req, res) => {
         y = doc.y,
         fontSize = 10,
         padding = 4,
+        alignCenter = false, // NEW: when true, center text inside cells
       } = opts;
 
       // measure height
@@ -679,7 +719,7 @@ router.get("/download", async (req, res) => {
         const txt = cell == null ? "" : String(cell);
         const h = doc.heightOfString(txt, {
           width: w,
-          align: "left",
+          align: alignCenter ? "center" : "left",
         });
         if (h > maxH) maxH = h;
       });
@@ -689,24 +729,21 @@ router.get("/download", async (req, res) => {
       const bottom = doc.page.height - doc.page.margins.bottom;
       if (y + rowH > bottom) {
         doc.addPage();
-        return drawRow(cells, widths, { header, y: doc.y, fontSize, padding });
+        return drawRow(cells, widths, { header, y: doc.y, fontSize, padding, alignCenter });
       }
 
       // draw
       let x = left;
       cells.forEach((cell, i) => {
         const w = widths[i];
-        doc
-          .rect(x, y, w, rowH)
-          .strokeColor("black")
-          .stroke();
+        doc.rect(x, y, w, rowH).strokeColor("black").stroke();
         doc
           .font(header ? "Helvetica-Bold" : "Helvetica")
           .fontSize(fontSize)
           .fillColor("black")
           .text(cell == null ? "" : String(cell), x + padding, y + padding, {
             width: w - padding * 2,
-            align: "left",
+            align: alignCenter ? "center" : "left",
           });
         x += w;
       });
@@ -721,48 +758,107 @@ router.get("/download", async (req, res) => {
     };
 
     /* ----------------------------------------------------
-       TITLE
+       TITLE (CENTER)
     ---------------------------------------------------- */
-    doc.font("Helvetica-Bold").fontSize(18).fillColor("black");
-    doc.text("Site Kharch Report", left, doc.y, { align: "left" });
+    doc
+      .font("Helvetica-Bold")
+      .fontSize(18)
+      .fillColor("black")
+      .text("Site Kharch Report", left, doc.y, {
+        align: "center",
+        width: pageWidthInner,
+      });
     doc.moveDown(0.3);
-    doc.font("Helvetica").fontSize(11);
-    doc.text(`Month: ${monthToLabel(month)}`);
+    doc
+      .font("Helvetica")
+      .fontSize(11)
+      .text(`Month: ${monthToLabel(month)}`, left, doc.y, {
+        align: "center",
+        width: pageWidthInner,
+      });
     doc.moveDown(1);
 
     /* ----------------------------------------------------
-       SUMMARY (ONE ROW TABLE)
+       KHARCH DETAILS (FIRST, HEADING CENTER)
     ---------------------------------------------------- */
-    const summaryWidths = [140, 120, 120, 120];
-    drawRow(
-      ["Month", "Total Kharch (Rs.)", "Total Received (Rs.)", "Balance (Rs.)"],
-      summaryWidths,
-      { header: true }
-    );
-    drawRow(
-      [
-        monthToLabel(month),
-        money(totalKharch),
-        money(totalReceived),
-        money(balance),
-      ],
-      summaryWidths
-    );
-    doc.moveDown(1.5);
+    doc
+      .font("Helvetica-Bold")
+      .fontSize(13)
+      .text("Kharch Details", left, doc.y, {
+        align: "center",
+        width: pageWidthInner,
+      });
+    doc.moveDown(0.5);
+
+    if (!kharchRows.length) {
+      doc.font("Helvetica").fontSize(10).text("No kharch entries.", left, doc.y, {
+        align: "center",
+        width: pageWidthInner,
+      });
+      doc.moveDown(1.5);
+    } else {
+      // #: 25, Date: 65, Details: 210, Amount: 65, Extra: 65, Total: 65
+      const kWidths = [25, 65, 210, 65, 65, 65]; // ~495
+      drawRow(["#", "Date", "Details", "Amount", "Extra", "Total"], kWidths, {
+        header: true,
+      });
+
+      kharchRows.forEach((r, idx) => {
+        const totalRow = calcRowTotal(r);
+        const details =
+          r.details && r.details.trim().length ? r.details : "—";
+
+        // main row (formatted date)
+        drawRow(
+          [
+            idx + 1,
+            formatDateDMY(r.kharch_date),
+            details,
+            money(r.amount),
+            r.extra_amount ? money(r.extra_amount) : "",
+            money(totalRow),
+          ],
+          kWidths
+        );
+
+        // extra_items as bullet subrows
+        if (Array.isArray(r.extra_items) && r.extra_items.length) {
+          r.extra_items.forEach((x) => {
+            const txt = `• Rs.${money(x.amount)}${
+              x.details ? ` (${x.details})` : ""
+            }`;
+            drawRow(["", "", txt, "", "", ""], kWidths, {
+              header: false,
+              fontSize: 9,
+            });
+          });
+        }
+      });
+
+      doc.moveDown(1.5);
+    }
 
     /* ----------------------------------------------------
-       RECEIVED FIRST
+       RECEIVED DETAILS (SECOND, HEADING CENTER)
     ---------------------------------------------------- */
-    doc.font("Helvetica-Bold").fontSize(13).text("Received Amounts", {
-      align: "left",
-    });
+    doc
+      .font("Helvetica-Bold")
+      .fontSize(13)
+      .text("Received Amounts", left, doc.y, {
+        align: "center",
+        width: pageWidthInner,
+      });
     doc.moveDown(0.5);
 
     if (!recvRows.length) {
-      doc.font("Helvetica").fontSize(10).text("No received entries.");
-      doc.moveDown(1.2);
+      doc.font("Helvetica").fontSize(10).text("No received entries.", left, doc.y, {
+        align: "center",
+        width: pageWidthInner,
+      });
+      doc.moveDown(1.5);
     } else {
-      const recWidths = [30, 70, 195, 80, 65]; // total ~440-450
+      // #: 30, Date: 70, Details: 195, Mode: 80, Amount: 65
+      const recWidths = [30, 70, 195, 80, 65]; // ~440-450
       drawRow(["#", "Date", "Details", "Mode", "Amount (Rs.)"], recWidths, {
         header: true,
       });
@@ -772,7 +868,7 @@ router.get("/download", async (req, res) => {
         drawRow(
           [
             idx + 1,
-            r.payment_date || "",
+            formatDateDMY(r.payment_date),
             det,
             r.payment_mode || "cash",
             money(r.amount_received),
@@ -785,56 +881,28 @@ router.get("/download", async (req, res) => {
     }
 
     /* ----------------------------------------------------
-       KHARCH BELOW
+       FINAL SUMMARY (TOTALS + BALANCE, CENTERED)
     ---------------------------------------------------- */
-    doc.font("Helvetica-Bold").fontSize(13).text("Kharch Details", {
-      align: "left",
-    });
+    doc
+      .font("Helvetica-Bold")
+      .fontSize(13)
+      .text("Summary", left, doc.y, {
+        align: "center",
+        width: pageWidthInner,
+      });
     doc.moveDown(0.5);
 
-    if (!kharchRows.length) {
-      doc.font("Helvetica").fontSize(10).text("No kharch entries.");
-    } else {
-      const kWidths = [25, 65, 210, 65, 65, 65]; // total ~495
-      drawRow(["#", "Date", "Details", "Amount", "Extra", "Total"], kWidths, {
-        header: true,
-      });
-
-      kharchRows.forEach((r, idx) => {
-        const total = calcRowTotal(r);
-        const details =
-          r.details && r.details.trim().length
-            ? r.details
-            : "—";
-
-        // main row
-        drawRow(
-          [
-            idx + 1,
-            r.kharch_date || "",
-            details,
-            money(r.amount),
-            r.extra_amount ? money(r.extra_amount) : "",
-            money(total),
-          ],
-          kWidths
-        );
-
-        // extra_items as subrows (only if present)
-        if (Array.isArray(r.extra_items) && r.extra_items.length) {
-          r.extra_items.forEach((x) => {
-            const txt = `• Rs.${money(x.amount)} ${
-              x.details ? `(${x.details})` : ""
-            }`;
-            drawRow(["", "", txt, "", "", ""], kWidths);
-          });
-        }
-      });
-    }
-
-    // optional footer
-    // doc.moveDown(1);
-    // doc.fontSize(8).text("Generated by Site Kharch System", left, doc.y);
+    const summaryWidths = [160, 140, 140];
+    drawRow(
+      ["Total Kharch (Rs.)", "Total Received (Rs.)", "Balance (Rs.)"],
+      summaryWidths,
+      { header: true, alignCenter: true }   // headings centered
+    );
+    drawRow(
+      [money(totalKharch), money(totalReceived), money(balance)],
+      summaryWidths,
+      { alignCenter: true }                 // numeric totals centered
+    );
 
     doc.end();
   } catch (err) {
@@ -842,7 +910,5 @@ router.get("/download", async (req, res) => {
     return res.status(500).json(makeError("Failed to download PDF"));
   }
 });
-
-
 
 module.exports = router;

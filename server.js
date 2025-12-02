@@ -134,7 +134,6 @@ app.use("/api/admin_impdocument", adminImpDocumentRouter);
 // ✅ keep only new defensive one
 app.use("/api/sitekharch", require("./routes/sitekharch_new"));
 
-app.use('/api', require('./routes/loan'));
 
 app.use("/api/act_favorite", require("./routes/userActFavorite"));
 
