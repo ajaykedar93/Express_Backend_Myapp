@@ -85,15 +85,17 @@ function buildMonthlyPDF({
   const DATE_BAND = "#f3f5fb";
   const ZEBRA = "#fafcff";
 
-  const CELL_PAD_X = 4;
-  const CELL_PAD_Y = 2;
-  const HEADER_H = 18;
-  const DATE_BAND_H = 24;
-  const MIN_ROW_H = 14;
+  // 🔹 more compact metrics
+  const CELL_PAD_X = 3;
+  const CELL_PAD_Y = 1.5;
+  const HEADER_H = 14;      // was 18
+  const DATE_BAND_H = 20;   // was 24
+  const MIN_ROW_H = 10;     // was 14
+  const BASE_FONT = 9;      // was 10
 
-  // IMPORTANT: no bufferPages here to avoid extra blank pages
+  // 🔹 smaller margins to fit more content
   const doc = new PDFDocument({
-    margin: 36,
+    margin: 24,        // was 36
     size: "A4",
     autoFirstPage: true,
   });
@@ -110,8 +112,8 @@ function buildMonthlyPDF({
   }
 
   // ---- Header (brand bar + title)
-  const headerY = 20;
-  const gradHeight = 22;
+  const headerY = 16;
+  const gradHeight = 18;
 
   const usableW =
     doc.page.width - doc.page.margins.left - doc.page.margins.right;
@@ -128,21 +130,21 @@ function buildMonthlyPDF({
 
   doc
     .font("Helvetica-Bold")
-    .fontSize(18)
+    .fontSize(16) // slightly smaller title
     .fillColor(INK_900)
-    .text(title, doc.page.margins.left, headerY + gradHeight + 10, {
+    .text(title, doc.page.margins.left, headerY + gradHeight + 6, {
       align: "left",
     });
 
   doc
     .font("Helvetica")
-    .fontSize(11)
+    .fontSize(10)
     .fillColor(INK_700)
     .text(`Period: ${monthName} ${year}`, {
       align: "left",
     });
 
-  drawDivider(doc, doc.y + 8, BORDER);
+  drawDivider(doc, doc.y + 6, BORDER);
 
   // ---- Compute totals & group by date
   let monthTotalDebit = 0;
@@ -167,13 +169,13 @@ function buildMonthlyPDF({
    * Fixed-ish: No, Amount, Type, Qty
    * Flexible: Category, Subcategory, Purpose (based on content width)
    */
-  doc.font("Helvetica").fontSize(10);
+  doc.font("Helvetica").fontSize(BASE_FONT);
 
   const fixed = {
-    no: 32,
-    amount: 80,
-    type: 50,
-    qty: 40,
+    no: 26,
+    amount: 70,
+    type: 44,
+    qty: 34,
   };
 
   const fixedSum = fixed.no + fixed.amount + fixed.type + fixed.qty;
@@ -195,9 +197,9 @@ function buildMonthlyPDF({
   let wSub = (maxSub / sumFlex) * flexAvailable;
   let wPur = (maxPur / sumFlex) * flexAvailable;
 
-  const MIN_CAT = 70;
-  const MIN_SUB = 70;
-  const MIN_PUR = 90;
+  const MIN_CAT = 60;
+  const MIN_SUB = 60;
+  const MIN_PUR = 80;
 
   wCat = Math.max(MIN_CAT, wCat);
   wSub = Math.max(MIN_SUB, wSub);
@@ -223,7 +225,7 @@ function buildMonthlyPDF({
   ];
 
   const startX = doc.page.margins.left;
-  let cursorY = doc.y + 12;
+  let cursorY = doc.y + 8;
 
   const bottomLimit = () =>
     doc.page.height - doc.page.margins.bottom;
@@ -238,7 +240,7 @@ function buildMonthlyPDF({
   function drawHeaderRow() {
     ensureSpaceHeight(HEADER_H);
     let x = startX;
-    doc.font("Helvetica-Bold").fontSize(10).fillColor(INK_600);
+    doc.font("Helvetica-Bold").fontSize(BASE_FONT).fillColor(INK_600);
     columns.forEach((c) => {
       doc.text(c.label, x + CELL_PAD_X, cursorY + CELL_PAD_Y, {
         width: c.width - 2 * CELL_PAD_X,
@@ -246,7 +248,7 @@ function buildMonthlyPDF({
       });
       x += c.width;
     });
-    drawDivider(doc, cursorY + HEADER_H - 2, BORDER);
+    drawDivider(doc, cursorY + HEADER_H - 1, BORDER);
     cursorY += HEADER_H;
   }
 
@@ -259,9 +261,9 @@ function buildMonthlyPDF({
       .restore();
     doc
       .font("Helvetica-Bold")
-      .fontSize(12)
+      .fontSize(BASE_FONT + 1)
       .fillColor(INK_900)
-      .text(label, startX + 8, cursorY + 6);
+      .text(label, startX + 8, cursorY + 4);
     cursorY += DATE_BAND_H;
     drawHeaderRow();
   }
@@ -269,8 +271,7 @@ function buildMonthlyPDF({
   function measureRowHeight(row, seq) {
     let maxH = 0;
 
-    // We'll measure using Helvetica size 10 for all cells
-    doc.font("Helvetica").fontSize(10);
+    doc.font("Helvetica").fontSize(BASE_FONT);
 
     columns.forEach((c) => {
       let text = "";
@@ -310,12 +311,12 @@ function buildMonthlyPDF({
 
   function drawRow(seq, row, zebra) {
     const rowH = measureRowHeight(row, seq);
-    ensureSpaceHeight(rowH + 4);
+    ensureSpaceHeight(rowH + 2);
 
     if (zebra) {
       doc
         .save()
-        .rect(startX, cursorY - 2, usableW, rowH + 4)
+        .rect(startX, cursorY - 1, usableW, rowH + 2)
         .fill(ZEBRA)
         .restore();
     }
@@ -369,7 +370,7 @@ function buildMonthlyPDF({
 
       doc
         .font(font)
-        .fontSize(10)
+        .fontSize(BASE_FONT)
         .fillColor(color)
         .text(text, x + CELL_PAD_X, cursorY + CELL_PAD_Y, {
           width: c.width - 2 * CELL_PAD_X,
@@ -387,19 +388,19 @@ function buildMonthlyPDF({
     let seq = 1;
     drawDateBand(dateLabel);
     rows.forEach((r, idx) => drawRow(seq++, r, idx % 2 === 0));
-    cursorY += 6;
+    cursorY += 3; // smaller gap between days (was 6)
   }
 
-  // ---- Monthly Summary Panel
-  const panelH = 84;
-  ensureSpaceHeight(panelH + 30);
+  // ---- Monthly Summary Panel (slightly shorter)
+  const panelH = 70;
+  ensureSpaceHeight(panelH + 20);
   drawDivider(doc, cursorY, BORDER);
-  cursorY += 10;
+  cursorY += 8;
 
   // Panel background
   doc
     .save()
-    .roundedRect(startX, cursorY, usableW, panelH, 10)
+    .roundedRect(startX, cursorY, usableW, panelH, 8)
     .fillOpacity(1)
     .fill(SURFACE)
     .restore();
@@ -409,34 +410,38 @@ function buildMonthlyPDF({
     .save()
     .lineWidth(1)
     .strokeColor(BORDER)
-    .roundedRect(startX, cursorY, usableW, panelH, 10)
+    .roundedRect(startX, cursorY, usableW, panelH, 8)
     .stroke()
     .restore();
 
-  const colW = (usableW - 32) / 3;
-  const px = startX + 16;
-  const py = cursorY + 14;
+  const colW = (usableW - 24) / 3;
+  const px = startX + 12;
+  const py = cursorY + 10;
 
   // Headings
-  doc.font("Helvetica").fontSize(10).fillColor(INK_600);
+  doc.font("Helvetica").fontSize(9).fillColor(INK_600);
   doc.text(`Total ${monthName} Transactions`, px, py, { width: colW });
-  doc.text("Total Debit", px + colW + 16, py, { width: colW });
-  doc.text("Total Credit", px + colW * 2 + 32, py, { width: colW });
+  doc.text("Total Debit", px + colW + 12, py, { width: colW });
+  doc.text("Total Credit", px + colW * 2 + 24, py, { width: colW });
 
   // Values
-  doc.font("Helvetica-Bold").fontSize(16).fillColor(INK_900);
-  doc.text(String(monthTotalTransactions), px, py + 16, { width: colW });
-  doc.fillColor(RED).text(INR(monthTotalDebit), px + colW + 16, py + 16, {
-    width: colW,
-  });
-  doc.fillColor(GREEN).text(INR(monthTotalCredit), px + colW * 2 + 32, py + 16, {
-    width: colW,
-  });
+  doc.font("Helvetica-Bold").fontSize(14).fillColor(INK_900);
+  doc.text(String(monthTotalTransactions), px, py + 14, { width: colW });
+  doc
+    .fillColor(RED)
+    .text(INR(monthTotalDebit), px + colW + 12, py + 14, {
+      width: colW,
+    });
+  doc
+    .fillColor(GREEN)
+    .text(INR(monthTotalCredit), px + colW * 2 + 24, py + 14, {
+      width: colW,
+    });
 
-  cursorY += panelH + 10;
+  cursorY += panelH + 6;
 
-  // NOTE: we intentionally DO NOT call pageFooter here any more
-  // to avoid extra blank pages from buffered page handling.
+  // (Optional) footer-per-page can be added here with doc.on("pageAdded") if you want,
+  // but we skip it to avoid any risk of blank pages.
 
   if (streamTo) {
     doc.end();
@@ -450,6 +455,7 @@ function buildMonthlyPDF({
     });
   }
 }
+
 
 // ----------------- Monthly Summary Download API -----------------
 router.get("/monthly-summary/download", async (req, res) => {
