@@ -88,6 +88,32 @@ function toJsonbTextArray(arr) {
   return filtered.length ? JSON.stringify(filtered) : null;
 }
 
+/**
+ * Check duplicate actress by (country_id + actress_name) (case-insensitive).
+ * Returns true if already exists.
+ */
+async function actressExistsInCountry({ country_id, favorite_actress_name, ignoreId }) {
+  if (!country_id || !favorite_actress_name) return false;
+
+  const params = [Number(country_id), String(favorite_actress_name).trim().toLowerCase()];
+  let sql = `
+    SELECT 1
+    FROM user_act_favorite
+    WHERE country_id = $1
+      AND lower(favorite_actress_name) = $2
+  `;
+
+  if (ignoreId) {
+    params.push(Number(ignoreId));
+    sql += ` AND id <> $3`;
+  }
+
+  sql += ` LIMIT 1`;
+
+  const { rows } = await pool.query(sql, params);
+  return rows.length > 0;
+}
+
 /* =========================================================
    COUNTRIES
    ========================================================= */
@@ -244,6 +270,7 @@ router.get(
 
 /**
  * POST /api/act_favorite/user-act-favorite
+ * ✅ Prevent duplicate actress by SAME (actress_name + country)
  */
 router.post(
   "/user-act-favorite",
@@ -270,6 +297,17 @@ router.post(
     }
 
     const cid = await resolveCountryId({ country_id, country_name });
+    if (!cid) return fail(res, 400, "country_id or country_name is required");
+
+    // ✅ DUPLICATE CHECK (same actress + same country)
+    const exists = await actressExistsInCountry({
+      country_id: cid,
+      favorite_actress_name,
+    });
+    if (exists) {
+      return fail(res, 409, "Duplicate: same actress already exists for this country");
+    }
+
     const imagesJsonText = toJsonbTextArray(images);
 
     const { rows } = await pool.query(
@@ -313,6 +351,7 @@ router.post(
 
 /**
  * PATCH /api/act_favorite/user-act-favorite/:id
+ * ✅ Also prevent duplicate when updating actress name/country
  */
 router.patch(
   "/user-act-favorite/:id",
@@ -338,6 +377,33 @@ router.patch(
       country_id !== undefined || country_name !== undefined
         ? await resolveCountryId({ country_id, country_name })
         : undefined;
+
+    // Determine final values for duplicate check if name/country is changing
+    if (cid !== undefined || favorite_actress_name !== undefined) {
+      // Get current row to know existing values
+      const current = (
+        await pool.query(
+          `SELECT country_id, favorite_actress_name FROM user_act_favorite WHERE id=$1 LIMIT 1`,
+          [id]
+        )
+      ).rows[0];
+      if (!current) return fail(res, 404, "Not found");
+
+      const finalCountryId = cid !== undefined ? cid : current.country_id;
+      const finalName =
+        favorite_actress_name !== undefined
+          ? favorite_actress_name
+          : current.favorite_actress_name;
+
+      const exists = await actressExistsInCountry({
+        country_id: finalCountryId,
+        favorite_actress_name: finalName,
+        ignoreId: id,
+      });
+      if (exists) {
+        return fail(res, 409, "Duplicate: same actress already exists for this country");
+      }
+    }
 
     const sets = [];
     const params = [];
