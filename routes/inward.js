@@ -1,8 +1,8 @@
 // routes/inward.js
 // ✅ PostgreSQL + Express + PDFKit + Multer (memory) -> BYTEA in DB
-// ✅ FIXED: upload routes must be BEFORE "/:id"
-// ✅ FIXED: Preview endpoint uses Content-Disposition: inline (so <img> works)
-// ✅ FIXED: GET ONE returns file_url for each item
+// ✅ ONE BILL FILE per inward (bill) + optional legacy files[]/fileIndexMap
+// ✅ upload routes BEFORE "/:id"
+// ✅ GET ONE returns ABSOLUTE file_url so React opens correctly
 
 const express = require("express");
 const PDFDocument = require("pdfkit");
@@ -58,15 +58,23 @@ function isMultipart(req) {
   return ct.includes("multipart/form-data");
 }
 
+// ✅ build absolute url for frontend (important)
+function getBaseUrl(req) {
+  // If you have proxy (render), this helps:
+  const proto = (req.headers["x-forwarded-proto"] || req.protocol || "http").toString().split(",")[0].trim();
+  const host = (req.headers["x-forwarded-host"] || req.get("host") || "").toString().split(",")[0].trim();
+  return `${proto}://${host}`;
+}
+
 /**
  * JSON:
  *  {work_date, store, items:[...]}
  *
  * multipart:
- *  work_date, store (fields)
+ *  work_date, store
  *  items (json string)
- *  fileIndexMap (json string) => {"0":true,"2":true}
- *  files[] (in same order of sorted keys)
+ *  bill (single file)  ✅ NEW
+ *  fileIndexMap + files[] (legacy support)
  */
 function readPayload(req) {
   if (!isMultipart(req)) {
@@ -74,6 +82,7 @@ function readPayload(req) {
       work_date: req.body?.work_date,
       store: req.body?.store,
       items: Array.isArray(req.body?.items) ? req.body.items : [],
+      billFile: null,
       fileIndexMap: null,
       files: [],
     };
@@ -81,12 +90,28 @@ function readPayload(req) {
 
   const items = safeJsonParse(req.body?.items || "[]", []);
   const fileIndexMap = safeJsonParse(req.body?.fileIndexMap || "{}", {});
-  const files = Array.isArray(req.files) ? req.files : [];
+
+  // ✅ multer.fields -> req.files is OBJECT: { bill:[...], files:[...] }
+  // ✅ multer.array -> req.files is ARRAY
+  let billFile = null;
+  let files = [];
+
+  if (Array.isArray(req.files)) {
+    // old array style
+    files = req.files;
+  } else if (req.files && typeof req.files === "object") {
+    billFile = Array.isArray(req.files.bill) ? req.files.bill[0] : null;
+    files = Array.isArray(req.files.files) ? req.files.files : [];
+  }
+
+  // Also allow req.file if someone used upload.single()
+  if (!billFile && req.file) billFile = req.file;
 
   return {
     work_date: req.body?.work_date,
     store: req.body?.store,
     items: Array.isArray(items) ? items : [],
+    billFile,
     fileIndexMap: fileIndexMap && typeof fileIndexMap === "object" ? fileIndexMap : {},
     files,
   };
@@ -113,6 +138,8 @@ function validateHeaderAndItems(payload) {
         : Number(it.quantity);
 
     const quantity_type = isNonEmptyString(it.quantity_type) ? it.quantity_type.trim() : null;
+
+    // we keep image_path optional (not used when upload exists)
     const image_path = isNonEmptyString(it.image_path) ? it.image_path.trim() : null;
 
     if (!material) errors.push(`items[${idx}].material is required.`);
@@ -146,6 +173,13 @@ function validateHeaderAndItems(payload) {
 
 /* ---------------- FILE -> DB helpers ---------------- */
 
+function isAllowedBillFile(file) {
+  if (!file) return false;
+  const mt = String(file.mimetype || "").toLowerCase();
+  // allow all images + pdf
+  return mt.startsWith("image/") || mt === "application/pdf";
+}
+
 async function insertUpload(client, file) {
   const q = `
     INSERT INTO inward_uploads (file_name, mime_type, file_data)
@@ -161,8 +195,7 @@ async function insertUpload(client, file) {
 }
 
 /**
- * fileIndexMap: {"0":true,"2":true}
- * files[] order must match sorted keys: 0 then 2
+ * legacy: fileIndexMap {"0":true,"2":true} + files[] ordered by key
  */
 function buildIndexToFileMap(fileIndexMap, files) {
   const idxs = Object.keys(fileIndexMap || {})
@@ -179,14 +212,13 @@ function buildIndexToFileMap(fileIndexMap, files) {
 }
 
 /* =========================================================
-   ✅ IMPORTANT: UPLOAD ROUTES MUST BE BEFORE "/:id"
+   ✅ UPLOAD ROUTES (BEFORE "/:id")
    ========================================================= */
 
 /**
  * ✅ PREVIEW uploaded file INLINE (for <img> and <iframe>)
  * GET /api/inward/upload/:uploadId/view
  */
-
 router.get("/upload/:uploadId/view", async (req, res) => {
   const uploadId = Number(req.params.uploadId);
   if (Number.isNaN(uploadId)) return res.status(400).json({ success: false, message: "Invalid uploadId" });
@@ -202,7 +234,6 @@ router.get("/upload/:uploadId/view", async (req, res) => {
   res.setHeader("Content-Disposition", `inline; filename="${(f.file_name || "file").replace(/"/g, "")}"`);
   return res.end(f.file_data);
 });
-
 
 /**
  * ✅ DOWNLOAD uploaded file (force download)
@@ -317,7 +348,7 @@ router.get("/pdf", async (req, res) => {
 });
 
 /**
- * ✅ GET ONE (returns file_url)
+ * ✅ GET ONE (returns ABSOLUTE file_url)
  * GET /api/inward/:id
  */
 router.get("/:id", async (req, res) => {
@@ -331,19 +362,21 @@ router.get("/:id", async (req, res) => {
     );
     if (header.rowCount === 0) return res.status(404).json({ success: false, message: "Inward not found" });
 
+    const base = getBaseUrl(req);
+
     const items = await db.query(
       `
       SELECT
         id, item_order, material, quantity, quantity_type, material_use, image_path, upload_id, created_at,
         CASE
-          WHEN upload_id IS NOT NULL THEN '/api/inward/upload/' || upload_id || '/view'
+          WHEN upload_id IS NOT NULL THEN $2 || '/api/inward/upload/' || upload_id || '/view'
           ELSE image_path
         END AS file_url
       FROM inward_items
       WHERE inward_id=$1
       ORDER BY item_order
       `,
-      [inwardId]
+      [inwardId, base]
     );
 
     return res.json({ success: true, data: { ...header.rows[0], items: items.rows } });
@@ -382,10 +415,13 @@ router.get("/:id/pdf", async (req, res) => {
 });
 
 /**
- * ✅ CREATE (JSON OR multipart)
+ * ✅ CREATE
  * POST /api/inward
+ * Accepts:
+ *  - bill (single file) ✅ preferred
+ *  - or legacy files[] + fileIndexMap
  */
-router.post("/", upload.array("files"), async (req, res) => {
+router.post("/", upload.fields([{ name: "bill", maxCount: 1 }, { name: "files", maxCount: 50 }]), async (req, res) => {
   const payload = readPayload(req);
   const v = validateHeaderAndItems(payload);
 
@@ -403,18 +439,39 @@ router.post("/", upload.array("files"), async (req, res) => {
     );
     const inwardId = header.rows[0].id;
 
+    // ✅ NEW: one bill file for whole inward
+    let commonUploadId = null;
+    if (payload.billFile && payload.billFile.buffer) {
+      if (!isAllowedBillFile(payload.billFile)) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ success: false, message: "Only image or PDF allowed for bill." });
+      }
+      commonUploadId = await insertUpload(client, payload.billFile);
+    }
+
+    // legacy support (optional)
     let indexToFile = new Map();
-    if (isMultipart(req)) {
+    if (!commonUploadId && isMultipart(req)) {
       indexToFile = buildIndexToFileMap(payload.fileIndexMap, payload.files);
     }
 
     for (let idx = 0; idx < v.items.length; idx++) {
       const it = v.items[idx];
 
-      const file = indexToFile.get(idx);
-      if (file && file.buffer) {
-        const uploadId = await insertUpload(client, file);
-        it.upload_id = uploadId;
+      // ✅ if common bill exists -> use for all items
+      if (commonUploadId) {
+        it.upload_id = commonUploadId;
+      } else {
+        // legacy per-item
+        const file = indexToFile.get(idx);
+        if (file && file.buffer) {
+          if (!isAllowedBillFile(file)) {
+            await client.query("ROLLBACK");
+            return res.status(400).json({ success: false, message: "Only image or PDF allowed for bill." });
+          }
+          const uploadId = await insertUpload(client, file);
+          it.upload_id = uploadId;
+        }
       }
 
       await client.query(
@@ -450,8 +507,13 @@ router.post("/", upload.array("files"), async (req, res) => {
 /**
  * ✅ UPDATE (replaces all items)
  * PUT /api/inward/:id
+ * Accepts:
+ *  - bill (single file) ✅ preferred
+ *  - or legacy files[] + fileIndexMap
+ *
+ * Note: If bill not sent, it keeps previous bill (if any) by reading old upload_id.
  */
-router.put("/:id", upload.array("files"), async (req, res) => {
+router.put("/:id", upload.fields([{ name: "bill", maxCount: 1 }, { name: "files", maxCount: 50 }]), async (req, res) => {
   const inwardId = Number(req.params.id);
   if (Number.isNaN(inwardId)) return res.status(400).json({ success: false, message: "Invalid id" });
 
@@ -477,20 +539,47 @@ router.put("/:id", upload.array("files"), async (req, res) => {
       [v.work_date, v.store, inwardId]
     );
 
+    // ✅ find old upload_id (to keep if new bill not provided)
+    const oldUpload = await client.query(
+      `SELECT upload_id FROM inward_items WHERE inward_id=$1 AND upload_id IS NOT NULL ORDER BY id LIMIT 1`,
+      [inwardId]
+    );
+    const oldUploadId = oldUpload.rowCount ? oldUpload.rows[0].upload_id : null;
+
+    // ✅ new bill?
+    let commonUploadId = oldUploadId;
+    if (payload.billFile && payload.billFile.buffer) {
+      if (!isAllowedBillFile(payload.billFile)) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ success: false, message: "Only image or PDF allowed for bill." });
+      }
+      commonUploadId = await insertUpload(client, payload.billFile);
+    }
+
+    // replace items
     await client.query(`DELETE FROM inward_items WHERE inward_id=$1`, [inwardId]);
 
+    // legacy support (only if no commonUploadId from bill)
     let indexToFile = new Map();
-    if (isMultipart(req)) {
+    if (!commonUploadId && isMultipart(req)) {
       indexToFile = buildIndexToFileMap(payload.fileIndexMap, payload.files);
     }
 
     for (let idx = 0; idx < v.items.length; idx++) {
       const it = v.items[idx];
 
-      const file = indexToFile.get(idx);
-      if (file && file.buffer) {
-        const uploadId = await insertUpload(client, file);
-        it.upload_id = uploadId;
+      if (commonUploadId) {
+        it.upload_id = commonUploadId;
+      } else {
+        const file = indexToFile.get(idx);
+        if (file && file.buffer) {
+          if (!isAllowedBillFile(file)) {
+            await client.query("ROLLBACK");
+            return res.status(400).json({ success: false, message: "Only image or PDF allowed for bill." });
+          }
+          const uploadId = await insertUpload(client, file);
+          it.upload_id = uploadId;
+        }
       }
 
       await client.query(
