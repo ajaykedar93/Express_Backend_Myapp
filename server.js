@@ -96,8 +96,10 @@ app.use("/api/documents", documentRouter);
 
 // Work-related
 app.use("/api", workDetailsRouter);
+
 const inwardRoutes = require("./routes/inward");
-app.use("/api", inwardRoutes); // so endpoints become /api/inward, /api/inward/export, etc.
+app.use("/api/inward", inwardRoutes);
+
 
 app.use("/api/workcategory", workCategoryRouter);
 
@@ -173,7 +175,3 @@ const server = app.listen(PORT, () => {
   console.log(`🚀 Server running at http://localhost:${PORT}`);
 });
 
-// Keep-alive for large/slow uploads
-server.keepAliveTimeout = 65000;
-server.headersTimeout = 66000;
-module.exports = app;
