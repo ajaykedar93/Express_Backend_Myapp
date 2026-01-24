@@ -99,6 +99,9 @@ app.use("/api", workDetailsRouter);
 
 const inwardRoutes = require("./routes/inward");
 app.use("/api/inward", inwardRoutes);
+// server.js / app.js
+const inwardViewOnly = require("./routes/inwardViewOnly");
+app.use("/api/inward-view", inwardViewOnly);
 
 
 app.use("/api/workcategory", workCategoryRouter);
