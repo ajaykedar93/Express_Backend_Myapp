@@ -130,7 +130,9 @@ function validateHeaderAndItems(payload) {
 
   const cleanItems = rawItems.map((it, idx) => {
     const material = isNonEmptyString(it.material) ? it.material.trim() : "";
-    const material_use = isNonEmptyString(it.material_use) ? it.material_use.trim() : "";
+
+    // ✅ OPTIONAL for b/c..., REQUIRED only for a) (idx==0)
+    const material_use = isNonEmptyString(it.material_use) ? it.material_use.trim() : null;
 
     const quantity =
       it.quantity === null || it.quantity === undefined || it.quantity === ""
@@ -139,28 +141,37 @@ function validateHeaderAndItems(payload) {
 
     const quantity_type = isNonEmptyString(it.quantity_type) ? it.quantity_type.trim() : null;
 
-    // we keep image_path optional (not used when upload exists)
     const image_path = isNonEmptyString(it.image_path) ? it.image_path.trim() : null;
 
+    // ✅ Material is mandatory for all rows that are sent
     if (!material) errors.push(`items[${idx}].material is required.`);
-    if (!material_use) errors.push(`items[${idx}].material_use is required.`);
-    if (quantity !== null && Number.isNaN(quantity)) errors.push(`items[${idx}].quantity must be a number.`);
+
+    // ✅ Only first row (a) requires material_use
+    if (idx === 0 && !material_use) {
+      errors.push(`items[${idx}].material_use is required for subpoint a).`);
+    }
+
+    if (quantity !== null && Number.isNaN(quantity)) {
+      errors.push(`items[${idx}].quantity must be a number.`);
+    }
 
     return {
       item_order: idx + 1,
       material,
       quantity,
       quantity_type,
-      material_use,
+      material_use, // can be null for b/c...
       image_path,
       upload_id: null,
     };
   });
 
-  // block duplicates inside same request
+  // ✅ block duplicates inside same request
+  // (material_use can be null now, so make it safe)
   const seen = new Set();
   for (let i = 0; i < cleanItems.length; i++) {
-    const k = `${work_date}||${store.toLowerCase()}||${cleanItems[i].material.toLowerCase()}||${cleanItems[i].material_use.toLowerCase()}`;
+    const useKey = (cleanItems[i].material_use || "").toLowerCase();
+    const k = `${work_date}||${store.toLowerCase()}||${cleanItems[i].material.toLowerCase()}||${useKey}`;
     if (seen.has(k)) {
       errors.push(`Duplicate not allowed inside request (Row ${i + 1}).`);
       break;
@@ -170,6 +181,7 @@ function validateHeaderAndItems(payload) {
 
   return { ok: errors.length === 0, errors, work_date, store, items: cleanItems };
 }
+
 
 /* ---------------- FILE -> DB helpers ---------------- */
 
