@@ -1,6 +1,6 @@
 // routes/inward.js
 // ✅ PostgreSQL + Express + PDFKit + Multer (memory) -> BYTEA in DB
-// ✅ ONE BILL FILE per inward (bill) + optional legacy files[]/fileIndexMap
+// ✅ ONE BILL FILE per inward (bill)
 // ✅ upload routes BEFORE "/:id"
 // ✅ GET ONE returns ABSOLUTE file_url so React opens correctly
 //
@@ -87,7 +87,7 @@ function getBaseUrl(req) {
  * multipart:
  *  work_date, store
  *  items (json string)
- *  bill (single file)  ✅ NEW
+ *  bill (single file)
  *  fileIndexMap + files[] (legacy support)
  */
 function readPayload(req) {
@@ -105,11 +105,10 @@ function readPayload(req) {
   const items = safeJsonParse(req.body?.items || "[]", []);
   const fileIndexMap = safeJsonParse(req.body?.fileIndexMap || "{}", {});
 
-  // ✅ multer.fields -> req.files is OBJECT: { bill:[...], files:[...] }
-  // ✅ multer.array -> req.files is ARRAY
   let billFile = null;
   let files = [];
 
+  // multer.fields -> req.files is OBJECT: { bill:[...], files:[...] }
   if (Array.isArray(req.files)) {
     files = req.files;
   } else if (req.files && typeof req.files === "object") {
@@ -143,7 +142,7 @@ function validateHeaderAndItems(payload) {
   const cleanItems = rawItems.map((it, idx) => {
     const material = isNonEmptyString(it.material) ? it.material.trim() : "";
 
-    // ✅ Only first row (a) requires material_use (as your existing logic)
+    // ✅ Only first row (a) requires material_use (your existing rule)
     const material_use = isNonEmptyString(it.material_use) ? it.material_use.trim() : null;
 
     const quantity =
@@ -156,17 +155,11 @@ function validateHeaderAndItems(payload) {
     const image_path = isNonEmptyString(it.image_path) ? it.image_path.trim() : null;
 
     if (!material) errors.push(`items[${idx}].material is required.`);
-
-    if (idx === 0 && !material_use) {
-      errors.push(`items[${idx}].material_use is required for subpoint a).`);
-    }
-
-    if (quantity !== null && Number.isNaN(quantity)) {
-      errors.push(`items[${idx}].quantity must be a number.`);
-    }
+    if (idx === 0 && !material_use) errors.push(`items[${idx}].material_use is required for subpoint a).`);
+    if (quantity !== null && Number.isNaN(quantity)) errors.push(`items[${idx}].quantity must be a number.`);
 
     return {
-      item_order: idx + 1, // will be re-assigned in DB as needed
+      item_order: idx + 1, // DB may reassign when inserting new
       material,
       quantity,
       quantity_type,
@@ -176,7 +169,7 @@ function validateHeaderAndItems(payload) {
     };
   });
 
-  // ✅ block duplicates inside same request (by material only for merge rule)
+  // ✅ block duplicates inside same request (material only, because merge rule is by material)
   const seen = new Set();
   for (let i = 0; i < cleanItems.length; i++) {
     const k = `${work_date}||${store.toLowerCase()}||${cleanItems[i].material.toLowerCase()}`;
@@ -229,30 +222,24 @@ function buildIndexToFileMap(fileIndexMap, files) {
   return map;
 }
 
-/* ---------------- NEW: Date-wise stable sequence helpers ---------------- */
+/* ---------------- Date-wise stable sequence helpers ---------------- */
 
-async function getOrCreateDaySeqId(client, work_date) {
-  // If exists, return it. Else create.
-  // We avoid relying on seq_no calculation in app.
-  const existing = await client.query(
-    `SELECT id, seq_no FROM inward_day_seq WHERE work_date=$1`,
-    [work_date]
-  );
-  if (existing.rowCount) return existing.rows[0].id;
-
-  const created = await client.query(
-    `INSERT INTO inward_day_seq (work_date) VALUES ($1) RETURNING id, seq_no`,
-    [work_date]
-  );
-  return created.rows[0].id;
-}
-
-async function getDaySeqNo(client, work_date) {
+/**
+ * ✅ Concurrency-safe: if two requests create same work_date simultaneously, no crash.
+ * Requires inward_day_seq(work_date UNIQUE, seq_no ...)
+ */
+async function getOrCreateDaySeqRow(client, work_date) {
   const r = await client.query(
-    `SELECT seq_no FROM inward_day_seq WHERE work_date=$1`,
+    `
+    INSERT INTO inward_day_seq (work_date)
+    VALUES ($1)
+    ON CONFLICT (work_date)
+    DO UPDATE SET work_date = EXCLUDED.work_date
+    RETURNING id, seq_no
+    `,
     [work_date]
   );
-  return r.rowCount ? r.rows[0].seq_no : null;
+  return r.rows[0]; // {id, seq_no}
 }
 
 /* =========================================================
@@ -305,25 +292,17 @@ router.get("/upload/:uploadId/download", async (req, res) => {
 /* ---------------- ROUTES ---------------- */
 
 /**
- * ✅ LIST
+ * ✅ LIST (FAST)
  * GET /api/inward?from=YYYY-MM-DD&to=YYYY-MM-DD
- * ✅ shows date-level seq_no (stable)
+ * ✅ returns items inline so React loads fast
  */
 router.get("/", async (req, res) => {
   const from = toISODate(req.query.from);
   const to = toISODate(req.query.to);
 
   try {
-    let q = `
-      SELECT
-        i.id,
-        ds.seq_no,
-        i.work_date,
-        i.store,
-        i.created_at
-      FROM inward i
-      LEFT JOIN inward_day_seq ds ON ds.id = i.day_seq_id
-    `;
+    const base = getBaseUrl(req);
+
     const params = [];
     const where = [];
 
@@ -335,10 +314,48 @@ router.get("/", async (req, res) => {
       params.push(to);
       where.push(`i.work_date <= $${params.length}`);
     }
-    if (where.length) q += ` WHERE ` + where.join(" AND ");
-    q += ` ORDER BY i.work_date DESC, ds.seq_no DESC NULLS LAST, i.store ASC`;
 
-    const r = await db.query(q, params);
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+    // ✅ items inline (JSON aggregation) -> much faster frontend
+    const q = `
+      SELECT
+        i.id,
+        ds.seq_no,
+        i.work_date,
+        i.store,
+        i.created_at,
+        COALESCE(
+          json_agg(
+            json_build_object(
+              'id', it.id,
+              'item_order', it.item_order,
+              'material', it.material,
+              'quantity', it.quantity,
+              'quantity_type', it.quantity_type,
+              'material_use', it.material_use,
+              'image_path', it.image_path,
+              'upload_id', it.upload_id,
+              'file_url',
+                CASE
+                  WHEN it.upload_id IS NOT NULL THEN $1 || '/api/inward/upload/' || it.upload_id || '/view'
+                  ELSE it.image_path
+                END
+            )
+            ORDER BY it.item_order
+          ) FILTER (WHERE it.id IS NOT NULL),
+          '[]'::json
+        ) AS items
+      FROM inward i
+      LEFT JOIN inward_day_seq ds ON ds.id = i.day_seq_id
+      LEFT JOIN inward_items it ON it.inward_id = i.id
+      ${whereSql}
+      GROUP BY i.id, ds.seq_no, i.work_date, i.store, i.created_at
+      ORDER BY i.work_date DESC, ds.seq_no DESC NULLS LAST, i.store ASC, i.id DESC
+    `;
+
+    // $1 is base url, rest are date filters
+    const r = await db.query(q, [base, ...params]);
     return res.json({ success: true, data: r.rows });
   } catch (err) {
     return res.status(500).json({ success: false, message: "Server error", error: String(err) });
@@ -505,6 +522,9 @@ router.get("/:id/pdf", async (req, res) => {
  * ✅ If same (Date + Store) header exists:
  *    - do NOT create new inward header
  *    - for each item: if same material exists => ADD quantity, else insert new row
+ *
+ * ✅ One bill per inward:
+ *    - if new bill uploaded: set upload_id for ALL items of that inward
  */
 router.post(
   "/",
@@ -521,8 +541,10 @@ router.post(
     try {
       await client.query("BEGIN");
 
-      // ✅ date-wise stable seq
-      const daySeqId = await getOrCreateDaySeqId(client, v.work_date);
+      // ✅ date-wise stable seq row
+      const dayRow = await getOrCreateDaySeqRow(client, v.work_date);
+      const daySeqId = dayRow.id;
+      const daySeqNo = dayRow.seq_no;
 
       // ✅ check if header exists for same date + store
       const existingHeader = await client.query(
@@ -535,6 +557,9 @@ router.post(
 
       if (existingHeader.rowCount) {
         inwardId = existingHeader.rows[0].id;
+
+        // ensure day_seq_id is set even for old records
+        await client.query(`UPDATE inward SET day_seq_id=$1 WHERE id=$2 AND (day_seq_id IS NULL OR day_seq_id<>$1)`, [daySeqId, inwardId]);
       } else {
         const header = await client.query(
           `INSERT INTO inward (work_date, store, day_seq_id) VALUES ($1,$2,$3) RETURNING id`,
@@ -544,16 +569,18 @@ router.post(
         createdNew = true;
       }
 
-      // ✅ NEW: one bill file for whole inward
+      // ✅ Bill logic (one per inward)
+      let newBillUploaded = false;
       let commonUploadId = null;
+
       if (payload.billFile && payload.billFile.buffer) {
         if (!isAllowedBillFile(payload.billFile)) {
           await client.query("ROLLBACK");
           return res.status(400).json({ success: false, message: "Only image or PDF allowed for bill." });
         }
         commonUploadId = await insertUpload(client, payload.billFile);
+        newBillUploaded = true;
       } else {
-        // keep old if exists
         const oldUpload = await client.query(
           `SELECT upload_id FROM inward_items WHERE inward_id=$1 AND upload_id IS NOT NULL ORDER BY id LIMIT 1`,
           [inwardId]
@@ -561,23 +588,34 @@ router.post(
         commonUploadId = oldUpload.rowCount ? oldUpload.rows[0].upload_id : null;
       }
 
-      // legacy support (optional) - ONLY if no commonUploadId
+      // ✅ if new bill uploaded -> apply to ALL existing items immediately
+      if (newBillUploaded && commonUploadId) {
+        await client.query(
+          `UPDATE inward_items SET upload_id=$1 WHERE inward_id=$2`,
+          [commonUploadId, inwardId]
+        );
+      }
+
+      // legacy support ONLY if no commonUploadId
       let indexToFile = new Map();
       if (!commonUploadId && isMultipart(req)) {
         indexToFile = buildIndexToFileMap(payload.fileIndexMap, payload.files);
       }
 
-      // ✅ build existing items map by material lower
+      // existing items map by material lower
       const existingItems = await client.query(
-        `SELECT id, material, quantity, quantity_type, material_use, item_order FROM inward_items WHERE inward_id=$1`,
+        `SELECT id, material, quantity, quantity_type, material_use, upload_id, item_order
+         FROM inward_items
+         WHERE inward_id=$1`,
         [inwardId]
       );
+
       const byMaterial = new Map();
       for (const r of existingItems.rows) {
         byMaterial.set(String(r.material || "").toLowerCase(), r);
       }
 
-      // ✅ for inserting new, get current max item_order
+      // for inserting new, get current max item_order
       const maxOrderRes = await client.query(
         `SELECT COALESCE(MAX(item_order),0) AS mx FROM inward_items WHERE inward_id=$1`,
         [inwardId]
@@ -605,7 +643,7 @@ router.post(
 
         const found = byMaterial.get(key);
 
-        // ✅ MERGE: if same material exists => add quantity (no new row)
+        // ✅ MERGE: same material -> add qty
         if (found) {
           const oldQty = found.quantity === null || found.quantity === undefined ? null : Number(found.quantity);
           const newQty = it.quantity === null || it.quantity === undefined ? null : Number(it.quantity);
@@ -616,13 +654,8 @@ router.post(
             finalQty = Number(finalQty) + Number(newQty);
           }
 
-          // update quantity_type only if provided
           const finalQtyType = it.quantity_type ? it.quantity_type : found.quantity_type;
-
-          // update material_use only if existing missing and new provided
           const finalUse = found.material_use ? found.material_use : it.material_use;
-
-          // update upload_id: keep commonUploadId (if any) OR new if provided
           const finalUpload = it.upload_id ? it.upload_id : found.upload_id;
 
           await client.query(
@@ -650,15 +683,14 @@ router.post(
 
       await client.query("COMMIT");
 
-      // return header with seq_no
-      const seqNo = await getDaySeqNo(client, v.work_date);
       return res.json({
         success: true,
         message: createdNew ? "Inward created" : "Inward merged (quantity added)",
-        data: { id: inwardId, seq_no: seqNo, work_date: v.work_date, store: v.store },
+        data: { id: inwardId, seq_no: daySeqNo, work_date: v.work_date, store: v.store },
       });
     } catch (err) {
       await client.query("ROLLBACK");
+
       if (pgDuplicateError(err)) {
         return res.status(409).json({
           success: false,
@@ -666,6 +698,7 @@ router.post(
           error: err.detail || String(err),
         });
       }
+
       return res.status(500).json({ success: false, message: "Server error", error: String(err) });
     } finally {
       client.release();
@@ -677,7 +710,7 @@ router.post(
  * ✅ UPDATE (replaces all items)
  * PUT /api/inward/:id
  *
- * ✅ keeps same day_seq_id (date बदलली तर seq त्या date ला assign होईल)
+ * ✅ keeps day_seq_id for that date
  * Note: If bill not sent, it keeps previous bill (if any) by reading old upload_id.
  */
 router.put(
@@ -704,22 +737,24 @@ router.put(
         return res.status(404).json({ success: false, message: "Inward not found" });
       }
 
-      // ✅ ensure day_seq_id for new date
-      const daySeqId = await getOrCreateDaySeqId(client, v.work_date);
+      const dayRow = await getOrCreateDaySeqRow(client, v.work_date);
+      const daySeqId = dayRow.id;
+      const daySeqNo = dayRow.seq_no;
 
-      const header = await client.query(
-        `UPDATE inward SET work_date=$1, store=$2, day_seq_id=$3 WHERE id=$4 RETURNING id, work_date, store, day_seq_id`,
+      // header update (may throw duplicate if same date+store already exists for another record)
+      await client.query(
+        `UPDATE inward SET work_date=$1, store=$2, day_seq_id=$3 WHERE id=$4`,
         [v.work_date, v.store, daySeqId, inwardId]
       );
 
-      // ✅ find old upload_id (to keep if new bill not provided)
+      // old upload_id
       const oldUpload = await client.query(
         `SELECT upload_id FROM inward_items WHERE inward_id=$1 AND upload_id IS NOT NULL ORDER BY id LIMIT 1`,
         [inwardId]
       );
       const oldUploadId = oldUpload.rowCount ? oldUpload.rows[0].upload_id : null;
 
-      // ✅ new bill?
+      // new bill?
       let commonUploadId = oldUploadId;
       if (payload.billFile && payload.billFile.buffer) {
         if (!isAllowedBillFile(payload.billFile)) {
@@ -729,7 +764,7 @@ router.put(
         commonUploadId = await insertUpload(client, payload.billFile);
       }
 
-      // replace items (but while inserting, keep material uniqueness)
+      // replace items
       await client.query(`DELETE FROM inward_items WHERE inward_id=$1`, [inwardId]);
 
       // legacy support (ONLY if there is no commonUploadId)
@@ -738,7 +773,7 @@ router.put(
         indexToFile = buildIndexToFileMap(payload.fileIndexMap, payload.files);
       }
 
-      // insert new items with fresh item_order
+      // insert fresh items (order 1..N)
       let order = 1;
       for (let idx = 0; idx < v.items.length; idx++) {
         const it = v.items[idx];
@@ -766,16 +801,16 @@ router.put(
           `,
           [inwardId, order, it.material, it.quantity, it.quantity_type, it.material_use, it.image_path, it.upload_id]
         );
+
         order++;
       }
 
       await client.query("COMMIT");
 
-      const seqNo = await getDaySeqNo(client, v.work_date);
       return res.json({
         success: true,
         message: "Inward updated",
-        data: { id: inwardId, seq_no: seqNo, work_date: v.work_date, store: v.store },
+        data: { id: inwardId, seq_no: daySeqNo, work_date: v.work_date, store: v.store },
       });
     } catch (err) {
       await client.query("ROLLBACK");
@@ -783,7 +818,7 @@ router.put(
       if (pgDuplicateError(err)) {
         return res.status(409).json({
           success: false,
-          message: "Duplicate not allowed (Same Date + Store + Material must be unique).",
+          message: "Duplicate not allowed (Same Date + Store must be unique).",
           error: err.detail || String(err),
         });
       }
@@ -796,21 +831,34 @@ router.put(
 );
 
 /**
- * ✅ DELETE
+ * ✅ DELETE (SAFE)
  * DELETE /api/inward/:id
- * ✅ day_seq table untouched => sequence remains stable forever
+ * ✅ deletes items first, then header
+ * ✅ day_seq table untouched => seq remains stable forever
  */
 router.delete("/:id", async (req, res) => {
   const inwardId = Number(req.params.id);
   if (Number.isNaN(inwardId)) return res.status(400).json({ success: false, message: "Invalid id" });
 
+  const client = await db.connect();
   try {
-    const del = await db.query(`DELETE FROM inward WHERE id=$1 RETURNING id`, [inwardId]);
-    if (del.rowCount === 0) return res.status(404).json({ success: false, message: "Inward not found" });
+    await client.query("BEGIN");
 
+    await client.query(`DELETE FROM inward_items WHERE inward_id=$1`, [inwardId]);
+
+    const del = await client.query(`DELETE FROM inward WHERE id=$1 RETURNING id`, [inwardId]);
+    if (del.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, message: "Inward not found" });
+    }
+
+    await client.query("COMMIT");
     return res.json({ success: true, message: "Inward deleted" });
   } catch (err) {
+    await client.query("ROLLBACK");
     return res.status(500).json({ success: false, message: "Server error", error: String(err) });
+  } finally {
+    client.release();
   }
 });
 
@@ -944,9 +992,10 @@ function drawInwardPDF(res, records, fileName = "inward-details.pdf") {
       const srText = !printedSrForDate.has(dateKey) && idx === 0 ? String(rec.seq_no || "") : "";
 
       // ✅ Date should appear for each store group first row
-      const dateText = !printedDateForDateStore.has(dateStoreKey) && idx === 0
-        ? formatDateDDMMYYYY(dateKey)
-        : "";
+      const dateText =
+        !printedDateForDateStore.has(dateStoreKey) && idx === 0
+          ? formatDateDDMMYYYY(dateKey)
+          : "";
 
       const storeText = idx === 0 ? storeKey : "";
       const useText = it.material_use || "";
@@ -955,9 +1004,11 @@ function drawInwardPDF(res, records, fileName = "inward-details.pdf") {
       const useH = measureCellHeight(useText, cols.find((c) => c.key === "use").w - 8, "Times-Roman", 10);
       const rowH = Math.max(22, Math.ceil(Math.max(materialH, useH) + 8));
 
-      drawRow({ srno: srText, date: dateText, material: materialText, qty: qtyText, store: storeText, use: useText }, rowH);
+      drawRow(
+        { srno: srText, date: dateText, material: materialText, qty: qtyText, store: storeText, use: useText },
+        rowH
+      );
 
-      // mark printed
       if (!printedSrForDate.has(dateKey) && idx === 0) printedSrForDate.add(dateKey);
       if (!printedDateForDateStore.has(dateStoreKey) && idx === 0) printedDateForDateStore.add(dateStoreKey);
     }
