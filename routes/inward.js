@@ -4,11 +4,9 @@
 // ✅ upload routes BEFORE "/:id"
 // ✅ GET ONE returns ABSOLUTE file_url so React opens correctly
 //
-// ✅ NEW RULES:
+// ✅ RULES:
 // 1) Same Date + Same Store + Same Material => Quantity ADD (NO new row)
 // 2) Sr.No is per Date only (stable) + Date prints per Store group
-//    - 1 Sr.No per date (printed once for that date across all stores)
-//    - Date printed for each store's first row even if same date
 // 3) Sr.No never breaks even if delete/update => use inward_day_seq
 
 const express = require("express");
@@ -142,7 +140,7 @@ function validateHeaderAndItems(payload) {
   const cleanItems = rawItems.map((it, idx) => {
     const material = isNonEmptyString(it.material) ? it.material.trim() : "";
 
-    // ✅ Only first row (a) requires material_use (your existing rule)
+    // ✅ Only first row (a) requires material_use
     const material_use = isNonEmptyString(it.material_use) ? it.material_use.trim() : null;
 
     const quantity =
@@ -151,7 +149,6 @@ function validateHeaderAndItems(payload) {
         : Number(it.quantity);
 
     const quantity_type = isNonEmptyString(it.quantity_type) ? it.quantity_type.trim() : null;
-
     const image_path = isNonEmptyString(it.image_path) ? it.image_path.trim() : null;
 
     if (!material) errors.push(`items[${idx}].material is required.`);
@@ -159,7 +156,7 @@ function validateHeaderAndItems(payload) {
     if (quantity !== null && Number.isNaN(quantity)) errors.push(`items[${idx}].quantity must be a number.`);
 
     return {
-      item_order: idx + 1, // DB may reassign when inserting new
+      item_order: idx + 1,
       material,
       quantity,
       quantity_type,
@@ -169,7 +166,7 @@ function validateHeaderAndItems(payload) {
     };
   });
 
-  // ✅ block duplicates inside same request (material only, because merge rule is by material)
+  // ✅ prevent duplicate material in same request
   const seen = new Set();
   for (let i = 0; i < cleanItems.length; i++) {
     const k = `${work_date}||${store.toLowerCase()}||${cleanItems[i].material.toLowerCase()}`;
@@ -225,8 +222,8 @@ function buildIndexToFileMap(fileIndexMap, files) {
 /* ---------------- Date-wise stable sequence helpers ---------------- */
 
 /**
- * ✅ Concurrency-safe: if two requests create same work_date simultaneously, no crash.
- * Requires inward_day_seq(work_date UNIQUE, seq_no ...)
+ * ✅ Concurrency-safe
+ * Requires inward_day_seq(work_date UNIQUE, seq_no default sequence)
  */
 async function getOrCreateDaySeqRow(client, work_date) {
   const r = await client.query(
@@ -239,7 +236,7 @@ async function getOrCreateDaySeqRow(client, work_date) {
     `,
     [work_date]
   );
-  return r.rows[0]; // {id, seq_no}
+  return r.rows[0];
 }
 
 /* =========================================================
@@ -292,9 +289,12 @@ router.get("/upload/:uploadId/download", async (req, res) => {
 /* ---------------- ROUTES ---------------- */
 
 /**
- * ✅ LIST (FAST)
+ * ✅ LIST (FAST, items inline)
  * GET /api/inward?from=YYYY-MM-DD&to=YYYY-MM-DD
- * ✅ returns items inline so React loads fast
+ *
+ * ✅ IMPORTANT FIX:
+ * $1 = baseUrl
+ * where params start from $2...
  */
 router.get("/", async (req, res) => {
   const from = toISODate(req.query.from);
@@ -303,7 +303,7 @@ router.get("/", async (req, res) => {
   try {
     const base = getBaseUrl(req);
 
-    const params = [];
+    const params = [base]; // ✅ $1 reserved for base
     const where = [];
 
     if (from) {
@@ -317,7 +317,6 @@ router.get("/", async (req, res) => {
 
     const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
-    // ✅ items inline (JSON aggregation) -> much faster frontend
     const q = `
       SELECT
         i.id,
@@ -354,8 +353,7 @@ router.get("/", async (req, res) => {
       ORDER BY i.work_date DESC, ds.seq_no DESC NULLS LAST, i.store ASC, i.id DESC
     `;
 
-    // $1 is base url, rest are date filters
-    const r = await db.query(q, [base, ...params]);
+    const r = await db.query(q, params);
     return res.json({ success: true, data: r.rows });
   } catch (err) {
     return res.status(500).json({ success: false, message: "Server error", error: String(err) });
@@ -365,10 +363,6 @@ router.get("/", async (req, res) => {
 /**
  * ✅ MULTI PDF (range)
  * GET /api/inward/pdf?from=YYYY-MM-DD&to=YYYY-MM-DD
- *
- * ✅ PDF RULES:
- * - Sr.No printed ONCE per date (across stores)
- * - Date printed for EACH store group first row (even if same date)
  */
 router.get("/pdf", async (req, res) => {
   const from = toISODate(req.query.from);
@@ -427,7 +421,7 @@ router.get("/pdf", async (req, res) => {
 });
 
 /**
- * ✅ GET ONE (returns ABSOLUTE file_url)
+ * ✅ GET ONE
  * GET /api/inward/:id
  */
 router.get("/:id", async (req, res) => {
@@ -518,13 +512,6 @@ router.get("/:id/pdf", async (req, res) => {
 /**
  * ✅ CREATE (MERGE MODE)
  * POST /api/inward
- *
- * ✅ If same (Date + Store) header exists:
- *    - do NOT create new inward header
- *    - for each item: if same material exists => ADD quantity, else insert new row
- *
- * ✅ One bill per inward:
- *    - if new bill uploaded: set upload_id for ALL items of that inward
  */
 router.post(
   "/",
@@ -541,12 +528,11 @@ router.post(
     try {
       await client.query("BEGIN");
 
-      // ✅ date-wise stable seq row
       const dayRow = await getOrCreateDaySeqRow(client, v.work_date);
       const daySeqId = dayRow.id;
       const daySeqNo = dayRow.seq_no;
 
-      // ✅ check if header exists for same date + store
+      // header exists? (same date + store)
       const existingHeader = await client.query(
         `SELECT id FROM inward WHERE work_date=$1 AND store=$2 LIMIT 1`,
         [v.work_date, v.store]
@@ -557,9 +543,11 @@ router.post(
 
       if (existingHeader.rowCount) {
         inwardId = existingHeader.rows[0].id;
-
-        // ensure day_seq_id is set even for old records
-        await client.query(`UPDATE inward SET day_seq_id=$1 WHERE id=$2 AND (day_seq_id IS NULL OR day_seq_id<>$1)`, [daySeqId, inwardId]);
+        // ensure day_seq_id set for old records
+        await client.query(
+          `UPDATE inward SET day_seq_id=$1 WHERE id=$2 AND (day_seq_id IS NULL OR day_seq_id<>$1)`,
+          [daySeqId, inwardId]
+        );
       } else {
         const header = await client.query(
           `INSERT INTO inward (work_date, store, day_seq_id) VALUES ($1,$2,$3) RETURNING id`,
@@ -569,7 +557,7 @@ router.post(
         createdNew = true;
       }
 
-      // ✅ Bill logic (one per inward)
+      // one bill per inward
       let newBillUploaded = false;
       let commonUploadId = null;
 
@@ -588,21 +576,17 @@ router.post(
         commonUploadId = oldUpload.rowCount ? oldUpload.rows[0].upload_id : null;
       }
 
-      // ✅ if new bill uploaded -> apply to ALL existing items immediately
+      // if new bill uploaded -> apply to all existing items
       if (newBillUploaded && commonUploadId) {
-        await client.query(
-          `UPDATE inward_items SET upload_id=$1 WHERE inward_id=$2`,
-          [commonUploadId, inwardId]
-        );
+        await client.query(`UPDATE inward_items SET upload_id=$1 WHERE inward_id=$2`, [commonUploadId, inwardId]);
       }
 
-      // legacy support ONLY if no commonUploadId
+      // legacy support only if no commonUploadId
       let indexToFile = new Map();
       if (!commonUploadId && isMultipart(req)) {
         indexToFile = buildIndexToFileMap(payload.fileIndexMap, payload.files);
       }
 
-      // existing items map by material lower
       const existingItems = await client.query(
         `SELECT id, material, quantity, quantity_type, material_use, upload_id, item_order
          FROM inward_items
@@ -615,7 +599,6 @@ router.post(
         byMaterial.set(String(r.material || "").toLowerCase(), r);
       }
 
-      // for inserting new, get current max item_order
       const maxOrderRes = await client.query(
         `SELECT COALESCE(MAX(item_order),0) AS mx FROM inward_items WHERE inward_id=$1`,
         [inwardId]
@@ -636,24 +619,17 @@ router.post(
               await client.query("ROLLBACK");
               return res.status(400).json({ success: false, message: "Only image or PDF allowed for bill." });
             }
-            const uploadId = await insertUpload(client, file);
-            it.upload_id = uploadId;
+            it.upload_id = await insertUpload(client, file);
           }
         }
 
         const found = byMaterial.get(key);
 
-        // ✅ MERGE: same material -> add qty
         if (found) {
-          const oldQty = found.quantity === null || found.quantity === undefined ? null : Number(found.quantity);
-          const newQty = it.quantity === null || it.quantity === undefined ? null : Number(it.quantity);
+          const oldQty = found.quantity === null || found.quantity === undefined ? 0 : Number(found.quantity);
+          const newQty = it.quantity === null || it.quantity === undefined ? 0 : Number(it.quantity);
 
-          let finalQty = oldQty;
-          if (newQty !== null && !Number.isNaN(newQty)) {
-            if (finalQty === null || finalQty === undefined || Number.isNaN(Number(finalQty))) finalQty = 0;
-            finalQty = Number(finalQty) + Number(newQty);
-          }
-
+          const finalQty = (Number.isNaN(oldQty) ? 0 : oldQty) + (Number.isNaN(newQty) ? 0 : newQty);
           const finalQtyType = it.quantity_type ? it.quantity_type : found.quantity_type;
           const finalUse = found.material_use ? found.material_use : it.material_use;
           const finalUpload = it.upload_id ? it.upload_id : found.upload_id;
@@ -667,7 +643,6 @@ router.post(
             [finalQty, finalQtyType, finalUse, finalUpload, found.id]
           );
         } else {
-          // ✅ insert new row
           await client.query(
             `
             INSERT INTO inward_items
@@ -698,7 +673,6 @@ router.post(
           error: err.detail || String(err),
         });
       }
-
       return res.status(500).json({ success: false, message: "Server error", error: String(err) });
     } finally {
       client.release();
@@ -707,11 +681,8 @@ router.post(
 );
 
 /**
- * ✅ UPDATE (replaces all items)
+ * ✅ UPDATE (replace items)
  * PUT /api/inward/:id
- *
- * ✅ keeps day_seq_id for that date
- * Note: If bill not sent, it keeps previous bill (if any) by reading old upload_id.
  */
 router.put(
   "/:id",
@@ -741,20 +712,17 @@ router.put(
       const daySeqId = dayRow.id;
       const daySeqNo = dayRow.seq_no;
 
-      // header update (may throw duplicate if same date+store already exists for another record)
       await client.query(
         `UPDATE inward SET work_date=$1, store=$2, day_seq_id=$3 WHERE id=$4`,
         [v.work_date, v.store, daySeqId, inwardId]
       );
 
-      // old upload_id
       const oldUpload = await client.query(
         `SELECT upload_id FROM inward_items WHERE inward_id=$1 AND upload_id IS NOT NULL ORDER BY id LIMIT 1`,
         [inwardId]
       );
       const oldUploadId = oldUpload.rowCount ? oldUpload.rows[0].upload_id : null;
 
-      // new bill?
       let commonUploadId = oldUploadId;
       if (payload.billFile && payload.billFile.buffer) {
         if (!isAllowedBillFile(payload.billFile)) {
@@ -764,16 +732,13 @@ router.put(
         commonUploadId = await insertUpload(client, payload.billFile);
       }
 
-      // replace items
       await client.query(`DELETE FROM inward_items WHERE inward_id=$1`, [inwardId]);
 
-      // legacy support (ONLY if there is no commonUploadId)
       let indexToFile = new Map();
       if (!commonUploadId && isMultipart(req)) {
         indexToFile = buildIndexToFileMap(payload.fileIndexMap, payload.files);
       }
 
-      // insert fresh items (order 1..N)
       let order = 1;
       for (let idx = 0; idx < v.items.length; idx++) {
         const it = v.items[idx];
@@ -787,8 +752,7 @@ router.put(
               await client.query("ROLLBACK");
               return res.status(400).json({ success: false, message: "Only image or PDF allowed for bill." });
             }
-            const uploadId = await insertUpload(client, file);
-            it.upload_id = uploadId;
+            it.upload_id = await insertUpload(client, file);
           }
         }
 
@@ -801,7 +765,6 @@ router.put(
           `,
           [inwardId, order, it.material, it.quantity, it.quantity_type, it.material_use, it.image_path, it.upload_id]
         );
-
         order++;
       }
 
@@ -833,8 +796,6 @@ router.put(
 /**
  * ✅ DELETE (SAFE)
  * DELETE /api/inward/:id
- * ✅ deletes items first, then header
- * ✅ day_seq table untouched => seq remains stable forever
  */
 router.delete("/:id", async (req, res) => {
   const inwardId = Number(req.params.id);
@@ -966,9 +927,8 @@ function drawInwardPDF(res, records, fileName = "inward-details.pdf") {
 
   drawHeaderRow();
 
-  // ✅ NEW PDF PRINT RULE TRACKERS
-  const printedSrForDate = new Set(); // date -> srno printed once
-  const printedDateForDateStore = new Set(); // date||store -> date printed per store group
+  const printedSrForDate = new Set();
+  const printedDateForDateStore = new Set();
 
   for (const rec of records) {
     const items = rec.items || [];
@@ -988,14 +948,8 @@ function drawInwardPDF(res, records, fileName = "inward-details.pdf") {
           ? ""
           : `${it.quantity}${it.quantity_type ? " " + it.quantity_type : ""}`;
 
-      // ✅ SrNo only once per date across all stores
       const srText = !printedSrForDate.has(dateKey) && idx === 0 ? String(rec.seq_no || "") : "";
-
-      // ✅ Date should appear for each store group first row
-      const dateText =
-        !printedDateForDateStore.has(dateStoreKey) && idx === 0
-          ? formatDateDDMMYYYY(dateKey)
-          : "";
+      const dateText = !printedDateForDateStore.has(dateStoreKey) && idx === 0 ? formatDateDDMMYYYY(dateKey) : "";
 
       const storeText = idx === 0 ? storeKey : "";
       const useText = it.material_use || "";
@@ -1004,10 +958,7 @@ function drawInwardPDF(res, records, fileName = "inward-details.pdf") {
       const useH = measureCellHeight(useText, cols.find((c) => c.key === "use").w - 8, "Times-Roman", 10);
       const rowH = Math.max(22, Math.ceil(Math.max(materialH, useH) + 8));
 
-      drawRow(
-        { srno: srText, date: dateText, material: materialText, qty: qtyText, store: storeText, use: useText },
-        rowH
-      );
+      drawRow({ srno: srText, date: dateText, material: materialText, qty: qtyText, store: storeText, use: useText }, rowH);
 
       if (!printedSrForDate.has(dateKey) && idx === 0) printedSrForDate.add(dateKey);
       if (!printedDateForDateStore.has(dateStoreKey) && idx === 0) printedDateForDateStore.add(dateStoreKey);
