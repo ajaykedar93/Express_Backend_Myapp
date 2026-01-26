@@ -316,12 +316,12 @@ router.get("/", async (req, res) => {
  * ✅ MULTI PDF (range)
  * GET /api/inward/pdf?from=YYYY-MM-DD&to=YYYY-MM-DD
  *
- * ✅ PDF ONLY RULES (as per your requirement):
- * 1) Sr.No is DATE-wise sequence starting from 1 within the filtered range
- *    - First row of a date prints Sr.No
- *    - Remaining rows of same date => Sr.No blank
+ * ✅ PDF ONLY RULES (UPDATED as you asked):
+ * 1) Sr.No is ENTRY-wise sequence starting from 1 within the filtered range
+ *    - Each inward record (store entry) gets Sr.No on its first row
+ *    - Remaining rows of same entry => Sr.No blank
  * 2) Same Date + Same Store + Same Material => Quantity ADD (merge in PDF output only)
- * 3) Date prints only for first row of a date (like your old PDF behavior)
+ * 3) Date + Store prints only for first row of that entry
  */
 router.get("/pdf", async (req, res) => {
   const from = toISODate(req.query.from);
@@ -343,8 +343,7 @@ router.get("/pdf", async (req, res) => {
     }
     if (where.length) q += ` WHERE ` + where.join(" AND ");
 
-    // ✅ IMPORTANT: PDF should be date ascending (old -> new) so Sr.No starts from 1 naturally
-    // but you asked "from last" earlier; still Sr.No start 1 — so we do ASC for clarity.
+    // ✅ order: old -> new, store, id
     q += ` ORDER BY work_date ASC, store ASC, id ASC`;
 
     const headers = await db.query(q, params);
@@ -371,14 +370,13 @@ router.get("/pdf", async (req, res) => {
     }
 
     // ========= ✅ PDF MERGE (Same Date + Same Store + Same Material => Quantity ADD) =========
-    // We will create a NEW records array for PDF only (DB not changed)
     const recordsMerged = [];
 
     for (const rec of headerMap.values()) {
       const items = Array.isArray(rec.items) ? rec.items : [];
       if (items.length === 0) continue;
 
-      // merge key: date + store + material(lower)
+      // merge inside this one entry by material only
       const byMat = new Map();
 
       for (const it of items) {
@@ -413,27 +411,21 @@ router.get("/pdf", async (req, res) => {
       recordsMerged.push({ ...rec, items: mergedItems });
     }
 
-    // sort merged headers: date ASC then store
+    // final sort (same as query)
     recordsMerged.sort((a, b) => {
       const da = String(a.work_date || "").slice(0, 10);
       const dbb = String(b.work_date || "").slice(0, 10);
       if (da !== dbb) return da.localeCompare(dbb);
-      return String(a.store || "").localeCompare(String(b.store || ""));
+      const sa = String(a.store || "");
+      const sb = String(b.store || "");
+      if (sa !== sb) return sa.localeCompare(sb);
+      return Number(a.id || 0) - Number(b.id || 0);
     });
 
-    // ========= ✅ DATE-WISE Sr.No (start from 1 within this PDF range) =========
-    // We will assign a "pdf_seq_no" by date, ignoring DB seq_no
-    const dateToPdfSeq = new Map();
-    let counter = 0;
-
-    for (const rec of recordsMerged) {
-      const dateKey = String(rec.work_date || "").slice(0, 10);
-      if (!dateToPdfSeq.has(dateKey)) {
-        counter += 1;
-        dateToPdfSeq.set(dateKey, counter);
-      }
-      rec.seq_no = dateToPdfSeq.get(dateKey); // override ONLY for PDF rendering
-    }
+    // ========= ✅ ENTRY-WISE Sr.No (start 1..N for each entry) =========
+    recordsMerged.forEach((rec, idx) => {
+      rec.seq_no = idx + 1; // override ONLY for PDF rendering
+    });
 
     return drawInwardPDF(res, recordsMerged, "inward-details.pdf");
   } catch (err) {
@@ -515,86 +507,90 @@ router.get("/:id/pdf", async (req, res) => {
  *  - bill (single file) ✅ preferred
  *  - or legacy files[] + fileIndexMap
  */
-router.post("/", upload.fields([{ name: "bill", maxCount: 1 }, { name: "files", maxCount: 50 }]), async (req, res) => {
-  const payload = readPayload(req);
-  const v = validateHeaderAndItems(payload);
+router.post(
+  "/",
+  upload.fields([{ name: "bill", maxCount: 1 }, { name: "files", maxCount: 50 }]),
+  async (req, res) => {
+    const payload = readPayload(req);
+    const v = validateHeaderAndItems(payload);
 
-  if (!v.ok) {
-    return res.status(400).json({ success: false, message: "Validation failed", errors: v.errors });
-  }
-
-  const client = await db.connect();
-  try {
-    await client.query("BEGIN");
-
-    const header = await client.query(
-      `INSERT INTO inward (work_date, store) VALUES ($1,$2) RETURNING id, seq_no, work_date, store`,
-      [v.work_date, v.store]
-    );
-    const inwardId = header.rows[0].id;
-
-    // ✅ NEW: one bill file for whole inward
-    let commonUploadId = null;
-    if (payload.billFile && payload.billFile.buffer) {
-      if (!isAllowedBillFile(payload.billFile)) {
-        await client.query("ROLLBACK");
-        return res.status(400).json({ success: false, message: "Only image or PDF allowed for bill." });
-      }
-      commonUploadId = await insertUpload(client, payload.billFile);
+    if (!v.ok) {
+      return res.status(400).json({ success: false, message: "Validation failed", errors: v.errors });
     }
 
-    // legacy support (optional)
-    let indexToFile = new Map();
-    if (!commonUploadId && isMultipart(req)) {
-      indexToFile = buildIndexToFileMap(payload.fileIndexMap, payload.files);
-    }
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
 
-    for (let idx = 0; idx < v.items.length; idx++) {
-      const it = v.items[idx];
+      const header = await client.query(
+        `INSERT INTO inward (work_date, store) VALUES ($1,$2) RETURNING id, seq_no, work_date, store`,
+        [v.work_date, v.store]
+      );
+      const inwardId = header.rows[0].id;
 
-      if (commonUploadId) {
-        it.upload_id = commonUploadId;
-      } else {
-        const file = indexToFile.get(idx);
-        if (file && file.buffer) {
-          if (!isAllowedBillFile(file)) {
-            await client.query("ROLLBACK");
-            return res.status(400).json({ success: false, message: "Only image or PDF allowed for bill." });
-          }
-          const uploadId = await insertUpload(client, file);
-          it.upload_id = uploadId;
+      // ✅ NEW: one bill file for whole inward
+      let commonUploadId = null;
+      if (payload.billFile && payload.billFile.buffer) {
+        if (!isAllowedBillFile(payload.billFile)) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ success: false, message: "Only image or PDF allowed for bill." });
         }
+        commonUploadId = await insertUpload(client, payload.billFile);
       }
 
-      await client.query(
-        `
+      // legacy support (optional)
+      let indexToFile = new Map();
+      if (!commonUploadId && isMultipart(req)) {
+        indexToFile = buildIndexToFileMap(payload.fileIndexMap, payload.files);
+      }
+
+      for (let idx = 0; idx < v.items.length; idx++) {
+        const it = v.items[idx];
+
+        if (commonUploadId) {
+          it.upload_id = commonUploadId;
+        } else {
+          const file = indexToFile.get(idx);
+          if (file && file.buffer) {
+            if (!isAllowedBillFile(file)) {
+              await client.query("ROLLBACK");
+              return res.status(400).json({ success: false, message: "Only image or PDF allowed for bill." });
+            }
+            const uploadId = await insertUpload(client, file);
+            it.upload_id = uploadId;
+          }
+        }
+
+        await client.query(
+          `
         INSERT INTO inward_items
           (inward_id, item_order, material, quantity, quantity_type, material_use, image_path, upload_id)
         VALUES
           ($1,$2,$3,$4,$5,$6,$7,$8)
         `,
-        [inwardId, it.item_order, it.material, it.quantity, it.quantity_type, it.material_use, it.image_path, it.upload_id]
-      );
+          [inwardId, it.item_order, it.material, it.quantity, it.quantity_type, it.material_use, it.image_path, it.upload_id]
+        );
+      }
+
+      await client.query("COMMIT");
+      return res.json({ success: true, message: "Inward created", data: header.rows[0] });
+    } catch (err) {
+      await client.query("ROLLBACK");
+
+      if (pgDuplicateError(err)) {
+        return res.status(409).json({
+          success: false,
+          message: "Duplicate entry not allowed (Same Date + Store + Material + Material Use must be unique).",
+          error: err.detail || String(err),
+        });
+      }
+
+      return res.status(500).json({ success: false, message: "Server error", error: String(err) });
+    } finally {
+      client.release();
     }
-
-    await client.query("COMMIT");
-    return res.json({ success: true, message: "Inward created", data: header.rows[0] });
-  } catch (err) {
-    await client.query("ROLLBACK");
-
-    if (pgDuplicateError(err)) {
-      return res.status(409).json({
-        success: false,
-        message: "Duplicate entry not allowed (Same Date + Store + Material + Material Use must be unique).",
-        error: err.detail || String(err),
-      });
-    }
-
-    return res.status(500).json({ success: false, message: "Server error", error: String(err) });
-  } finally {
-    client.release();
   }
-});
+);
 
 /**
  * ✅ UPDATE (replaces all items)
@@ -602,104 +598,108 @@ router.post("/", upload.fields([{ name: "bill", maxCount: 1 }, { name: "files", 
  *
  * Note: If bill not sent, it keeps previous bill (if any) by reading old upload_id.
  */
-router.put("/:id", upload.fields([{ name: "bill", maxCount: 1 }, { name: "files", maxCount: 50 }]), async (req, res) => {
-  const inwardId = Number(req.params.id);
-  if (Number.isNaN(inwardId)) return res.status(400).json({ success: false, message: "Invalid id" });
+router.put(
+  "/:id",
+  upload.fields([{ name: "bill", maxCount: 1 }, { name: "files", maxCount: 50 }]),
+  async (req, res) => {
+    const inwardId = Number(req.params.id);
+    if (Number.isNaN(inwardId)) return res.status(400).json({ success: false, message: "Invalid id" });
 
-  const payload = readPayload(req);
-  const v = validateHeaderAndItems(payload);
+    const payload = readPayload(req);
+    const v = validateHeaderAndItems(payload);
 
-  if (!v.ok) {
-    return res.status(400).json({ success: false, message: "Validation failed", errors: v.errors });
-  }
-
-  const client = await db.connect();
-  try {
-    await client.query("BEGIN");
-
-    const existing = await client.query(`SELECT id FROM inward WHERE id=$1`, [inwardId]);
-    if (existing.rowCount === 0) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ success: false, message: "Inward not found" });
+    if (!v.ok) {
+      return res.status(400).json({ success: false, message: "Validation failed", errors: v.errors });
     }
 
-    const header = await client.query(
-      `UPDATE inward SET work_date=$1, store=$2 WHERE id=$3 RETURNING id, seq_no, work_date, store`,
-      [v.work_date, v.store, inwardId]
-    );
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
 
-    // ✅ find old upload_id (to keep if new bill not provided)
-    const oldUpload = await client.query(
-      `SELECT upload_id FROM inward_items WHERE inward_id=$1 AND upload_id IS NOT NULL ORDER BY id LIMIT 1`,
-      [inwardId]
-    );
-    const oldUploadId = oldUpload.rowCount ? oldUpload.rows[0].upload_id : null;
-
-    // ✅ new bill?
-    let commonUploadId = oldUploadId;
-    if (payload.billFile && payload.billFile.buffer) {
-      if (!isAllowedBillFile(payload.billFile)) {
+      const existing = await client.query(`SELECT id FROM inward WHERE id=$1`, [inwardId]);
+      if (existing.rowCount === 0) {
         await client.query("ROLLBACK");
-        return res.status(400).json({ success: false, message: "Only image or PDF allowed for bill." });
+        return res.status(404).json({ success: false, message: "Inward not found" });
       }
-      commonUploadId = await insertUpload(client, payload.billFile);
-    }
 
-    // replace items
-    await client.query(`DELETE FROM inward_items WHERE inward_id=$1`, [inwardId]);
+      const header = await client.query(
+        `UPDATE inward SET work_date=$1, store=$2 WHERE id=$3 RETURNING id, seq_no, work_date, store`,
+        [v.work_date, v.store, inwardId]
+      );
 
-    // legacy support (ONLY if there is no commonUploadId)
-    let indexToFile = new Map();
-    if (!commonUploadId && isMultipart(req)) {
-      indexToFile = buildIndexToFileMap(payload.fileIndexMap, payload.files);
-    }
+      // ✅ find old upload_id (to keep if new bill not provided)
+      const oldUpload = await client.query(
+        `SELECT upload_id FROM inward_items WHERE inward_id=$1 AND upload_id IS NOT NULL ORDER BY id LIMIT 1`,
+        [inwardId]
+      );
+      const oldUploadId = oldUpload.rowCount ? oldUpload.rows[0].upload_id : null;
 
-    for (let idx = 0; idx < v.items.length; idx++) {
-      const it = v.items[idx];
-
-      if (commonUploadId) {
-        it.upload_id = commonUploadId;
-      } else {
-        const file = indexToFile.get(idx);
-        if (file && file.buffer) {
-          if (!isAllowedBillFile(file)) {
-            await client.query("ROLLBACK");
-            return res.status(400).json({ success: false, message: "Only image or PDF allowed for bill." });
-          }
-          const uploadId = await insertUpload(client, file);
-          it.upload_id = uploadId;
+      // ✅ new bill?
+      let commonUploadId = oldUploadId;
+      if (payload.billFile && payload.billFile.buffer) {
+        if (!isAllowedBillFile(payload.billFile)) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ success: false, message: "Only image or PDF allowed for bill." });
         }
+        commonUploadId = await insertUpload(client, payload.billFile);
       }
 
-      await client.query(
-        `
+      // replace items
+      await client.query(`DELETE FROM inward_items WHERE inward_id=$1`, [inwardId]);
+
+      // legacy support (ONLY if there is no commonUploadId)
+      let indexToFile = new Map();
+      if (!commonUploadId && isMultipart(req)) {
+        indexToFile = buildIndexToFileMap(payload.fileIndexMap, payload.files);
+      }
+
+      for (let idx = 0; idx < v.items.length; idx++) {
+        const it = v.items[idx];
+
+        if (commonUploadId) {
+          it.upload_id = commonUploadId;
+        } else {
+          const file = indexToFile.get(idx);
+          if (file && file.buffer) {
+            if (!isAllowedBillFile(file)) {
+              await client.query("ROLLBACK");
+              return res.status(400).json({ success: false, message: "Only image or PDF allowed for bill." });
+            }
+            const uploadId = await insertUpload(client, file);
+            it.upload_id = uploadId;
+          }
+        }
+
+        await client.query(
+          `
         INSERT INTO inward_items
           (inward_id, item_order, material, quantity, quantity_type, material_use, image_path, upload_id)
         VALUES
           ($1,$2,$3,$4,$5,$6,$7,$8)
         `,
-        [inwardId, it.item_order, it.material, it.quantity, it.quantity_type, it.material_use, it.image_path, it.upload_id]
-      );
+          [inwardId, it.item_order, it.material, it.quantity, it.quantity_type, it.material_use, it.image_path, it.upload_id]
+        );
+      }
+
+      await client.query("COMMIT");
+      return res.json({ success: true, message: "Inward updated", data: header.rows[0] });
+    } catch (err) {
+      await client.query("ROLLBACK");
+
+      if (pgDuplicateError(err)) {
+        return res.status(409).json({
+          success: false,
+          message: "Duplicate entry not allowed (Same Date + Store + Material + Material Use must be unique).",
+          error: err.detail || String(err),
+        });
+      }
+
+      return res.status(500).json({ success: false, message: "Server error", error: String(err) });
+    } finally {
+      client.release();
     }
-
-    await client.query("COMMIT");
-    return res.json({ success: true, message: "Inward updated", data: header.rows[0] });
-  } catch (err) {
-    await client.query("ROLLBACK");
-
-    if (pgDuplicateError(err)) {
-      return res.status(409).json({
-        success: false,
-        message: "Duplicate entry not allowed (Same Date + Store + Material + Material Use must be unique).",
-        error: err.detail || String(err),
-      });
-    }
-
-    return res.status(500).json({ success: false, message: "Server error", error: String(err) });
-  } finally {
-    client.release();
   }
-});
+);
 
 /**
  * ✅ DELETE
@@ -823,9 +823,7 @@ function drawInwardPDF(res, records, fileName = "inward-details.pdf") {
 
   drawHeaderRow();
 
-  // ✅ PDF RULE: print Sr.No only once per DATE, others blank
-  const printedSrForDate = new Set();
-
+  // ✅ UPDATED RULE: Sr.No prints for EACH ENTRY (inward record) only on first row, others blank
   for (const rec of records) {
     const items = rec.items || [];
     if (items.length === 0) continue;
@@ -842,18 +840,29 @@ function drawInwardPDF(res, records, fileName = "inward-details.pdf") {
           ? ""
           : `${it.quantity}${it.quantity_type ? " " + it.quantity_type : ""}`;
 
-      const srText = !printedSrForDate.has(dateKey) && idx === 0 ? String(rec.seq_no) : "";
+      const srText = idx === 0 ? String(rec.seq_no) : "";
       const dateText = idx === 0 ? formatDateDDMMYYYY(dateKey) : "";
       const storeText = idx === 0 ? String(rec.store || "") : "";
       const useText = it.material_use || "";
 
-      const materialH = measureCellHeight(materialText, cols.find((c) => c.key === "material").w - 8, "Times-Roman", 10);
-      const useH = measureCellHeight(useText, cols.find((c) => c.key === "use").w - 8, "Times-Roman", 10);
+      const materialH = measureCellHeight(
+        materialText,
+        cols.find((c) => c.key === "material").w - 8,
+        "Times-Roman",
+        10
+      );
+      const useH = measureCellHeight(
+        useText,
+        cols.find((c) => c.key === "use").w - 8,
+        "Times-Roman",
+        10
+      );
       const rowH = Math.max(22, Math.ceil(Math.max(materialH, useH) + 8));
 
-      drawRow({ srno: srText, date: dateText, material: materialText, qty: qtyText, store: storeText, use: useText }, rowH);
-
-      if (!printedSrForDate.has(dateKey) && idx === 0) printedSrForDate.add(dateKey);
+      drawRow(
+        { srno: srText, date: dateText, material: materialText, qty: qtyText, store: storeText, use: useText },
+        rowH
+      );
     }
 
     drawBoldSeparationLine();
