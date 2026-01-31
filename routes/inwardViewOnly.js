@@ -2,6 +2,7 @@
 // ✅ VIEW ONLY API
 // ✅ Used for SHARE LINK page
 // ❌ No POST / PUT / DELETE
+// ✅ NEW: month filter (default current month)
 
 const express = require("express");
 const db = require("../db");
@@ -21,6 +22,31 @@ function toISODate(d) {
   return `${yyyy}-${mm}-${dd}`;
 }
 
+// ✅ month helpers
+function getCurrentMonthStr() {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  return `${y}-${m}`;
+}
+
+function isValidMonthStr(ym) {
+  if (!ym || typeof ym !== "string") return false;
+  if (!/^\d{4}-\d{2}$/.test(ym)) return false;
+  const [y, m] = ym.split("-").map(Number);
+  return y > 1970 && m >= 1 && m <= 12;
+}
+
+// returns {start, end} where end is next month start (exclusive)
+function getMonthRange(ym) {
+  const [y, m] = ym.split("-").map(Number);
+  const start = new Date(y, m - 1, 1);
+  const end = new Date(y, m, 1); // next month
+  const startISO = toISODate(start); // YYYY-MM-01
+  const endISO = toISODate(end);     // next YYYY-MM-01
+  return { start: startISO, end: endISO };
+}
+
 // build absolute url (for bill view)
 function getBaseUrl(req) {
   const proto = (req.headers["x-forwarded-proto"] || req.protocol || "http")
@@ -36,10 +62,20 @@ function getBaseUrl(req) {
 
 /* =========================================================
    ✅ LIST – VIEW ONLY (FOR SHARE LINK)
-   GET /api/inward-view
+   GET /api/inward-view?month=YYYY-MM
+   - month is PRIORITY
+   - if month not provided => current month
+   - (optional) supports from/to if you ever want
    ========================================================= */
 
 router.get("/", async (req, res) => {
+  // ✅ month priority (default current month)
+  let month = String(req.query.month || "").trim();
+  if (!month) month = getCurrentMonthStr();
+
+  const hasMonth = isValidMonthStr(month);
+
+  // optional fallback: from/to if month invalid and user provided from/to
   const from = toISODate(req.query.from);
   const to = toISODate(req.query.to);
 
@@ -68,14 +104,24 @@ router.get("/", async (req, res) => {
     const params = [];
     const where = [];
 
-    if (from) {
-      params.push(from);
+    if (hasMonth) {
+      const { start, end } = getMonthRange(month);
+      params.push(start);
       where.push(`h.work_date >= $${params.length}`);
+      params.push(end);
+      where.push(`h.work_date < $${params.length}`);
+    } else {
+      // if month invalid, you can still use from/to (optional)
+      if (from) {
+        params.push(from);
+        where.push(`h.work_date >= $${params.length}`);
+      }
+      if (to) {
+        params.push(to);
+        where.push(`h.work_date <= $${params.length}`);
+      }
     }
-    if (to) {
-      params.push(to);
-      where.push(`h.work_date <= $${params.length}`);
-    }
+
     if (where.length) q += ` WHERE ` + where.join(" AND ");
 
     // ✅ same sequence everywhere
@@ -103,13 +149,15 @@ router.get("/", async (req, res) => {
       material_use: x.material_use,
 
       // bill view
-      file_url: x.upload_id
-        ? `${base}/api/inward-view/upload/${x.upload_id}/view`
-        : null,
+      file_url: x.upload_id ? `${base}/api/inward-view/upload/${x.upload_id}/view` : null,
       mime_type: x.mime_type || "",
     }));
 
-    return res.json({ success: true, data });
+    return res.json({
+      success: true,
+      month: hasMonth ? month : null,
+      data,
+    });
   } catch (err) {
     return res.status(500).json({
       success: false,
