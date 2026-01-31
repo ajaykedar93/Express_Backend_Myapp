@@ -96,8 +96,8 @@ function formatDateDMY(d) {
   if (!dt) return "";
   const day = dt.getDate(); // 1..31
   const monthsShort = [
-    "Jan","Feb","Mar","Apr","May","Jun",
-    "Jul","Aug","Sep","Oct","Nov","Dec",
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
   ];
   const month = monthsShort[dt.getMonth()];
   const year = dt.getFullYear();
@@ -618,13 +618,12 @@ router.get("/summary", async (req, res) => {
 /**
  * GET /api/sitekharch/download?month=YYYY-MM
  *
- * Layout (black-only PDF):
- *  1. Title + Month (CENTER)
- *  2. KHARCH DETAILS (heading CENTER, table left)
- *  3. RECEIVED DETAILS (heading CENTER, table left)
- *  4. SUMMARY row (heading CENTER, totals CENTER)
- *
- * Dates in tables are shown as "2 Oct 2025"
+ * Changes requested:
+ *  - Kharch table columns ONLY: Sr.No, Date, Details, Amount
+ *  - Remove Extra and Total columns
+ *  - Amount should show like: 40 (NOT 40.00)
+ *  - After Kharch section ends, "Received Amounts" must ALWAYS start on NEW PAGE
+ *  - Summary should be BELOW Received Amounts (same page after received table)
  */
 router.get("/download", async (req, res) => {
   try {
@@ -673,10 +672,10 @@ router.get("/download", async (req, res) => {
       [start, end]
     );
 
-    // 3) TOTALS (using calcRowTotal for kharch)
+    // 3) TOTALS (same logic remains)
     let totalKharch = 0;
     for (const r of kharchRows) {
-      totalKharch += calcRowTotal(r);
+      totalKharch += calcRowTotal(r); // keep accurate total (includes extras)
     }
     const totalReceived = recvRows.reduce(
       (sum, r) => sum + Number(r.amount_received || 0),
@@ -709,7 +708,7 @@ router.get("/download", async (req, res) => {
         y = doc.y,
         fontSize = 10,
         padding = 4,
-        alignCenter = false, // NEW: when true, center text inside cells
+        alignCenter = false,
       } = opts;
 
       // measure height
@@ -729,7 +728,13 @@ router.get("/download", async (req, res) => {
       const bottom = doc.page.height - doc.page.margins.bottom;
       if (y + rowH > bottom) {
         doc.addPage();
-        return drawRow(cells, widths, { header, y: doc.y, fontSize, padding, alignCenter });
+        return drawRow(cells, widths, {
+          header,
+          y: doc.y,
+          fontSize,
+          padding,
+          alignCenter,
+        });
       }
 
       // draw
@@ -752,9 +757,15 @@ router.get("/download", async (req, res) => {
       return rowH;
     };
 
-    const money = (n) => {
-      const num = Number(n || 0);
-      return num.toFixed(2);
+    // amount formatting: 40 -> "40", 40.5 -> "40.5", 40.00 -> "40"
+    const moneyPlain = (n) => {
+      const num = Number(n);
+      if (!Number.isFinite(num)) return "0";
+      if (Number.isInteger(num)) return String(num);
+      // trim trailing zeros safely
+      const s = String(num);
+      if (s.includes("e") || s.includes("E")) return s; // keep scientific if any
+      return s.replace(/(\.\d*?[1-9])0+$/g, "$1").replace(/\.0+$/g, "");
     };
 
     /* ----------------------------------------------------
@@ -779,7 +790,8 @@ router.get("/download", async (req, res) => {
     doc.moveDown(1);
 
     /* ----------------------------------------------------
-       KHARCH DETAILS (FIRST, HEADING CENTER)
+       KHARCH DETAILS (HEADING CENTER)
+       TABLE: Sr.No, Date, Details, Amount
     ---------------------------------------------------- */
     doc
       .font("Helvetica-Bold")
@@ -791,56 +803,40 @@ router.get("/download", async (req, res) => {
     doc.moveDown(0.5);
 
     if (!kharchRows.length) {
-      doc.font("Helvetica").fontSize(10).text("No kharch entries.", left, doc.y, {
-        align: "center",
-        width: pageWidthInner,
-      });
+      doc
+        .font("Helvetica")
+        .fontSize(10)
+        .text("No kharch entries.", left, doc.y, {
+          align: "center",
+          width: pageWidthInner,
+        });
       doc.moveDown(1.5);
     } else {
-      // #: 25, Date: 65, Details: 210, Amount: 65, Extra: 65, Total: 65
-      const kWidths = [25, 65, 210, 65, 65, 65]; // ~495
-      drawRow(["#", "Date", "Details", "Amount", "Extra", "Total"], kWidths, {
+      // Sr.No: 40, Date: 80, Details: 285, Amount: 90  (sum ~495)
+      const kWidths = [40, 80, 285, 90];
+      drawRow(["Sr.No", "Date", "Details", "Amount"], kWidths, {
         header: true,
       });
 
       kharchRows.forEach((r, idx) => {
-        const totalRow = calcRowTotal(r);
         const details =
-          r.details && r.details.trim().length ? r.details : "—";
+          r.details && String(r.details).trim().length ? r.details : "—";
 
-        // main row (formatted date)
+        // NOTE: Amount column shows ONLY r.amount (no extra/total columns)
         drawRow(
-          [
-            idx + 1,
-            formatDateDMY(r.kharch_date),
-            details,
-            money(r.amount),
-            r.extra_amount ? money(r.extra_amount) : "",
-            money(totalRow),
-          ],
+          [idx + 1, formatDateDMY(r.kharch_date), details, moneyPlain(r.amount)],
           kWidths
         );
-
-        // extra_items as bullet subrows
-        if (Array.isArray(r.extra_items) && r.extra_items.length) {
-          r.extra_items.forEach((x) => {
-            const txt = `• Rs.${money(x.amount)}${
-              x.details ? ` (${x.details})` : ""
-            }`;
-            drawRow(["", "", txt, "", "", ""], kWidths, {
-              header: false,
-              fontSize: 9,
-            });
-          });
-        }
       });
 
       doc.moveDown(1.5);
     }
 
     /* ----------------------------------------------------
-       RECEIVED DETAILS (SECOND, HEADING CENTER)
+       RECEIVED DETAILS (ALWAYS NEW PAGE)
     ---------------------------------------------------- */
+    doc.addPage();
+
     doc
       .font("Helvetica-Bold")
       .fontSize(13)
@@ -851,14 +847,17 @@ router.get("/download", async (req, res) => {
     doc.moveDown(0.5);
 
     if (!recvRows.length) {
-      doc.font("Helvetica").fontSize(10).text("No received entries.", left, doc.y, {
-        align: "center",
-        width: pageWidthInner,
-      });
+      doc
+        .font("Helvetica")
+        .fontSize(10)
+        .text("No received entries.", left, doc.y, {
+          align: "center",
+          width: pageWidthInner,
+        });
       doc.moveDown(1.5);
     } else {
-      // #: 30, Date: 70, Details: 195, Mode: 80, Amount: 65
-      const recWidths = [30, 70, 195, 80, 65]; // ~440-450
+      // #: 30, Date: 80, Details: 220, Mode: 80, Amount: 85 (sum ~495)
+      const recWidths = [30, 80, 220, 80, 85];
       drawRow(["#", "Date", "Details", "Mode", "Amount (Rs.)"], recWidths, {
         header: true,
       });
@@ -871,7 +870,7 @@ router.get("/download", async (req, res) => {
             formatDateDMY(r.payment_date),
             det,
             r.payment_mode || "cash",
-            money(r.amount_received),
+            moneyPlain(r.amount_received),
           ],
           recWidths
         );
@@ -881,7 +880,7 @@ router.get("/download", async (req, res) => {
     }
 
     /* ----------------------------------------------------
-       FINAL SUMMARY (TOTALS + BALANCE, CENTERED)
+       SUMMARY (BELOW RECEIVED AMOUNTS)
     ---------------------------------------------------- */
     doc
       .font("Helvetica-Bold")
@@ -896,12 +895,12 @@ router.get("/download", async (req, res) => {
     drawRow(
       ["Total Kharch (Rs.)", "Total Received (Rs.)", "Balance (Rs.)"],
       summaryWidths,
-      { header: true, alignCenter: true }   // headings centered
+      { header: true, alignCenter: true }
     );
     drawRow(
-      [money(totalKharch), money(totalReceived), money(balance)],
+      [moneyPlain(totalKharch), moneyPlain(totalReceived), moneyPlain(balance)],
       summaryWidths,
-      { alignCenter: true }                 // numeric totals centered
+      { alignCenter: true }
     );
 
     doc.end();
