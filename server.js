@@ -124,6 +124,12 @@ app.use("/api/deposits", invDepositRouter);
 app.use("/api/monthly_summary", monthSummaryRouter);
 app.use("/api/trading_journal", investmentTradingJournalRouter);
 
+
+const monthlySummary = require("./routes/investmentmonthlySummary");
+app.use("/api", monthlySummary);
+
+
+
 /* ---------- Routers (ONLY user_investment) ---------- */
 app.use("/api/user_investment", require("./routes/user_investment"));
 // Mount once at /api  (so /api/password-manager works)
