@@ -66,7 +66,6 @@ const invCategoryRouter = require("./routes/investment_category");
 const invSubcategoryRouter = require("./routes/investment_subcategory");
 const invDepositRouter = require("./routes/investment_deposit_logic");
 const monthSummaryRouter = require("./routes/investment_month_summary");
-const investmentTradingJournalRouter = require("./routes/investment_tradingjournal");
 
 
 const userInvestmentRoutes = require('./routes/user_investment');
@@ -122,11 +121,32 @@ app.use("/api/investment_category", invCategoryRouter);       // was duplicated 
 app.use("/api/investment_subcategory", invSubcategoryRouter);
 app.use("/api/deposits", invDepositRouter);
 app.use("/api/monthly_summary", monthSummaryRouter);
-app.use("/api/trading_journal", investmentTradingJournalRouter);
 
 
 const monthlySummary = require("./routes/investmentmonthlySummary");
 app.use("/api", monthlySummary);
+
+
+
+
+
+
+
+const investmentCatSub = require("./routes/INVESTMENT/investment_catsub");
+app.use("/api", investmentCatSub);
+
+
+const planJournalRoutes = require("./routes/INVESTMENT/investment_plan_journal");
+app.use("/api", planJournalRoutes);
+
+
+const reportRoutes = require("./routes/INVESTMENT/investment_reports");
+app.use("/api", reportRoutes);
+
+
+const dipwidRoutes = require("./routes/INVESTMENT/investment_dipwid");
+app.use("/api", dipwidRoutes);
+
 
 
 
