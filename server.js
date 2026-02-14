@@ -148,6 +148,10 @@ const dipwidRoutes = require("./routes/INVESTMENT/investment_dipwid");
 app.use("/api", dipwidRoutes);
 
 
+// ✅ Import routes
+const notesMyAppRoutes = require("./routes/Notes/notesmyapp");
+app.use("/api/notes-myapp", notesMyAppRoutes);
+
 
 
 /* ---------- Routers (ONLY user_investment) ---------- */
