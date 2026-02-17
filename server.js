@@ -61,11 +61,6 @@ const transactionCategoryWiseRouter = require("./routes/transactionscategorywise
 
 
 
-// Investment module (your new flows)
-const invCategoryRouter = require("./routes/investment_category");
-const invSubcategoryRouter = require("./routes/investment_subcategory");
-const invDepositRouter = require("./routes/investment_deposit_logic");
-const monthSummaryRouter = require("./routes/investment_month_summary");
 
 
 const userInvestmentRoutes = require('./routes/user_investment');
@@ -116,36 +111,34 @@ app.use("/api/transaction-category", transactionCategoryRouter);
 // ❗ Fix: give the “categorywise” router its own unique base to avoid clashing
 app.use("/api/transaction-category", transactionCategoryWiseRouter);
 
-// Investment (new)
-app.use("/api/investment_category", invCategoryRouter);       // was duplicated before; now only once
-app.use("/api/investment_subcategory", invSubcategoryRouter);
-app.use("/api/deposits", invDepositRouter);
-app.use("/api/monthly_summary", monthSummaryRouter);
 
+// Investment module (your new flows)
+// Investment Routes
+// =========================
 
-const monthlySummary = require("./routes/investmentmonthlySummary");
-app.use("/api", monthlySummary);
+// 1. Platform & Segment
+const investmentPlatformSegment = require("./routes/INVESTMENT/investment_platform_segment");
+app.use("/api/investment/platform-segment", investmentPlatformSegment);
 
+// 2. Investment Plan
+const investmentPlan = require("./routes/INVESTMENT/investment_plan");
+app.use("/api/investment/plan", investmentPlan);
 
+// 3. Trading Journal (Create, Get, Delete)
+const investmentTradingJournal = require("./routes/INVESTMENT/investment_tradingjournal");
+app.use("/api/investment/tradingjournal", investmentTradingJournal);
 
+// 4. Investment Report (Month report, Mistakes repeat)
+const investmentReport = require("./routes/INVESTMENT/investment_report");
+app.use("/api/investment/report", investmentReport);
 
+// 5. Deposit / Withdrawal
+const investmentDipWid = require("./routes/INVESTMENT/investment_dipwid");
+app.use("/api/investment/dipwid", investmentDipWid);
 
-
-
-const investmentCatSub = require("./routes/INVESTMENT/investment_catsub");
-app.use("/api", investmentCatSub);
-
-
-const planJournalRoutes = require("./routes/INVESTMENT/investment_plan_journal");
-app.use("/api", planJournalRoutes);
-
-
-const reportRoutes = require("./routes/INVESTMENT/investment_reports");
-app.use("/api", reportRoutes);
-
-
-const dipwidRoutes = require("./routes/INVESTMENT/investment_dipwid");
-app.use("/api", dipwidRoutes);
+// 6. Trading Journal Views (Daily summary, Entry details)
+const investmentGetViewTradingJournal = require("./routes/INVESTMENT/investment_getview_tradingjournal");
+app.use("/api/investment/tradingjournal-view", investmentGetViewTradingJournal);
 
 
 // ✅ Import routes

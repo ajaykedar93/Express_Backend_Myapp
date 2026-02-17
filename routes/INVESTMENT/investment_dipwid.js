@@ -1,201 +1,158 @@
+// src/routes/investment/investment_dipwid.js
 const express = require("express");
 const router = express.Router();
 const pool = require("../../db");
+const auth = require("../../middleware/auth");
 
+// Create dip/wid
+router.post("/", auth, async (req, res) => {
+  const userId = req.user.user_id;
+  const { platform_id, segment_id, plan_id, txn_type, amount, note } = req.body;
 
-function getUserId(req) {
-  const uid = req.user?.user_id || req.headers["x-user-id"];
-  if (!uid) return null;
-  const n = parseInt(uid, 10);
-  return Number.isNaN(n) ? null : n;
-}
+  const pid = Number(platform_id);
+  const sid = Number(segment_id);
+  const planId = plan_id ? Number(plan_id) : null;
+  const amt = Number(amount);
 
-function isValidMonthString(m) {
-  return typeof m === "string" && /^\d{4}-\d{2}$/.test(m);
-}
+  if (!pid) return res.status(400).json({ message: "platform_id required" });
+  if (!sid) return res.status(400).json({ message: "segment_id required" });
+  if (!["DEPOSIT", "WITHDRAW"].includes(String(txn_type || "").toUpperCase()))
+    return res.status(400).json({ message: "txn_type invalid" });
+  if (!Number.isFinite(amt) || amt <= 0) return res.status(400).json({ message: "amount invalid" });
 
-// 1) POST /api/dipwid
-router.post("/dipwid", async (req, res) => {
   try {
-    const user_id = getUserId(req);
-    if (!user_id) return res.status(401).json({ message: "Unauthorized: user_id missing" });
+    // ✅ ownership + relation check (segment belongs to platform)
+    const seg = await pool.query(
+      `SELECT 1 FROM investment_segment WHERE user_id=$1 AND segment_id=$2 AND platform_id=$3`,
+      [userId, sid, pid]
+    );
+    if (!seg.rowCount) return res.status(400).json({ message: "Invalid platform/segment for user" });
 
-    const { txn_type, amount, txn_date, note, category_id, subcategory_id } = req.body;
-
-    const TYPE = String(txn_type || "").toUpperCase();
-    if (!["DEPOSIT", "WITHDRAW"].includes(TYPE)) {
-      return res.status(400).json({ message: "txn_type must be DEPOSIT or WITHDRAW" });
-    }
-
-    const amt = Number(amount);
-    if (!Number.isFinite(amt) || amt <= 0) return res.status(400).json({ message: "amount must be > 0" });
-
-    const catId = category_id ? parseInt(category_id, 10) : null;
-    const subId = subcategory_id ? parseInt(subcategory_id, 10) : null;
-
-    if (catId !== null && !catId) return res.status(400).json({ message: "Invalid category_id" });
-    if (subId !== null && !subId) return res.status(400).json({ message: "Invalid subcategory_id" });
-
-    if (txn_date && !/^\d{4}-\d{2}-\d{2}$/.test(String(txn_date))) {
-      return res.status(400).json({ message: "txn_date must be YYYY-MM-DD" });
-    }
-
-    // ownership checks (only if provided)
-    if (catId !== null) {
-      const catCheck = await pool.query(
-        `SELECT 1 FROM investment_category WHERE category_id=$1 AND user_id=$2`,
-        [catId, user_id]
+    // plan (optional) should match
+    if (planId) {
+      const pl = await pool.query(
+        `SELECT 1 FROM investment_plan WHERE user_id=$1 AND plan_id=$2 AND platform_id=$3 AND segment_id=$4`,
+        [userId, planId, pid, sid]
       );
-      if (catCheck.rowCount === 0) return res.status(404).json({ message: "Category not found for this user" });
+      if (!pl.rowCount) return res.status(400).json({ message: "Invalid plan for user/platform/segment" });
     }
 
-    if (subId !== null) {
-      const subCheck = await pool.query(
-        `SELECT category_id FROM investment_subcategory WHERE subcategory_id=$1 AND user_id=$2`,
-        [subId, user_id]
-      );
-      if (subCheck.rowCount === 0) return res.status(404).json({ message: "Subcategory not found for this user" });
+    const { rows } = await pool.query(
+      `INSERT INTO investment_dipwid
+        (user_id, platform_id, segment_id, plan_id, txn_type, amount, note)
+       VALUES
+        ($1,$2,$3,$4,$5,$6,$7)
+       RETURNING dipwid_id, user_id, platform_id, segment_id, plan_id, txn_type, amount, txn_at, note`,
+      [userId, pid, sid, planId, String(txn_type).toUpperCase(), Math.trunc(amt), note?.trim() ? note.trim() : null]
+    );
 
-      if (catId !== null && subCheck.rows[0].category_id !== catId) {
-        return res.status(400).json({ message: "subcategory_id does not belong to category_id" });
-      }
-    }
-
-    const q = `
-      INSERT INTO investment_dipwid
-        (user_id, category_id, subcategory_id, txn_type, amount, txn_date, note)
-      VALUES
-        ($1,$2,$3,$4,$5, COALESCE($6::date, CURRENT_DATE), $7)
-      RETURNING dipwid_id, user_id, category_id, subcategory_id, txn_type, amount, txn_date, note, created_at;
-    `;
-    const result = await pool.query(q, [
-      user_id,
-      catId,
-      subId,
-      TYPE,
-      amt,
-      txn_date ?? null,
-      note ?? null,
-    ]);
-
-    return res.status(201).json({ message: "Transaction saved", data: result.rows[0] });
-  } catch (err) {
-    console.error("POST /api/dipwid error:", err);
-    return res.status(500).json({ message: "Server error", error: err.message });
+    res.json({ data: rows[0] });
+  } catch (e) {
+    res.status(500).json({ message: "Dip/Wid create failed", error: e.message });
   }
 });
 
-// 2) GET /api/dipwid
-router.get("/dipwid", async (req, res) => {
+// DELETE dipwid (user safe)
+router.delete("/:id", auth, async (req, res) => {
+  const userId = req.user.user_id;
+  const id = Number(req.params.id);
+  if (!id) return res.status(400).json({ message: "Invalid dipwid_id" });
+
   try {
-    const user_id = getUserId(req);
-    if (!user_id) return res.status(401).json({ message: "Unauthorized: user_id missing" });
+    const result = await pool.query(
+      `DELETE FROM investment_dipwid WHERE user_id=$1 AND dipwid_id=$2`,
+      [userId, id]
+    );
+    if (!result.rowCount) return res.status(404).json({ message: "Not found" });
+    res.json({ message: "Deleted" });
+  } catch (e) {
+    res.status(500).json({ message: "Delete failed", error: e.message });
+  }
+});
 
-    const category_id = req.query.category_id ? parseInt(req.query.category_id, 10) : null;
-    const subcategory_id = req.query.subcategory_id ? parseInt(req.query.subcategory_id, 10) : null;
+// GET ledger (returns names too)
+router.get("/ledger", auth, async (req, res) => {
+  const userId = req.user.user_id;
+  const platformId = req.query.platform_id ? Number(req.query.platform_id) : null;
+  const segmentId = req.query.segment_id ? Number(req.query.segment_id) : null;
+  const planId = req.query.plan_id ? Number(req.query.plan_id) : null;
 
-    let q = `
+  try {
+    const { rows } = await pool.query(
+      `
       SELECT
-        d.*,
-        c.category_name,
-        s.subcategory_name
+        d.dipwid_id, d.user_id,
+        d.platform_id, p.platform_name,
+        d.segment_id,  s.segment_name,
+        d.plan_id,
+        d.txn_type, d.amount, d.txn_at, d.note,
+
+        pl.total_fund_deposit AS plan_fund,
+
+        CASE WHEN d.txn_type='DEPOSIT' THEN d.amount ELSE -d.amount END AS signed_amount,
+
+        SUM(CASE WHEN d.txn_type='DEPOSIT' THEN d.amount ELSE -d.amount END)
+          OVER (PARTITION BY d.user_id, d.platform_id, d.segment_id
+                ORDER BY d.txn_at, d.dipwid_id) AS running_balance
+
       FROM investment_dipwid d
-      LEFT JOIN investment_category c ON c.category_id = d.category_id
-      LEFT JOIN investment_subcategory s ON s.subcategory_id = d.subcategory_id
-      WHERE d.user_id = $1
-    `;
-    const params = [user_id];
+      JOIN investment_platform p ON p.user_id=d.user_id AND p.platform_id=d.platform_id
+      JOIN investment_segment  s ON s.user_id=d.user_id AND s.segment_id=d.segment_id
+      LEFT JOIN investment_plan pl ON pl.user_id=d.user_id AND pl.plan_id=d.plan_id
 
-    if (category_id) {
-      q += ` AND d.category_id = $2`;
-      params.push(category_id);
-    }
-    if (subcategory_id) {
-      q += ` AND d.subcategory_id = $${params.length + 1}`;
-      params.push(subcategory_id);
-    }
+      WHERE d.user_id=$1
+        AND ($2::bigint IS NULL OR d.platform_id=$2)
+        AND ($3::bigint IS NULL OR d.segment_id=$3)
+        AND ($4::bigint IS NULL OR d.plan_id=$4)
 
-    q += ` ORDER BY d.txn_date DESC, d.dipwid_id DESC;`;
+      ORDER BY d.txn_at DESC, d.dipwid_id DESC
+      `,
+      [userId, platformId, segmentId, planId]
+    );
 
-    const result = await pool.query(q, params);
-    return res.json({ data: result.rows });
-  } catch (err) {
-    console.error("GET /api/dipwid error:", err);
-    return res.status(500).json({ message: "Server error" });
+    res.json({ data: rows });
+  } catch (e) {
+    res.status(500).json({ message: "Ledger fetch failed", error: e.message });
   }
 });
 
-// 3) GET /api/dipwid/ledger
-router.get("/dipwid/ledger", async (req, res) => {
+// GET month summary (deposit/withdraw counts + totals)
+router.get("/month-summary", auth, async (req, res) => {
+  const userId = req.user.user_id;
+  const platformId = req.query.platform_id ? Number(req.query.platform_id) : null;
+  const segmentId = req.query.segment_id ? Number(req.query.segment_id) : null;
+  const month = req.query.month ? String(req.query.month) : null; // YYYY-MM-01
+
   try {
-    const user_id = getUserId(req);
-    if (!user_id) return res.status(401).json({ message: "Unauthorized: user_id missing" });
-
-    const category_id = req.query.category_id ? parseInt(req.query.category_id, 10) : null;
-    const subcategory_id = req.query.subcategory_id ? parseInt(req.query.subcategory_id, 10) : null;
-
-    let q = `
+    const { rows } = await pool.query(
+      `
       SELECT
-        l.*,
-        c.category_name,
-        s.subcategory_name
-      FROM investment_dipwid_ledger l
-      LEFT JOIN investment_category c ON c.category_id = l.category_id
-      LEFT JOIN investment_subcategory s ON s.subcategory_id = l.subcategory_id
-      WHERE l.user_id = $1
-    `;
-    const params = [user_id];
+        user_id,
+        platform_id,
+        segment_id,
+        date_trunc('month', txn_at)::date AS month_start,
 
-    if (category_id) {
-      q += ` AND l.category_id = $2`;
-      params.push(category_id);
-    }
-    if (subcategory_id) {
-      q += ` AND l.subcategory_id = $${params.length + 1}`;
-      params.push(subcategory_id);
-    }
+        COUNT(*) FILTER (WHERE txn_type='DEPOSIT')  AS deposits_count,
+        COUNT(*) FILTER (WHERE txn_type='WITHDRAW') AS withdrawals_count,
 
-    q += ` ORDER BY l.txn_date ASC, l.dipwid_id ASC;`;
+        COALESCE(SUM(amount) FILTER (WHERE txn_type='DEPOSIT'), 0)  AS total_deposit,
+        COALESCE(SUM(amount) FILTER (WHERE txn_type='WITHDRAW'), 0) AS total_withdraw
 
-    const result = await pool.query(q, params);
-    return res.json({ data: result.rows });
-  } catch (err) {
-    console.error("GET /api/dipwid/ledger error:", err);
-    return res.status(500).json({ message: "Server error" });
-  }
-});
+      FROM investment_dipwid
+      WHERE user_id=$1
+        AND ($2::bigint IS NULL OR platform_id=$2)
+        AND ($3::bigint IS NULL OR segment_id=$3)
+        AND ($4::date IS NULL OR date_trunc('month', txn_at)::date = date_trunc('month', $4::date)::date)
 
-// 4) GET /api/dipwid/alert?month=YYYY-MM  (EXTRA - monthly alert messages)
-router.get("/dipwid/alert", async (req, res) => {
-  try {
-    const user_id = getUserId(req);
-    if (!user_id) return res.status(401).json({ message: "Unauthorized: user_id missing" });
+      GROUP BY user_id, platform_id, segment_id, date_trunc('month', txn_at)
+      ORDER BY month_start DESC
+      `,
+      [userId, platformId, segmentId, month]
+    );
 
-    const month = req.query.month ? String(req.query.month) : null;
-    if (!month || !isValidMonthString(month)) {
-      return res.status(400).json({ message: "month is required in YYYY-MM (e.g., 2026-02)" });
-    }
-
-    const monthStart = `${month}-01`;
-
-    const q = `
-      SELECT
-        a.*,
-        c.category_name,
-        s.subcategory_name
-      FROM investment_dipwid_month_alert a
-      LEFT JOIN investment_category c ON c.category_id = a.category_id
-      LEFT JOIN investment_subcategory s ON s.subcategory_id = a.subcategory_id
-      WHERE a.user_id = $1
-        AND a.month_start = $2::date
-      ORDER BY c.category_name NULLS FIRST, s.subcategory_name NULLS FIRST;
-    `;
-
-    const result = await pool.query(q, [user_id, monthStart]);
-    return res.json({ month, data: result.rows });
-  } catch (err) {
-    console.error("GET /api/dipwid/alert error:", err);
-    return res.status(500).json({ message: "Server error" });
+    res.json({ data: rows });
+  } catch (e) {
+    res.status(500).json({ message: "Month summary failed", error: e.message });
   }
 });
 
