@@ -141,6 +141,17 @@ const investmentGetViewTradingJournal = require("./routes/INVESTMENT/investment_
 app.use("/api/investment/tradingjournal-view", investmentGetViewTradingJournal);
 
 
+// NEW OVERALL P & L API
+app.use(
+  "/api/investment/trading",
+  require("./routes/INVESTMENT/investment_newapitrading")
+);
+
+
+
+
+
+
 // ✅ Import routes
 const notesMyAppRoutes = require("./routes/Notes/notesmyapp");
 app.use("/api/notes-myapp", notesMyAppRoutes);
