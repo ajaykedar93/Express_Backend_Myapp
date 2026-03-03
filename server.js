@@ -138,6 +138,7 @@ const investmentGetViewTradingJournal = require("./routes/INVESTMENT/investment_
 app.use("/api/investment/tradingjournal-view", investmentGetViewTradingJournal);
 
 
+
 // NEW OVERALL P & L API
 app.use(
   "/api/investment/trading",

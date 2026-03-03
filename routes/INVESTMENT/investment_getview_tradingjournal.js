@@ -4,7 +4,7 @@ const router = express.Router();
 const pool = require("../../db");
 const auth = require("../../middleware/auth");
 
-// ✅ strict rules (same as create)
+// ✅ strict rules
 function validateProfitLossBrokerage({ profit, loss, brokerage }) {
   const p = Number(profit);
   const l = Number(loss);
@@ -23,13 +23,11 @@ function validateProfitLossBrokerage({ profit, loss, brokerage }) {
 
 /**
  * ✅ GET /daily-summary
- * Query (all optional):
+ * Query (optional):
  *  - platform_id
  *  - segment_id
  *  - plan_id
- *  - month=YYYY-MM-01 (default current month if not sent)
- *
- * ✅ Returns: rows with platform_name, segment_name, trade_name
+ *  - month=YYYY-MM-01 (default current month)
  */
 router.get("/daily-summary", auth, async (req, res) => {
   const userId = req.user.user_id;
@@ -37,8 +35,6 @@ router.get("/daily-summary", auth, async (req, res) => {
   const platformId = req.query.platform_id ? Number(req.query.platform_id) : null;
   const segmentId = req.query.segment_id ? Number(req.query.segment_id) : null;
   const planId = req.query.plan_id ? Number(req.query.plan_id) : null;
-
-  // if month not provided -> current month
   const month = req.query.month ? String(req.query.month) : null;
 
   try {
@@ -59,7 +55,7 @@ router.get("/daily-summary", auth, async (req, res) => {
 
         j.plan_id,
         j.trade_date,
-        j.trade_name,                 -- ✅ included
+        j.trade_name,
 
         j.profit,
         j.loss,
@@ -102,15 +98,15 @@ router.get("/daily-summary", auth, async (req, res) => {
 });
 
 /**
- * ✅ PUT /:id  (Update main journal row)
- * Body:
- *  - platform_id, segment_id (required)
- *  - plan_id (optional)
- *  - trade_date (required)
- *  - trade_name (required)
- *  - profit, loss, brokerage (required)
- *  - trade_logic (required)
- *  - mistakes (optional)
+ * ✅ PUT /:id  (update row)
+ * Body required:
+ *  - platform_id, segment_id
+ *  - trade_date, trade_name
+ *  - profit, loss, brokerage
+ *  - trade_logic
+ * optional:
+ *  - plan_id (null allowed)
+ *  - mistakes
  */
 router.put("/:id", auth, async (req, res) => {
   const userId = req.user.user_id;
@@ -132,7 +128,9 @@ router.put("/:id", auth, async (req, res) => {
 
   const pid = Number(platform_id);
   const sid = Number(segment_id);
-  const planId = plan_id ? Number(plan_id) : null;
+
+  // plan_id: allow null
+  const planId = plan_id === null || plan_id === "" || plan_id === undefined ? null : Number(plan_id);
 
   if (!pid) return res.status(400).json({ message: "platform_id required" });
   if (!sid) return res.status(400).json({ message: "segment_id required" });
@@ -160,7 +158,7 @@ router.put("/:id", auth, async (req, res) => {
       return res.status(404).json({ message: "Journal not found" });
     }
 
-    // ✅ segment must belong to platform for this user
+    // ✅ validate segment belongs to platform for this user
     const seg = await client.query(
       `SELECT 1
        FROM investment_segment
@@ -172,7 +170,7 @@ router.put("/:id", auth, async (req, res) => {
       return res.status(400).json({ message: "Invalid platform/segment for user" });
     }
 
-    // ✅ plan optional validate
+    // ✅ plan validate (if not null)
     if (planId) {
       const pl = await client.query(
         `SELECT 1
@@ -234,7 +232,7 @@ router.put("/:id", auth, async (req, res) => {
 });
 
 /**
- * ✅ DELETE /:id (user safe)
+ * ✅ DELETE /:id
  */
 router.delete("/:id", auth, async (req, res) => {
   const userId = req.user.user_id;
