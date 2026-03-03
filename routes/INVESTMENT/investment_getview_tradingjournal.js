@@ -4,7 +4,7 @@ const router = express.Router();
 const pool = require("../../db");
 const auth = require("../../middleware/auth");
 
-// ✅ strict rules (same logic)
+// ✅ strict rules (same as create)
 function validateProfitLossBrokerage({ profit, loss, brokerage }) {
   const p = Number(profit);
   const l = Number(loss);
@@ -16,15 +16,20 @@ function validateProfitLossBrokerage({ profit, loss, brokerage }) {
 
   const ok = (p === 0 && l > 0) || (l === 0 && p > 0) || (p === 0 && l === 0);
   if (!ok) return "Either Profit OR Loss should be > 0 (both cannot be > 0 together)";
-
   if (p === 0 && l === 0 && b > 0) return "brokerage not allowed when profit=loss=0";
+
   return "";
 }
 
 /**
  * ✅ GET /daily-summary
- * Filters: platform_id, segment_id, plan_id, month=YYYY-MM-01 (optional)
- * Returns: trade_name + platform/segment names + net_total
+ * Query (all optional):
+ *  - platform_id
+ *  - segment_id
+ *  - plan_id
+ *  - month=YYYY-MM-01 (default current month if not sent)
+ *
+ * ✅ Returns: rows with platform_name, segment_name, trade_name
  */
 router.get("/daily-summary", auth, async (req, res) => {
   const userId = req.user.user_id;
@@ -32,23 +37,33 @@ router.get("/daily-summary", auth, async (req, res) => {
   const platformId = req.query.platform_id ? Number(req.query.platform_id) : null;
   const segmentId = req.query.segment_id ? Number(req.query.segment_id) : null;
   const planId = req.query.plan_id ? Number(req.query.plan_id) : null;
-  const month = req.query.month ? String(req.query.month) : null; // YYYY-MM-01
+
+  // if month not provided -> current month
+  const month = req.query.month ? String(req.query.month) : null;
 
   try {
     const { rows } = await pool.query(
       `
+      WITH chosen AS (
+        SELECT date_trunc(
+                 'month',
+                 COALESCE($5::date, date_trunc('month', now())::date)
+               )::date AS month_start
+      )
       SELECT
         j.journal_id,
         j.user_id,
 
         j.platform_id, p.platform_name,
         j.segment_id,  s.segment_name,
+
         j.plan_id,
-
         j.trade_date,
-        j.trade_name,
+        j.trade_name,                 -- ✅ included
 
-        j.profit, j.loss, j.brokerage,
+        j.profit,
+        j.loss,
+        j.brokerage,
 
         CASE
           WHEN j.profit > 0 THEN j.profit - j.brokerage
@@ -59,19 +74,22 @@ router.get("/daily-summary", auth, async (req, res) => {
         j.trade_logic,
         j.mistakes,
         j.created_at
+
       FROM investment_tradingjournal j
+      JOIN chosen c
+        ON date_trunc('month', j.trade_date)::date = c.month_start
+
       JOIN investment_platform p
         ON p.user_id=j.user_id AND p.platform_id=j.platform_id
+
       JOIN investment_segment s
         ON s.user_id=j.user_id AND s.segment_id=j.segment_id
+
       WHERE j.user_id=$1
         AND ($2::bigint IS NULL OR j.platform_id=$2)
         AND ($3::bigint IS NULL OR j.segment_id=$3)
         AND ($4::bigint IS NULL OR j.plan_id=$4)
-        AND (
-          $5::date IS NULL
-          OR date_trunc('month', j.trade_date)::date = date_trunc('month', $5::date)::date
-        )
+
       ORDER BY j.trade_date DESC, j.journal_id DESC
       `,
       [userId, platformId, segmentId, planId, month]
@@ -84,9 +102,15 @@ router.get("/daily-summary", auth, async (req, res) => {
 });
 
 /**
- * ✅ PUT /:id (Update trade)
- * Allowed update: platform_id, segment_id, plan_id(optional), trade_date,
- * trade_name, profit, loss, brokerage, trade_logic, mistakes
+ * ✅ PUT /:id  (Update main journal row)
+ * Body:
+ *  - platform_id, segment_id (required)
+ *  - plan_id (optional)
+ *  - trade_date (required)
+ *  - trade_name (required)
+ *  - profit, loss, brokerage (required)
+ *  - trade_logic (required)
+ *  - mistakes (optional)
  */
 router.put("/:id", auth, async (req, res) => {
   const userId = req.user.user_id;
@@ -126,17 +150,17 @@ router.put("/:id", auth, async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // ✅ journal belongs to user
-    const own = await client.query(
+    // ✅ ensure journal belongs to user
+    const chk = await client.query(
       `SELECT 1 FROM investment_tradingjournal WHERE user_id=$1 AND journal_id=$2`,
       [userId, journalId]
     );
-    if (!own.rowCount) {
+    if (!chk.rowCount) {
       await client.query("ROLLBACK");
       return res.status(404).json({ message: "Journal not found" });
     }
 
-    // ✅ segment belongs to platform + user
+    // ✅ segment must belong to platform for this user
     const seg = await client.query(
       `SELECT 1
        FROM investment_segment
@@ -148,7 +172,7 @@ router.put("/:id", auth, async (req, res) => {
       return res.status(400).json({ message: "Invalid platform/segment for user" });
     }
 
-    // ✅ plan (optional) validate
+    // ✅ plan optional validate
     if (planId) {
       const pl = await client.query(
         `SELECT 1
@@ -162,7 +186,7 @@ router.put("/:id", auth, async (req, res) => {
       }
     }
 
-    const { rows } = await client.query(
+    const upd = await client.query(
       `
       UPDATE investment_tradingjournal
       SET
@@ -200,7 +224,7 @@ router.put("/:id", auth, async (req, res) => {
     );
 
     await client.query("COMMIT");
-    res.json({ data: rows[0] });
+    res.json({ data: upd.rows[0] });
   } catch (e) {
     await client.query("ROLLBACK");
     res.status(400).json({ message: "Journal update failed", error: e.message });
@@ -210,18 +234,18 @@ router.put("/:id", auth, async (req, res) => {
 });
 
 /**
- * ✅ DELETE /:id (Delete trade)
+ * ✅ DELETE /:id (user safe)
  */
 router.delete("/:id", auth, async (req, res) => {
   const userId = req.user.user_id;
-  const journalId = Number(req.params.id);
-  if (!journalId) return res.status(400).json({ message: "Invalid journal_id" });
+  const id = Number(req.params.id);
+  if (!id) return res.status(400).json({ message: "Invalid journal_id" });
 
   try {
     const result = await pool.query(
       `DELETE FROM investment_tradingjournal
        WHERE user_id=$1 AND journal_id=$2`,
-      [userId, journalId]
+      [userId, id]
     );
     if (!result.rowCount) return res.status(404).json({ message: "Journal not found" });
     res.json({ message: "Deleted" });

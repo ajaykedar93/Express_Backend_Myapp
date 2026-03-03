@@ -17,13 +17,12 @@ function validateProfitLossBrokerage({ profit, loss, brokerage }) {
   const ok = (p === 0 && l > 0) || (l === 0 && p > 0) || (p === 0 && l === 0);
   if (!ok) return "Either Profit OR Loss should be > 0 (both cannot be > 0 together)";
 
-  // optional tighten (same as your old code)
   if (p === 0 && l === 0 && b > 0) return "brokerage not allowed when profit=loss=0";
 
   return "";
 }
 
-// ✅ POST create journal (NEW: only trade_name, no child tables)
+// ✅ POST create journal (ONLY ADD)
 router.post("/", auth, async (req, res) => {
   const userId = req.user.user_id;
 
@@ -32,7 +31,7 @@ router.post("/", auth, async (req, res) => {
     segment_id,
     plan_id, // optional
     trade_date,
-    trade_name, // ✅ NEW
+    trade_name, // required
     profit,
     loss,
     brokerage,
@@ -60,7 +59,7 @@ router.post("/", auth, async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // ✅ segment ownership + segment belongs to platform (IMPORTANT)
+    // ✅ segment must belong to platform for this user
     const seg = await client.query(
       `SELECT 1
        FROM investment_segment
@@ -72,7 +71,7 @@ router.post("/", auth, async (req, res) => {
       return res.status(400).json({ message: "Invalid platform/segment for user" });
     }
 
-    // ✅ plan ownership validate (if provided)
+    // ✅ plan validate (if provided)
     if (planId) {
       const pl = await client.query(
         `SELECT 1
@@ -86,7 +85,6 @@ router.post("/", auth, async (req, res) => {
       }
     }
 
-    // ✅ Insert (NEW column trade_name)
     const j = await client.query(
       `INSERT INTO investment_tradingjournal
         (user_id, platform_id, segment_id, plan_id, trade_date, trade_name,
@@ -120,25 +118,6 @@ router.post("/", auth, async (req, res) => {
     res.status(400).json({ message: "Journal create failed", error: e.message });
   } finally {
     client.release();
-  }
-});
-
-// ✅ DELETE journal (user safe)
-router.delete("/:id", auth, async (req, res) => {
-  const userId = req.user.user_id;
-  const id = Number(req.params.id);
-  if (!id) return res.status(400).json({ message: "Invalid journal_id" });
-
-  try {
-    const result = await pool.query(
-      `DELETE FROM investment_tradingjournal
-       WHERE user_id=$1 AND journal_id=$2`,
-      [userId, id]
-    );
-    if (!result.rowCount) return res.status(404).json({ message: "Journal not found" });
-    res.json({ message: "Deleted" });
-  } catch (e) {
-    res.status(500).json({ message: "Journal delete failed", error: e.message });
   }
 });
 
