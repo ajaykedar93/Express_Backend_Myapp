@@ -5,26 +5,32 @@ const pool = require("../../db");
 const auth = require("../../middleware/auth");
 
 /**
- * ✅ Month Trading + Deposit Stats API
- * - user can pass ?month=YYYY-MM-01
- * - if month not provided => current month auto
+ * ✅ Month Trading + Deposit Stats API (NEW)
  *
- * ✅ Returns (separate):
+ * Query (all optional):
+ *  - month=YYYY-MM-01   (if not given -> current month)
+ *  - platform_id
+ *  - segment_id
+ *  - plan_id
+ *
+ * ✅ Returns:
  *  - total_trades
  *  - total_profit
  *  - total_loss
  *  - total_brokerage
+ *  - profit_net_total  = SUM(profit - brokerage) only profit trades
+ *  - loss_net_total    = SUM(-(loss + brokerage)) only loss trades
  *  - overall_month_pnl = total_profit - (total_loss + total_brokerage)
- *  - profit_net_total  = SUM(profit - brokerage) for profit trades
- *  - loss_net_total    = SUM(-(loss + brokerage)) for loss trades
  *  - total_deposit     = SUM(deposit amount) from investment_dipwid (month filtered)
  */
 
 router.get("/month-stats", auth, async (req, res) => {
   const userId = req.user.user_id;
 
-  // month optional (YYYY-MM-01). If null -> current month
-  const month = req.query.month ? String(req.query.month) : null;
+  const month = req.query.month ? String(req.query.month) : null; // YYYY-MM-01
+  const platformId = req.query.platform_id ? Number(req.query.platform_id) : null;
+  const segmentId = req.query.segment_id ? Number(req.query.segment_id) : null;
+  const planId = req.query.plan_id ? Number(req.query.plan_id) : null;
 
   try {
     const { rows } = await pool.query(
@@ -46,6 +52,9 @@ router.get("/month-stats", auth, async (req, res) => {
         JOIN chosen c
           ON date_trunc('month', j.trade_date)::date = c.month_start
         WHERE j.user_id = $1
+          AND ($3::bigint IS NULL OR j.platform_id = $3)
+          AND ($4::bigint IS NULL OR j.segment_id  = $4)
+          AND ($5::bigint IS NULL OR j.plan_id     = $5)
       ),
       d AS (
         SELECT
@@ -56,48 +65,52 @@ router.get("/month-stats", auth, async (req, res) => {
         JOIN chosen c
           ON date_trunc('month', d.txn_at)::date = c.month_start
         WHERE d.user_id = $1
+          AND ($3::bigint IS NULL OR d.platform_id = $3)
+          AND ($4::bigint IS NULL OR d.segment_id  = $4)
+          AND ($5::bigint IS NULL OR d.plan_id     = $5)
         GROUP BY d.user_id, date_trunc('month', d.txn_at)::date
       )
       SELECT
         $1::int AS user_id,
         c.month_start,
 
-        -- trades
-        COALESCE(COUNT(j.*), 0)::int AS total_trades,
+        -- ✅ trades count
+        COALESCE((SELECT COUNT(*) FROM j), 0)::int AS total_trades,
 
-        -- totals separate
-        COALESCE(SUM(j.profit), 0)::numeric(14,0)    AS total_profit,
-        COALESCE(SUM(j.loss), 0)::numeric(14,0)      AS total_loss,
-        COALESCE(SUM(j.brokerage), 0)::numeric(14,0) AS total_brokerage,
+        -- ✅ totals separate
+        COALESCE((SELECT SUM(profit)    FROM j), 0)::numeric(14,0) AS total_profit,
+        COALESCE((SELECT SUM(loss)      FROM j), 0)::numeric(14,0) AS total_loss,
+        COALESCE((SELECT SUM(brokerage) FROM j), 0)::numeric(14,0) AS total_brokerage,
 
-        -- ✅ profit net: profit - brokerage (only profit trades)
+        -- ✅ profit net total
         COALESCE(
-          SUM(CASE WHEN j.profit > 0 THEN (j.profit - j.brokerage) ELSE 0 END),
+          (SELECT SUM(CASE WHEN profit > 0 THEN (profit - brokerage) ELSE 0 END) FROM j),
           0
         )::numeric(14,0) AS profit_net_total,
 
-        -- ✅ loss net: -(loss + brokerage) (only loss trades)
+        -- ✅ loss net total
         COALESCE(
-          SUM(CASE WHEN j.loss > 0 THEN -(j.loss + j.brokerage) ELSE 0 END),
+          (SELECT SUM(CASE WHEN loss > 0 THEN -(loss + brokerage) ELSE 0 END) FROM j),
           0
         )::numeric(14,0) AS loss_net_total,
 
-        -- ✅ overall = total_profit - (total_loss + total_brokerage)
+        -- ✅ overall pnl
         (
-          COALESCE(SUM(j.profit), 0)
+          COALESCE((SELECT SUM(profit) FROM j), 0)
           -
-          (COALESCE(SUM(j.loss), 0) + COALESCE(SUM(j.brokerage), 0))
+          (
+            COALESCE((SELECT SUM(loss) FROM j), 0)
+            +
+            COALESCE((SELECT SUM(brokerage) FROM j), 0)
+          )
         )::numeric(14,0) AS overall_month_pnl,
 
-        -- deposits
-        COALESCE(d.total_deposit, 0)::numeric(14,0) AS total_deposit
+        -- ✅ deposits
+        COALESCE((SELECT total_deposit FROM d LIMIT 1), 0)::numeric(14,0) AS total_deposit
 
       FROM chosen c
-      LEFT JOIN j ON j.month_start = c.month_start
-      LEFT JOIN d ON d.month_start = c.month_start AND d.user_id = $1
-      GROUP BY c.month_start, d.total_deposit
       `,
-      [userId, month]
+      [userId, month, platformId, segmentId, planId]
     );
 
     res.json({ data: rows[0] });

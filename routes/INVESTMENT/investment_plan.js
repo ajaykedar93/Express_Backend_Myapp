@@ -27,6 +27,7 @@ router.get("/", auth, async (req, res) => {
        ORDER BY pl.created_at DESC`,
       [userId, platformId, segmentId]
     );
+
     res.json({ data: rows });
   } catch (e) {
     res.status(500).json({ message: "Plan fetch failed", error: e.message });
@@ -54,7 +55,7 @@ router.post("/", auth, async (req, res) => {
   if (!pid) return res.status(400).json({ message: "platform_id required" });
   if (!sid) return res.status(400).json({ message: "segment_id required" });
 
-  // numeric ints
+  // numeric
   const fund = Number(total_fund_deposit);
   const risk = Number(risk_loss);
   const reward = Number(profit_reward);
@@ -72,7 +73,7 @@ router.post("/", auth, async (req, res) => {
   if (td !== null && (!Number.isFinite(td) || td <= 0)) return res.status(400).json({ message: "trading_days invalid" });
 
   try {
-    // ✅ ownership validate platform + segment same user and segment belongs to platform
+    // ✅ ownership validate + segment belongs to platform
     const chk = await pool.query(
       `SELECT s.segment_id
        FROM investment_segment s
@@ -121,6 +122,7 @@ router.put("/:id", auth, async (req, res) => {
   if (!pid) return res.status(400).json({ message: "platform_id required" });
   if (!sid) return res.status(400).json({ message: "segment_id required" });
 
+  // ✅ (FIX) numeric validations also in PUT
   const fund = Number(total_fund_deposit);
   const risk = Number(risk_loss);
   const reward = Number(profit_reward);
@@ -129,10 +131,16 @@ router.put("/:id", auth, async (req, res) => {
   const allowedRR = new Set(["1:1", "1:1.5", "1:2", "1:3"]);
   if (!allowedRR.has(rr_ratio)) return res.status(400).json({ message: "rr_ratio invalid" });
 
+  if (!Number.isFinite(fund) || fund < 0) return res.status(400).json({ message: "total_fund_deposit invalid" });
+  if (!Number.isFinite(risk) || risk <= 0) return res.status(400).json({ message: "risk_loss invalid" });
+  if (!Number.isFinite(reward) || reward <= 0) return res.status(400).json({ message: "profit_reward invalid" });
+  if (!Number.isFinite(dayLimit) || dayLimit < 0) return res.status(400).json({ message: "day_trade_limit invalid" });
+
   const td = trading_days === null || trading_days === "" || trading_days === undefined ? null : Number(trading_days);
   if (td !== null && (!Number.isFinite(td) || td <= 0)) return res.status(400).json({ message: "trading_days invalid" });
 
   try {
+    // ✅ ownership validate segment belongs to same user + platform
     const chk = await pool.query(
       `SELECT 1
        FROM investment_segment s

@@ -12,13 +12,17 @@ router.post("/", auth, async (req, res) => {
   const pid = Number(platform_id);
   const sid = Number(segment_id);
   const planId = plan_id ? Number(plan_id) : null;
+
+  const type = String(txn_type || "").toUpperCase();
   const amt = Number(amount);
 
   if (!pid) return res.status(400).json({ message: "platform_id required" });
   if (!sid) return res.status(400).json({ message: "segment_id required" });
-  if (!["DEPOSIT", "WITHDRAW"].includes(String(txn_type || "").toUpperCase()))
-    return res.status(400).json({ message: "txn_type invalid" });
+  if (!["DEPOSIT", "WITHDRAW"].includes(type)) return res.status(400).json({ message: "txn_type invalid" });
+
   if (!Number.isFinite(amt) || amt <= 0) return res.status(400).json({ message: "amount invalid" });
+  // ✅ because DB is NUMERIC(14,0)
+  if (!Number.isInteger(amt)) return res.status(400).json({ message: "amount must be a whole number" });
 
   try {
     // ✅ ownership + relation check (segment belongs to platform)
@@ -43,7 +47,7 @@ router.post("/", auth, async (req, res) => {
        VALUES
         ($1,$2,$3,$4,$5,$6,$7)
        RETURNING dipwid_id, user_id, platform_id, segment_id, plan_id, txn_type, amount, txn_at, note`,
-      [userId, pid, sid, planId, String(txn_type).toUpperCase(), Math.trunc(amt), note?.trim() ? note.trim() : null]
+      [userId, pid, sid, planId, type, amt, note?.trim() ? note.trim() : null]
     );
 
     res.json({ data: rows[0] });

@@ -128,9 +128,6 @@ app.use("/api/investment/plan", investmentPlan);
 const investmentTradingJournal = require("./routes/INVESTMENT/investment_tradingjournal");
 app.use("/api/investment/tradingjournal", investmentTradingJournal);
 
-// 4. Investment Report (Month report, Mistakes repeat)
-const investmentReport = require("./routes/INVESTMENT/investment_report");
-app.use("/api/investment/report", investmentReport);
 
 // 5. Deposit / Withdrawal
 const investmentDipWid = require("./routes/INVESTMENT/investment_dipwid");

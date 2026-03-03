@@ -1,54 +1,79 @@
-// src/routes/investment/investment_getview_trandingjouranal.js
+// src/routes/investment/investment_getview_tradingjournal.js
 const express = require("express");
 const router = express.Router();
 const pool = require("../../db");
 const auth = require("../../middleware/auth");
 
-/**
- * ✅ IMPORTANT:
- * - filters now by platform_id / segment_id (IDs) (NOT names)
- * - response includes platform_name + segment_name for display
- */
+// ✅ strict rules (same logic)
+function validateProfitLossBrokerage({ profit, loss, brokerage }) {
+  const p = Number(profit);
+  const l = Number(loss);
+  const b = Number(brokerage);
 
-// GET daily-summary (month required optional; default current)
+  if (!Number.isFinite(p) || p < 0) return "profit invalid";
+  if (!Number.isFinite(l) || l < 0) return "loss invalid";
+  if (!Number.isFinite(b) || b < 0) return "brokerage invalid";
+
+  const ok = (p === 0 && l > 0) || (l === 0 && p > 0) || (p === 0 && l === 0);
+  if (!ok) return "Either Profit OR Loss should be > 0 (both cannot be > 0 together)";
+
+  if (p === 0 && l === 0 && b > 0) return "brokerage not allowed when profit=loss=0";
+  return "";
+}
+
+/**
+ * ✅ GET /daily-summary
+ * Filters: platform_id, segment_id, plan_id, month=YYYY-MM-01 (optional)
+ * Returns: trade_name + platform/segment names + net_total
+ */
 router.get("/daily-summary", auth, async (req, res) => {
   const userId = req.user.user_id;
+
   const platformId = req.query.platform_id ? Number(req.query.platform_id) : null;
   const segmentId = req.query.segment_id ? Number(req.query.segment_id) : null;
   const planId = req.query.plan_id ? Number(req.query.plan_id) : null;
-
-  const month = req.query.month ? String(req.query.month) : null; // "YYYY-MM-01"
+  const month = req.query.month ? String(req.query.month) : null; // YYYY-MM-01
 
   try {
     const { rows } = await pool.query(
-      `SELECT
-         j.journal_id,
-         j.user_id,
-         j.platform_id, p.platform_name,
-         j.segment_id,  s.segment_name,
-         j.plan_id,
-         j.trade_date,
-         j.profit, j.loss, j.brokerage,
-         CASE
-           WHEN j.profit > 0 THEN j.profit - j.brokerage
-           WHEN j.loss   > 0 THEN -(j.loss + j.brokerage)
-           ELSE 0
-         END AS net_total,
-         j.trade_logic,
-         j.mistakes,
-         j.created_at
-       FROM investment_tradingjournal j
-       JOIN investment_platform p ON p.user_id=j.user_id AND p.platform_id=j.platform_id
-       JOIN investment_segment  s ON s.user_id=j.user_id AND s.segment_id=j.segment_id
-       WHERE j.user_id=$1
-         AND ($2::bigint IS NULL OR j.platform_id=$2)
-         AND ($3::bigint IS NULL OR j.segment_id=$3)
-         AND ($4::bigint IS NULL OR j.plan_id=$4)
-         AND (
-              $5::date IS NULL
-              OR date_trunc('month', j.trade_date)::date = date_trunc('month', $5::date)::date
-         )
-       ORDER BY j.trade_date DESC, j.journal_id DESC`,
+      `
+      SELECT
+        j.journal_id,
+        j.user_id,
+
+        j.platform_id, p.platform_name,
+        j.segment_id,  s.segment_name,
+        j.plan_id,
+
+        j.trade_date,
+        j.trade_name,
+
+        j.profit, j.loss, j.brokerage,
+
+        CASE
+          WHEN j.profit > 0 THEN j.profit - j.brokerage
+          WHEN j.loss   > 0 THEN -(j.loss + j.brokerage)
+          ELSE 0
+        END AS net_total,
+
+        j.trade_logic,
+        j.mistakes,
+        j.created_at
+      FROM investment_tradingjournal j
+      JOIN investment_platform p
+        ON p.user_id=j.user_id AND p.platform_id=j.platform_id
+      JOIN investment_segment s
+        ON s.user_id=j.user_id AND s.segment_id=j.segment_id
+      WHERE j.user_id=$1
+        AND ($2::bigint IS NULL OR j.platform_id=$2)
+        AND ($3::bigint IS NULL OR j.segment_id=$3)
+        AND ($4::bigint IS NULL OR j.plan_id=$4)
+        AND (
+          $5::date IS NULL
+          OR date_trunc('month', j.trade_date)::date = date_trunc('month', $5::date)::date
+        )
+      ORDER BY j.trade_date DESC, j.journal_id DESC
+      `,
       [userId, platformId, segmentId, planId, month]
     );
 
@@ -58,74 +83,150 @@ router.get("/daily-summary", auth, async (req, res) => {
   }
 });
 
-// GET entry-details (by journal_id OR month)
-router.get("/entry-details", auth, async (req, res) => {
+/**
+ * ✅ PUT /:id (Update trade)
+ * Allowed update: platform_id, segment_id, plan_id(optional), trade_date,
+ * trade_name, profit, loss, brokerage, trade_logic, mistakes
+ */
+router.put("/:id", auth, async (req, res) => {
   const userId = req.user.user_id;
-  const journalId = req.query.journal_id ? Number(req.query.journal_id) : null;
-  const month = req.query.month ? String(req.query.month) : null;
+  const journalId = Number(req.params.id);
+  if (!journalId) return res.status(400).json({ message: "Invalid journal_id" });
 
+  const {
+    platform_id,
+    segment_id,
+    plan_id,
+    trade_date,
+    trade_name,
+    profit,
+    loss,
+    brokerage,
+    trade_logic,
+    mistakes,
+  } = req.body;
+
+  const pid = Number(platform_id);
+  const sid = Number(segment_id);
+  const planId = plan_id ? Number(plan_id) : null;
+
+  if (!pid) return res.status(400).json({ message: "platform_id required" });
+  if (!sid) return res.status(400).json({ message: "segment_id required" });
+  if (!trade_date) return res.status(400).json({ message: "trade_date required" });
+
+  if (!String(trade_name || "").trim())
+    return res.status(400).json({ message: "trade_name required (Index/Company/Symbol)" });
+
+  if (!trade_logic?.trim()) return res.status(400).json({ message: "trade_logic required" });
+
+  const v = validateProfitLossBrokerage({ profit, loss, brokerage });
+  if (v) return res.status(400).json({ message: v });
+
+  const client = await pool.connect();
   try {
-    // validate journal belongs to user if journal_id provided
-    if (journalId) {
-      const chk = await pool.query(
-        `SELECT 1 FROM investment_tradingjournal WHERE user_id=$1 AND journal_id=$2`,
-        [userId, journalId]
-      );
-      if (!chk.rowCount) return res.status(404).json({ message: "Journal not found" });
+    await client.query("BEGIN");
+
+    // ✅ journal belongs to user
+    const own = await client.query(
+      `SELECT 1 FROM investment_tradingjournal WHERE user_id=$1 AND journal_id=$2`,
+      [userId, journalId]
+    );
+    if (!own.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Journal not found" });
     }
 
-    const { rows } = await pool.query(
+    // ✅ segment belongs to platform + user
+    const seg = await client.query(
+      `SELECT 1
+       FROM investment_segment
+       WHERE user_id=$1 AND segment_id=$2 AND platform_id=$3`,
+      [userId, sid, pid]
+    );
+    if (!seg.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Invalid platform/segment for user" });
+    }
+
+    // ✅ plan (optional) validate
+    if (planId) {
+      const pl = await client.query(
+        `SELECT 1
+         FROM investment_plan
+         WHERE user_id=$1 AND plan_id=$2 AND platform_id=$3 AND segment_id=$4`,
+        [userId, planId, pid, sid]
+      );
+      if (!pl.rowCount) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "Invalid plan for user/platform/segment" });
+      }
+    }
+
+    const { rows } = await client.query(
       `
-      -- OPTIONS
-      SELECT
-        j.journal_id,
-        j.trade_date,
-        'OPTIONS' AS trade_type,
-        o.strike_price::text AS symbol,
-        o.option_type,
-        o.entry_price,
-        o.exit_price,
-        o.quantity,
-        NULL::text AS stock_name
-      FROM investment_tradingjournal j
-      JOIN investment_tradingjournal_options o ON o.journal_id=j.journal_id
-      WHERE j.user_id=$1
-        AND ($2::bigint IS NULL OR j.journal_id=$2)
-        AND (
-             $3::date IS NULL
-             OR date_trunc('month', j.trade_date)::date = date_trunc('month', $3::date)::date
-        )
-
-      UNION ALL
-
-      -- STOCKS / GOLD / CURRENCY
-      SELECT
-        j.journal_id,
-        j.trade_date,
-        'STOCK' AS trade_type,
-        NULL::text AS symbol,
-        NULL::text AS option_type,
-        s.entry_price,
-        s.exit_price,
-        s.quantity,
-        s.stock_name
-      FROM investment_tradingjournal j
-      JOIN investment_tradingjournal_stocks s ON s.journal_id=j.journal_id
-      WHERE j.user_id=$1
-        AND ($2::bigint IS NULL OR j.journal_id=$2)
-        AND (
-             $3::date IS NULL
-             OR date_trunc('month', j.trade_date)::date = date_trunc('month', $3::date)::date
-        )
-
-      ORDER BY trade_date DESC, journal_id DESC
+      UPDATE investment_tradingjournal
+      SET
+        platform_id=$1,
+        segment_id=$2,
+        plan_id=$3,
+        trade_date=$4,
+        trade_name=$5,
+        profit=$6,
+        loss=$7,
+        brokerage=$8,
+        trade_logic=$9,
+        mistakes=$10
+      WHERE user_id=$11 AND journal_id=$12
+      RETURNING
+        journal_id, user_id, platform_id, segment_id, plan_id,
+        trade_date, trade_name,
+        profit, loss, brokerage, net_pnl,
+        trade_logic, mistakes, created_at
       `,
-      [userId, journalId, month]
+      [
+        pid,
+        sid,
+        planId,
+        trade_date,
+        String(trade_name).trim(),
+        Math.trunc(Number(profit)),
+        Math.trunc(Number(loss)),
+        Math.trunc(Number(brokerage)),
+        trade_logic.trim(),
+        mistakes?.trim() ? mistakes.trim() : null,
+        userId,
+        journalId,
+      ]
     );
 
-    res.json({ data: rows });
+    await client.query("COMMIT");
+    res.json({ data: rows[0] });
   } catch (e) {
-    res.status(500).json({ message: "Entry details failed", error: e.message });
+    await client.query("ROLLBACK");
+    res.status(400).json({ message: "Journal update failed", error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * ✅ DELETE /:id (Delete trade)
+ */
+router.delete("/:id", auth, async (req, res) => {
+  const userId = req.user.user_id;
+  const journalId = Number(req.params.id);
+  if (!journalId) return res.status(400).json({ message: "Invalid journal_id" });
+
+  try {
+    const result = await pool.query(
+      `DELETE FROM investment_tradingjournal
+       WHERE user_id=$1 AND journal_id=$2`,
+      [userId, journalId]
+    );
+    if (!result.rowCount) return res.status(404).json({ message: "Journal not found" });
+    res.json({ message: "Deleted" });
+  } catch (e) {
+    res.status(500).json({ message: "Journal delete failed", error: e.message });
   }
 });
 
