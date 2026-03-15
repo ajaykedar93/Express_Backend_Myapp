@@ -188,7 +188,7 @@ app.use("/api/add-list-actress", addListFevActRoutes);
 
 
 /* ---------------- Health Check ---------------- */
-app.get("/health", (_req, res) => res.json({ status: "OK" }));
+app.get("/health", (_req, res) => res.json({ status: "OK--(API LOAD START)" }));
 
 /* ---------------- 404 ---------------- */
 app.use((req, res, next) => {
