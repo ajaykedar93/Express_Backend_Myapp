@@ -181,7 +181,8 @@ router.get("/", async (req, res) => {
       SELECT
         ROW_NUMBER() OVER (ORDER BY dpr_date ASC, sr_no ASC) AS sequence_no,
         sr_no,
-        TO_CHAR(dpr_date, 'FMDD Mon YYYY') AS dpr_date,
+        dpr_date,
+        TO_CHAR(dpr_date, 'FMDD Mon YYYY') AS display_date,
         work_details,
         work_time
       FROM month_dpr
