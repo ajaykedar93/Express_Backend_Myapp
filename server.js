@@ -4,7 +4,28 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const app = express();
+const http = require("http");
+const { Server } = require("socket.io");
+const server = http.createServer(app);
 
+const connectMongoDB = require("./config/mongo");
+connectMongoDB();
+
+/* ---------------- Socket Setup ---------------- */
+const io = new Server(server, {
+  cors: {
+    origin: [
+      "http://localhost:5173",
+      "https://express-backend-myapp.onrender.com",
+      "http://localhost:3000"
+    ],
+    credentials: true,
+    methods: ["GET", "POST"],
+  },
+});
+
+const initializeChatSocket = require("./routes/Socket/chatSocket");
+initializeChatSocket(io);
 
 
 /* ---------------- Middleware ---------------- */
@@ -67,6 +88,21 @@ const userInvestmentRoutes = require('./routes/user_investment');
 const passwordManagerRoutes = require("./routes/passwordManager"); // <- see file below
 // const adminImpDocumentRouter = require("./routes/admin_impdocument");
 const adminImpDocumentRouter = require("./routes/imodocument");
+
+
+
+const chatAuthRouter = require("./routes/Chat_APP/chatauth");
+app.use("/api/chat-auth", chatAuthRouter);
+
+
+const chatRouter = require("./routes/chat");
+app.use("/api/chat", chatRouter);
+
+
+//NEW DPR API
+const monthDprRoutes = require("./routes/monthdpr");
+app.use("/api/monthdpr", monthDprRoutes);
+
 
 
 /* ---------------- Routes ---------------- */
@@ -174,12 +210,6 @@ app.use("/api/sitekharch", require("./routes/sitekharch_new"));
 
 app.use("/api/act_favorite", require("./routes/userActFavorite"));
 
-
-
-
-
-
-
 const addListFevActRoutes = require("./routes/addlistfevact");
 app.use("/api/add-list-actress", addListFevActRoutes);
 
@@ -188,7 +218,7 @@ app.use("/api/add-list-actress", addListFevActRoutes);
 
 
 /* ---------------- Health Check ---------------- */
-app.get("/health", (_req, res) => res.json({ status: "OK--(API LOAD START)" }));
+app.get("/health", (_req, res) => res.json({ status: "OK" }));
 
 /* ---------------- 404 ---------------- */
 app.use((req, res, next) => {
@@ -206,7 +236,6 @@ app.use((err, _req, res, _next) => {
 
 /* ---------------- Start Server ---------------- */
 const PORT = process.env.PORT || 5000;
-const server = app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`🚀 Server running at http://localhost:${PORT}`);
 });
-

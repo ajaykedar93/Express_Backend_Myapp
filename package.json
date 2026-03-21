@@ -3,11 +3,12 @@
     "bcryptjs": "^3.0.2",
     "body-parser": "^2.2.0",
     "compression": "^1.8.1",
-    "cors": "^2.8.5",
+    "type": "module",
+    "cors": "^2.8.6",
     "csv-stringify": "^6.6.0",
-    "dotenv": "^17.2.3",
+    "dotenv": "^17.3.1",
     "exceljs": "^4.4.0",
-    "express": "^5.1.0",
+    "express": "^5.2.1",
     "express-validator": "^7.2.1",
     "googleapis": "^164.1.0",
     "helmet": "^8.1.0",
@@ -16,14 +17,19 @@
     "jsonwebtoken": "^9.0.2",
     "jspdf": "^4.0.0",
     "moment": "^2.30.1",
+    "mongodb": "^7.1.0",
+    "mongoose": "^9.3.0",
     "morgan": "^1.10.1",
     "multer": "^2.0.2",
     "node-mailjet": "^6.0.9",
     "nodemailer": "^7.0.6",
     "pdfkit": "^0.17.2",
-    "pg": "^8.16.3"
+    "pg": "^8.16.3",
+    "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3"
+    
   },
   "devDependencies": {
-    "nodemon": "^3.1.10"
+    "nodemon": "^3.1.14"
   }
 }
