@@ -3,22 +3,12 @@ require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
-const compression = require("compression");
-
 const app = express();
 
+
+
 /* ---------------- Middleware ---------------- */
-app.use(compression());
-app.use(
-  cors({
-    origin: [
-      "http://localhost:5173",
-      "https://express-backend-myapp.onrender.com",
-      "http://localhost:3000",
-    ],
-    credentials: true,
-  })
-);
+app.use(cors());
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
@@ -27,9 +17,14 @@ app.use(express.urlencoded({ limit: "50mb", extended: true }));
 const moviesRouter = require("./routes/movies");
 const seriesRouter = require("./routes/series");
 const downloadRouter = require("./routes/download");
+const compression = require('compression');
+app.use(compression());
+app.use(cors({ origin: ["http://localhost:5173","https://express-backend-myapp.onrender.com", "http://localhost:3000"], credentials: true }));
+app.use(compression());
+
 
 // Generic categories
-const allCategoriesRouter = require("./routes/Allcategories");
+const allCategoriesRouter = require("./routes/Allcategories"); // mounted at /api
 const categoryRouterLegacy = require("./routes/category");
 const subcategoryRouterLegacy = require("./routes/subcategory");
 
@@ -38,12 +33,19 @@ const adminRouter = require("./routes/admin");
 const favoriteRouter = require("./routes/favorite");
 const libraryRouter = require("./routes/library");
 
+
+
+
 // Documents
 const documentRouter = require("./routes/document");
+
+
 
 // Work-related
 const workDetailsRouter = require("./routes/workdetails");
 const workCategoryRouter = require("./routes/workcategory");
+
+
 
 // Transactions / Summaries (legacy finance flows)
 const dailyTransactionRouter = require("./routes/dailyTransaction");
@@ -55,46 +57,27 @@ const financeTotalsRouter = require("./routes/financeTotals");
 const transactionCategoryRouter = require("./routes/transactioncategory");
 const transactionCategoryWiseRouter = require("./routes/transactionscategorywise");
 
-// Other routes
-const userInvestmentRoutes = require("./routes/user_investment");
-const passwordManagerRoutes = require("./routes/passwordManager");
+
+
+
+
+
+
+const userInvestmentRoutes = require('./routes/user_investment');
+const passwordManagerRoutes = require("./routes/passwordManager"); // <- see file below
+// const adminImpDocumentRouter = require("./routes/admin_impdocument");
 const adminImpDocumentRouter = require("./routes/imodocument");
 
-// NEW DPR API
-const monthDprRoutes = require("./routes/monthdpr");
-
-// Inward
-const inwardRoutes = require("./routes/inward");
-const inwardViewOnly = require("./routes/inwardViewOnly");
-
-// Investment module
-const investmentPlatformSegment = require("./routes/INVESTMENT/investment_platform_segment");
-const investmentPlan = require("./routes/INVESTMENT/investment_plan");
-const investmentTradingJournal = require("./routes/INVESTMENT/investment_tradingjournal");
-const investmentDipWid = require("./routes/INVESTMENT/investment_dipwid");
-const investmentGetViewTradingJournal = require("./routes/INVESTMENT/investment_getview_tradingjournal");
-
-// Notes / websites / favorites
-const notesMyAppRoutes = require("./routes/Notes/notesmyapp");
-const notesRoutes = require("./routes/notes");
-const websitesRoutes = require("./routes/websites");
-const sitekharchNewRoutes = require("./routes/sitekharch_new");
-const userActFavoriteRoutes = require("./routes/userActFavorite");
-const addListFevActRoutes = require("./routes/addlistfevact");
 
 /* ---------------- Routes ---------------- */
-
-// NEW DPR API
-app.use("/api/monthdpr", monthDprRoutes);
-
 // Media
 app.use("/api/movies", moviesRouter);
 app.use("/api/series", seriesRouter);
 app.use("/api/download", downloadRouter);
 
 // Generic categories
-app.use("/api", allCategoriesRouter);
-app.use("/api/category", categoryRouterLegacy);
+app.use("/api", allCategoriesRouter);            // e.g. /api/Allcategories endpoints
+app.use("/api/category", categoryRouterLegacy);  // legacy category endpoints
 app.use("/api/subcategory", subcategoryRouterLegacy);
 
 // Admin + favorites + library
@@ -107,52 +90,105 @@ app.use("/api/documents", documentRouter);
 
 // Work-related
 app.use("/api", workDetailsRouter);
-app.use("/api/workcategory", workCategoryRouter);
 
-// Inward
+const inwardRoutes = require("./routes/inward");
 app.use("/api/inward", inwardRoutes);
+// server.js / app.js
+const inwardViewOnly = require("./routes/inwardViewOnly");
 app.use("/api/inward-view", inwardViewOnly);
+
+
+app.use("/api/workcategory", workCategoryRouter);
 
 // Finance / transactions (legacy)
 app.use("/api/dailyTransaction", dailyTransactionRouter);
 app.use("/api/mainTransaction", mainTransactionRouter);
-app.use("/api", monthlySummaryRouterLegacy);
+app.use("/api", monthlySummaryRouterLegacy); // stays under its own internal subpaths
 app.use("/api", financeTotalsRouter);
 
 // Transaction categories
 app.use("/api/transaction-category", transactionCategoryRouter);
+// ❗ Fix: give the “categorywise” router its own unique base to avoid clashing
 app.use("/api/transaction-category", transactionCategoryWiseRouter);
 
+
+// Investment module (your new flows)
 // Investment Routes
+// =========================
+
+// 1. Platform & Segment
+const investmentPlatformSegment = require("./routes/INVESTMENT/investment_platform_segment");
 app.use("/api/investment/platform-segment", investmentPlatformSegment);
+
+// 2. Investment Plan
+const investmentPlan = require("./routes/INVESTMENT/investment_plan");
 app.use("/api/investment/plan", investmentPlan);
+
+// 3. Trading Journal (Create, Get, Delete)
+const investmentTradingJournal = require("./routes/INVESTMENT/investment_tradingjournal");
 app.use("/api/investment/tradingjournal", investmentTradingJournal);
+
+
+// 5. Deposit / Withdrawal
+const investmentDipWid = require("./routes/INVESTMENT/investment_dipwid");
 app.use("/api/investment/dipwid", investmentDipWid);
+
+// 6. Trading Journal Views (Daily summary, Entry details)
+const investmentGetViewTradingJournal = require("./routes/INVESTMENT/investment_getview_tradingjournal");
 app.use("/api/investment/tradingjournal-view", investmentGetViewTradingJournal);
+
+
+
+// NEW OVERALL P & L API
 app.use(
   "/api/investment/trading",
   require("./routes/INVESTMENT/investment_newapitrading")
 );
 
-// User investment
-app.use("/api/user_investment", userInvestmentRoutes);
 
-// Password manager
-app.use("/api", passwordManagerRoutes);
 
-// Notes / websites / documents / favorites
+
+
+
+// ✅ Import routes
+const notesMyAppRoutes = require("./routes/Notes/notesmyapp");
 app.use("/api/notes-myapp", notesMyAppRoutes);
-app.use("/api/notes", notesRoutes);
-app.use("/api", websitesRoutes);
+
+
+
+/* ---------- Routers (ONLY user_investment) ---------- */
+app.use("/api/user_investment", require("./routes/user_investment"));
+// Mount once at /api  (so /api/password-manager works)
+app.use("/api", require("./routes/passwordManager"));
+
+app.use("/api/notes", require("./routes/notes")); // ✅ Mount Notes API
+app.use("/api", require("./routes/websites")); // ✅ your router
+
+
 app.use("/api/admin_impdocument", adminImpDocumentRouter);
-app.use("/api/sitekharch", sitekharchNewRoutes);
-app.use("/api/act_favorite", userActFavoriteRoutes);
+
+
+// ✅ keep only new defensive one
+app.use("/api/sitekharch", require("./routes/sitekharch_new"));
+
+
+app.use("/api/act_favorite", require("./routes/userActFavorite"));
+
+
+
+
+
+
+
+const addListFevActRoutes = require("./routes/addlistfevact");
 app.use("/api/add-list-actress", addListFevActRoutes);
 
+
+
+
+
 /* ---------------- Health Check ---------------- */
-app.get("/health", (_req, res) => {
-  res.json({ status: "OK" });
-});
+app.get("/health", (_req, res) => res.json({ status: "OK--(API LOAD START)" }));
 
 /* ---------------- 404 ---------------- */
 app.use((req, res, next) => {
