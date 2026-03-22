@@ -8,8 +8,6 @@ const http = require("http");
 const { Server } = require("socket.io");
 const server = http.createServer(app);
 
-const connectMongoDB = require("./config/mongo");
-connectMongoDB();
 
 /* ---------------- Socket Setup ---------------- */
 const io = new Server(server, {
