@@ -184,6 +184,9 @@ const addListFevActRoutes = require("./routes/addlistfevact");
 app.use("/api/add-list-actress", addListFevActRoutes);
 
 
+// NEW DPR API
+const monthDprRoutes = require("./routes/monthdpr");
+app.use("/api/monthdpr", monthDprRoutes);
 
 
 
