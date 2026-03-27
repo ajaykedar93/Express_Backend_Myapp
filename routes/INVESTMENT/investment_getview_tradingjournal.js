@@ -5,7 +5,9 @@ const PDFDocument = require("pdfkit");
 const pool = require("../../db");
 const auth = require("../../middleware/auth");
 
-// ✅ strict rules
+// ==============================
+// Helpers
+// ==============================
 function validateProfitLossBrokerage({ profit, loss, brokerage }) {
   const p = Number(profit);
   const l = Number(loss);
@@ -41,66 +43,10 @@ function numberText(value) {
   return safeNumber(value).toFixed(2).replace(/\.00$/, "");
 }
 
-async function getTradingJournalRows({ userId, platformId, segmentId, planId, month }) {
-  const { rows } = await pool.query(
-    `
-    WITH chosen AS (
-      SELECT date_trunc(
-               'month',
-               COALESCE($5::date, date_trunc('month', now())::date)
-             )::date AS month_start
-    )
-    SELECT
-      j.journal_id,
-      j.user_id,
-
-      j.platform_id,
-      p.platform_name,
-
-      j.segment_id,
-      s.segment_name,
-
-      j.plan_id,
-      j.trade_date,
-      j.trade_name,
-
-      j.profit,
-      j.loss,
-      j.brokerage,
-
-      CASE
-        WHEN j.profit > 0 THEN j.profit - j.brokerage
-        WHEN j.loss > 0 THEN -(j.loss + j.brokerage)
-        ELSE 0
-      END AS net_total,
-
-      j.trade_logic,
-      j.mistakes,
-      j.created_at
-
-    FROM investment_tradingjournal j
-    JOIN chosen c
-      ON date_trunc('month', j.trade_date)::date = c.month_start
-
-    JOIN investment_platform p
-      ON p.user_id = j.user_id
-     AND p.platform_id = j.platform_id
-
-    JOIN investment_segment s
-      ON s.user_id = j.user_id
-     AND s.segment_id = j.segment_id
-
-    WHERE j.user_id = $1
-      AND ($2::bigint IS NULL OR j.platform_id = $2)
-      AND ($3::bigint IS NULL OR j.segment_id = $3)
-      AND ($4::bigint IS NULL OR j.plan_id = $4)
-
-    ORDER BY j.trade_date DESC, j.journal_id DESC
-    `,
-    [userId, platformId, segmentId, planId, month]
-  );
-
-  return rows;
+function cleanText(value) {
+  if (value === null || value === undefined) return "-";
+  const text = String(value).replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+  return text || "-";
 }
 
 function getFilterParams(req) {
@@ -130,9 +76,60 @@ function calcTotals(rows) {
   );
 }
 
-/**
- * ✅ GET /daily-summary
- */
+async function getTradingJournalRows({ userId, platformId, segmentId, planId, month }) {
+  const { rows } = await pool.query(
+    `
+    WITH chosen AS (
+      SELECT date_trunc(
+               'month',
+               COALESCE($5::date, date_trunc('month', now())::date)
+             )::date AS month_start
+    )
+    SELECT
+      j.journal_id,
+      j.user_id,
+      j.platform_id,
+      p.platform_name,
+      j.segment_id,
+      s.segment_name,
+      j.plan_id,
+      j.trade_date,
+      j.trade_name,
+      j.profit,
+      j.loss,
+      j.brokerage,
+      CASE
+        WHEN j.profit > 0 THEN j.profit - j.brokerage
+        WHEN j.loss > 0 THEN -(j.loss + j.brokerage)
+        ELSE 0
+      END AS net_total,
+      j.trade_logic,
+      j.mistakes,
+      j.created_at
+    FROM investment_tradingjournal j
+    JOIN chosen c
+      ON date_trunc('month', j.trade_date)::date = c.month_start
+    JOIN investment_platform p
+      ON p.user_id = j.user_id
+     AND p.platform_id = j.platform_id
+    JOIN investment_segment s
+      ON s.user_id = j.user_id
+     AND s.segment_id = j.segment_id
+    WHERE j.user_id = $1
+      AND ($2::bigint IS NULL OR j.platform_id = $2)
+      AND ($3::bigint IS NULL OR j.segment_id = $3)
+      AND ($4::bigint IS NULL OR j.plan_id = $4)
+    ORDER BY j.trade_date DESC, j.journal_id DESC
+    `,
+    [userId, platformId, segmentId, planId, month]
+  );
+
+  return rows;
+}
+
+// ==============================
+// GET /daily-summary
+// ==============================
 router.get("/daily-summary", auth, async (req, res) => {
   const userId = req.user.user_id;
   const { platformId, segmentId, planId, month } = getFilterParams(req);
@@ -152,10 +149,9 @@ router.get("/daily-summary", auth, async (req, res) => {
   }
 });
 
-/**
- * ✅ GET /export/txt
- * Download as text file
- */
+// ==============================
+// GET /export/txt
+// ==============================
 router.get("/export/txt", auth, async (req, res) => {
   const userId = req.user.user_id;
   const { platformId, segmentId, planId, month } = getFilterParams(req);
@@ -170,43 +166,46 @@ router.get("/export/txt", auth, async (req, res) => {
     });
 
     const totals = calcTotals(rows);
-
     const selectedMonth = month || new Date().toISOString().slice(0, 7) + "-01";
-    const lines = [];
 
+    const lines = [];
     lines.push("TRADING JOURNAL REPORT");
-    lines.push("============================================================");
-    lines.push(`Month        : ${selectedMonth}`);
-    lines.push(`Platform Id  : ${platformId ?? "All"}`);
-    lines.push(`Segment Id   : ${segmentId ?? "All"}`);
-    lines.push(`Plan Id      : ${planId ?? "All"}`);
-    lines.push(`Total Rows   : ${rows.length}`);
-    lines.push("============================================================");
-    lines.push(`Total Profit    : ${numberText(totals.totalProfit)}`);
-    lines.push(`Total Loss      : ${numberText(totals.totalLoss)}`);
-    lines.push(`Total Brokerage : ${numberText(totals.totalBrokerage)}`);
-    lines.push(`Overall Net     : ${numberText(totals.totalNet)}`);
-    lines.push("============================================================");
+    lines.push("======================================================================");
+    lines.push(`Month            : ${selectedMonth}`);
+    lines.push(`Platform Id      : ${platformId ?? "All"}`);
+    lines.push(`Segment Id       : ${segmentId ?? "All"}`);
+    lines.push(`Plan Id          : ${planId ?? "All"}`);
+    lines.push(`Total Rows       : ${rows.length}`);
+    lines.push("----------------------------------------------------------------------");
+    lines.push(`Total Profit     : ${numberText(totals.totalProfit)}`);
+    lines.push(`Total Loss       : ${numberText(totals.totalLoss)}`);
+    lines.push(`Total Brokerage  : ${numberText(totals.totalBrokerage)}`);
+    lines.push(`Overall Net      : ${numberText(totals.totalNet)}`);
+    lines.push("======================================================================");
     lines.push("");
 
     rows.forEach((row, index) => {
-      lines.push(`Entry #${index + 1}`);
-      lines.push("------------------------------------------------------------");
-      lines.push(`Journal ID   : ${row.journal_id}`);
-      lines.push(`Date         : ${formatDateOnly(row.trade_date)}`);
-      lines.push(`Trade Name   : ${row.trade_name || "-"}`);
-      lines.push(`Platform     : ${row.platform_name || "-"}`);
-      lines.push(`Segment      : ${row.segment_name || "-"}`);
-      lines.push(`Profit       : ${numberText(row.profit)}`);
-      lines.push(`Loss         : ${numberText(row.loss)}`);
-      lines.push(`Brokerage    : ${numberText(row.brokerage)}`);
-      lines.push(`Net Total    : ${numberText(row.net_total)}`);
-      lines.push(`Trade Logic  : ${row.trade_logic || "-"}`);
-      lines.push(`Mistakes     : ${row.mistakes || "-"}`);
+      lines.push(`ENTRY #${index + 1}`);
+      lines.push("----------------------------------------------------------------------");
+      lines.push(`Journal ID       : ${row.journal_id}`);
+      lines.push(`Date             : ${formatDateOnly(row.trade_date)}`);
+      lines.push(`Trade Name       : ${cleanText(row.trade_name)}`);
+      lines.push(`Platform         : ${cleanText(row.platform_name)}`);
+      lines.push(`Segment          : ${cleanText(row.segment_name)}`);
+      lines.push(`Profit           : ${numberText(row.profit)}`);
+      lines.push(`Loss             : ${numberText(row.loss)}`);
+      lines.push(`Brokerage        : ${numberText(row.brokerage)}`);
+      lines.push(`Net Total        : ${numberText(row.net_total)}`);
+      lines.push("");
+      lines.push("Trade Logic:");
+      lines.push(cleanText(row.trade_logic));
+      lines.push("");
+      lines.push("Mistakes:");
+      lines.push(cleanText(row.mistakes));
+      lines.push("");
+      lines.push("======================================================================");
       lines.push("");
     });
-
-    const content = lines.join("\n");
 
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
     res.setHeader(
@@ -214,16 +213,15 @@ router.get("/export/txt", auth, async (req, res) => {
       `attachment; filename="trading_journal_${Date.now()}.txt"`
     );
 
-    res.send(content);
+    res.send(lines.join("\n"));
   } catch (e) {
     res.status(500).json({ message: "TXT export failed", error: e.message });
   }
 });
 
-/**
- * ✅ GET /export/pdf
- * Download as professional PDF
- */
+// ==============================
+// GET /export/pdf
+// ==============================
 router.get("/export/pdf", auth, async (req, res) => {
   const userId = req.user.user_id;
   const { platformId, segmentId, planId, month } = getFilterParams(req);
@@ -241,7 +239,7 @@ router.get("/export/pdf", auth, async (req, res) => {
 
     const doc = new PDFDocument({
       size: "A4",
-      margin: 35,
+      margins: { top: 32, bottom: 32, left: 28, right: 28 },
       bufferPages: true,
     });
 
@@ -255,22 +253,25 @@ router.get("/export/pdf", auth, async (req, res) => {
 
     const pageWidth = doc.page.width;
     const pageHeight = doc.page.height;
-    const margin = 35;
-    const contentWidth = pageWidth - margin * 2;
+    const marginLeft = 28;
+    const marginRight = 28;
+    const marginTop = 32;
+    const marginBottom = 32;
+    const contentWidth = pageWidth - marginLeft - marginRight;
 
     const col = {
-      sr: 35,
-      date: 65,
-      trade: 95,
-      platform: 60,
-      segment: 60,
-      profit: 45,
-      loss: 45,
-      brokerage: 55,
-      net: 50,
+      sr: 24,
+      date: 62,
+      trade: 92,
+      platform: 58,
+      segment: 58,
+      profit: 44,
+      loss: 44,
+      brokerage: 58,
+      net: 48,
     };
 
-    const detailBoxWidth = contentWidth - (
+    const tableWidth =
       col.sr +
       col.date +
       col.trade +
@@ -279,78 +280,109 @@ router.get("/export/pdf", auth, async (req, res) => {
       col.profit +
       col.loss +
       col.brokerage +
-      col.net
-    ) - 20;
+      col.net;
 
-    const tradeLogicWidth = Math.floor(detailBoxWidth / 2) - 10;
-    const mistakesWidth = detailBoxWidth - tradeLogicWidth - 10;
+    let y = marginTop;
 
-    const tableStartX = margin;
-    let y = margin;
+    function ensureSpace(requiredHeight) {
+      if (y + requiredHeight > pageHeight - marginBottom) {
+        doc.addPage();
+        y = marginTop;
+      }
+    }
 
-    function drawHeaderBlock() {
+    function drawPageTitle() {
+      ensureSpace(150);
+
+      doc.roundedRect(marginLeft, y, contentWidth, 62, 10).fill("#0f172a");
+
       doc
-        .roundedRect(margin, y, contentWidth, 72, 10)
-        .fillAndStroke("#111111", "#111111");
-
-      doc
-        .fillColor("#FFFFFF")
+        .fillColor("#ffffff")
         .font("Helvetica-Bold")
-        .fontSize(20)
-        .text("TRADING JOURNAL REPORT", margin + 15, y + 14, {
-          width: contentWidth - 30,
+        .fontSize(19)
+        .text("TRADING JOURNAL REPORT", marginLeft + 14, y + 14, {
+          width: contentWidth - 28,
           align: "left",
         });
 
       doc
+        .fillColor("#cbd5e1")
         .font("Helvetica")
-        .fontSize(10)
-        .fillColor("#E5E7EB")
-        .text(`Generated: ${new Date().toLocaleString()}`, margin + 15, y + 43);
+        .fontSize(9)
+        .text(`Generated: ${new Date().toLocaleString()}`, marginLeft + 14, y + 39, {
+          width: contentWidth - 28,
+          align: "left",
+        });
 
-      y += 85;
+      y += 74;
 
-      doc
-        .roundedRect(margin, y, contentWidth, 62, 8)
-        .fillAndStroke("#F8FAFC", "#D1D5DB");
+      doc.roundedRect(marginLeft, y, contentWidth, 54, 8).fill("#f8fafc").stroke("#cbd5e1");
 
-      doc.fillColor("#111111").font("Helvetica-Bold").fontSize(11);
-      doc.text(`Month: ${month || "Current Month"}`, margin + 12, y + 10);
-      doc.text(`Platform: ${platformId ?? "All"}`, margin + 220, y + 10);
-      doc.text(`Segment: ${segmentId ?? "All"}`, margin + 380, y + 10);
+      doc.fillColor("#111827").font("Helvetica-Bold").fontSize(10);
+      doc.text(`Month: ${month || "Current Month"}`, marginLeft + 12, y + 10);
+      doc.text(`Platform: ${platformId ?? "All"}`, marginLeft + 190, y + 10);
+      doc.text(`Segment: ${segmentId ?? "All"}`, marginLeft + 360, y + 10);
+      doc.text(`Plan: ${planId ?? "All"}`, marginLeft + 12, y + 30);
+      doc.text(`Total Rows: ${rows.length}`, marginLeft + 190, y + 30);
 
-      doc.text(`Plan: ${planId ?? "All"}`, margin + 12, y + 32);
-      doc.text(`Total Rows: ${rows.length}`, margin + 220, y + 32);
+      y += 66;
 
-      y += 75;
-
-      const boxGap = 10;
-      const boxW = (contentWidth - boxGap * 3) / 4;
-      const boxH = 52;
+      const gap = 8;
+      const statW = (contentWidth - gap * 3) / 4;
+      const statH = 48;
 
       const stats = [
-        { label: "TOTAL PROFIT", value: numberText(totals.totalProfit), fill: "#ECFDF5", stroke: "#86EFAC", text: "#166534" },
-        { label: "TOTAL LOSS", value: numberText(totals.totalLoss), fill: "#FEF2F2", stroke: "#FCA5A5", text: "#B91C1C" },
-        { label: "BROKERAGE", value: numberText(totals.totalBrokerage), fill: "#EFF6FF", stroke: "#93C5FD", text: "#1D4ED8" },
-        { label: "OVERALL NET", value: numberText(totals.totalNet), fill: "#F8FAFC", stroke: "#CBD5E1", text: "#111827" },
+        {
+          x: marginLeft,
+          label: "TOTAL PROFIT",
+          value: numberText(totals.totalProfit),
+          fill: "#ecfdf5",
+          stroke: "#86efac",
+          valueColor: "#166534",
+        },
+        {
+          x: marginLeft + (statW + gap),
+          label: "TOTAL LOSS",
+          value: numberText(totals.totalLoss),
+          fill: "#fef2f2",
+          stroke: "#fca5a5",
+          valueColor: "#b91c1c",
+        },
+        {
+          x: marginLeft + (statW + gap) * 2,
+          label: "BROKERAGE",
+          value: numberText(totals.totalBrokerage),
+          fill: "#eff6ff",
+          stroke: "#93c5fd",
+          valueColor: "#1d4ed8",
+        },
+        {
+          x: marginLeft + (statW + gap) * 3,
+          label: "OVERALL NET",
+          value: numberText(totals.totalNet),
+          fill: "#f8fafc",
+          stroke: "#cbd5e1",
+          valueColor: totals.totalNet >= 0 ? "#166534" : "#b91c1c",
+        },
       ];
 
-      stats.forEach((item, i) => {
-        const x = margin + i * (boxW + boxGap);
-        doc.roundedRect(x, y, boxW, boxH, 8).fillAndStroke(item.fill, item.stroke);
-        doc.fillColor("#64748B").font("Helvetica-Bold").fontSize(8).text(item.label, x + 10, y + 10);
-        doc.fillColor(item.text).font("Helvetica-Bold").fontSize(14).text(item.value, x + 10, y + 25);
+      stats.forEach((item) => {
+        doc.roundedRect(item.x, y, statW, statH, 8).fill(item.fill).stroke(item.stroke);
+        doc.fillColor("#64748b").font("Helvetica-Bold").fontSize(7.5)
+          .text(item.label, item.x + 8, y + 8, { width: statW - 16 });
+        doc.fillColor(item.valueColor).font("Helvetica-Bold").fontSize(12)
+          .text(item.value, item.x + 8, y + 23, { width: statW - 16 });
       });
 
-      y += boxH + 18;
+      y += statH + 16;
     }
 
     function drawTableHeader() {
-      const headerHeight = 26;
+      ensureSpace(28);
 
-      doc.roundedRect(tableStartX, y, contentWidth, headerHeight, 4).fillAndStroke("#111827", "#111827");
+      doc.roundedRect(marginLeft, y, tableWidth, 24, 4).fill("#0f172a");
 
-      let x = tableStartX;
+      let x = marginLeft;
       const headers = [
         ["No", col.sr],
         ["Date", col.date],
@@ -361,14 +393,13 @@ router.get("/export/pdf", auth, async (req, res) => {
         ["Loss", col.loss],
         ["Brokerage", col.brokerage],
         ["Net", col.net],
-        ["Trade Logic / Mistakes", detailBoxWidth],
       ];
 
       headers.forEach(([label, width]) => {
         doc
-          .fillColor("#FFFFFF")
+          .fillColor("#ffffff")
           .font("Helvetica-Bold")
-          .fontSize(8)
+          .fontSize(7.5)
           .text(label, x + 4, y + 8, {
             width: width - 8,
             align: "left",
@@ -376,118 +407,12 @@ router.get("/export/pdf", auth, async (req, res) => {
         x += width;
       });
 
-      y += headerHeight;
+      y += 24;
     }
 
-    function pageBreakIfNeeded(requiredHeight) {
-      if (y + requiredHeight > pageHeight - margin - 30) {
-        doc.addPage();
-        y = margin;
-        drawTableHeader();
-      }
-    }
-
-    function rowHeight(row, index) {
-      const logicText = row.trade_logic || "-";
-      const mistakesText = row.mistakes || "-";
-
-      const basicHeight = Math.max(
-        doc.heightOfString(String(index + 1), { width: col.sr - 8, align: "left" }),
-        doc.heightOfString(formatDateOnly(row.trade_date), { width: col.date - 8, align: "left" }),
-        doc.heightOfString(row.trade_name || "-", { width: col.trade - 8, align: "left" }),
-        doc.heightOfString(row.platform_name || "-", { width: col.platform - 8, align: "left" }),
-        doc.heightOfString(row.segment_name || "-", { width: col.segment - 8, align: "left" }),
-        doc.heightOfString(numberText(row.profit), { width: col.profit - 8, align: "left" }),
-        doc.heightOfString(numberText(row.loss), { width: col.loss - 8, align: "left" }),
-        doc.heightOfString(numberText(row.brokerage), { width: col.brokerage - 8, align: "left" }),
-        doc.heightOfString(numberText(row.net_total), { width: col.net - 8, align: "left" })
-      );
-
-      const logicLabelHeight = doc.heightOfString("Trade Logic:", {
-        width: tradeLogicWidth - 8,
-      });
-      const logicHeight = doc.heightOfString(logicText, {
-        width: tradeLogicWidth - 8,
-        align: "left",
-      });
-
-      const mistakesLabelHeight = doc.heightOfString("Mistakes:", {
-        width: mistakesWidth - 8,
-      });
-      const mistakesHeight = doc.heightOfString(mistakesText, {
-        width: mistakesWidth - 8,
-        align: "left",
-      });
-
-      const detailHeight = Math.max(
-        logicLabelHeight + logicHeight + 8,
-        mistakesLabelHeight + mistakesHeight + 8
-      );
-
-      return Math.max(basicHeight, detailHeight) + 16;
-    }
-
-    function drawRow(row, index) {
-      const h = rowHeight(row, index);
-      pageBreakIfNeeded(h);
-
-      doc
-        .rect(tableStartX, y, contentWidth, h)
-        .fillAndStroke(index % 2 === 0 ? "#FFFFFF" : "#F8FAFC", "#E5E7EB");
-
-      let x = tableStartX;
-
-      const normalFont = "Helvetica";
-      const boldFont = "Helvetica-Bold";
-      const topY = y + 8;
-
-      function cellText(text, width, color = "#111111", font = normalFont, size = 8) {
-        doc.fillColor(color).font(font).fontSize(size).text(String(text ?? "-"), x + 4, topY, {
-          width: width - 8,
-          align: "left",
-        });
-        x += width;
-      }
-
-      cellText(index + 1, col.sr, "#111111", boldFont, 8);
-      cellText(formatDateOnly(row.trade_date), col.date, "#111111", normalFont, 8);
-      cellText(row.trade_name || "-", col.trade, "#111111", boldFont, 8);
-      cellText(row.platform_name || "-", col.platform, "#111111", normalFont, 8);
-      cellText(row.segment_name || "-", col.segment, "#111111", normalFont, 8);
-      cellText(numberText(row.profit), col.profit, "#166534", boldFont, 8);
-      cellText(numberText(row.loss), col.loss, "#B91C1C", boldFont, 8);
-      cellText(numberText(row.brokerage), col.brokerage, "#1D4ED8", boldFont, 8);
-      cellText(numberText(row.net_total), col.net, row.net_total >= 0 ? "#166534" : "#B91C1C", boldFont, 8);
-
-      const detailX = x;
-
-      const logicX = detailX + 4;
-      const mistakesX = detailX + tradeLogicWidth + 6;
-
-      doc.fillColor("#111111").font("Helvetica-Bold").fontSize(8).text("Trade Logic:", logicX, topY, {
-        width: tradeLogicWidth - 8,
-      });
-
-      const logicLabelH = doc.heightOfString("Trade Logic:", { width: tradeLogicWidth - 8 });
-
-      doc.fillColor("#111111").font("Helvetica").fontSize(8).text(row.trade_logic || "-", logicX, topY + logicLabelH + 2, {
-        width: tradeLogicWidth - 8,
-        align: "left",
-      });
-
-      doc.fillColor("#B91C1C").font("Helvetica-Bold").fontSize(8).text("Mistakes:", mistakesX, topY, {
-        width: mistakesWidth - 8,
-      });
-
-      const mistakesLabelH = doc.heightOfString("Mistakes:", { width: mistakesWidth - 8 });
-
-      doc.fillColor("#B91C1C").font("Helvetica").fontSize(8).text(row.mistakes || "-", mistakesX, topY + mistakesLabelH + 2, {
-        width: mistakesWidth - 8,
-        align: "left",
-      });
-
-      let lineX = tableStartX;
-      [
+    function drawVerticalLines(rowTop, rowHeight) {
+      let x = marginLeft;
+      const widths = [
         col.sr,
         col.date,
         col.trade,
@@ -497,15 +422,142 @@ router.get("/export/pdf", auth, async (req, res) => {
         col.loss,
         col.brokerage,
         col.net,
-        detailBoxWidth,
-      ].forEach((w, idx, arr) => {
-        if (idx < arr.length - 1) {
-          lineX += w;
-          doc.moveTo(lineX, y).lineTo(lineX, y + h).strokeColor("#E5E7EB").stroke();
-        }
+      ];
+
+      for (let i = 0; i < widths.length - 1; i++) {
+        x += widths[i];
+        doc.moveTo(x, rowTop).lineTo(x, rowTop + rowHeight).strokeColor("#e5e7eb").stroke();
+      }
+    }
+
+    function getMainRowHeight(row, index) {
+      const size = 8;
+
+      return Math.max(
+        doc.heightOfString(String(index + 1), { width: col.sr - 8, align: "left" }),
+        doc.heightOfString(formatDateOnly(row.trade_date), { width: col.date - 8, align: "left" }),
+        doc.heightOfString(cleanText(row.trade_name), { width: col.trade - 8, align: "left" }),
+        doc.heightOfString(cleanText(row.platform_name), { width: col.platform - 8, align: "left" }),
+        doc.heightOfString(cleanText(row.segment_name), { width: col.segment - 8, align: "left" }),
+        doc.heightOfString(numberText(row.profit), { width: col.profit - 8, align: "left" }),
+        doc.heightOfString(numberText(row.loss), { width: col.loss - 8, align: "left" }),
+        doc.heightOfString(numberText(row.brokerage), { width: col.brokerage - 8, align: "left" }),
+        doc.heightOfString(numberText(row.net_total), { width: col.net - 8, align: "left" }),
+        14
+      ) + 12;
+    }
+
+    function getDetailBlockHeight(row) {
+      const boxWidth = contentWidth;
+      const innerWidth = boxWidth - 22;
+
+      const logicTitleH = doc.heightOfString("Trade Logic", {
+        width: innerWidth,
+        align: "left",
       });
 
+      const logicTextH = doc.heightOfString(cleanText(row.trade_logic), {
+        width: innerWidth,
+        align: "left",
+      });
+
+      const mistakesTitleH = doc.heightOfString("Mistakes", {
+        width: innerWidth,
+        align: "left",
+      });
+
+      const mistakesTextH = doc.heightOfString(cleanText(row.mistakes), {
+        width: innerWidth,
+        align: "left",
+      });
+
+      return logicTitleH + logicTextH + mistakesTitleH + mistakesTextH + 34;
+    }
+
+    function drawMainRow(row, index) {
+      const h = getMainRowHeight(row, index);
+      ensureSpace(h + 10);
+
+      const rowTop = y;
+
+      doc.rect(marginLeft, y, tableWidth, h).fill(index % 2 === 0 ? "#ffffff" : "#f8fafc").stroke("#e5e7eb");
+
+      let x = marginLeft;
+      const topY = y + 6;
+
+      function drawCell(text, width, color = "#111111", font = "Helvetica", size = 8) {
+        doc.fillColor(color).font(font).fontSize(size).text(String(text ?? "-"), x + 4, topY, {
+          width: width - 8,
+          align: "left",
+        });
+        x += width;
+      }
+
+      drawCell(index + 1, col.sr, "#111111", "Helvetica-Bold", 8);
+      drawCell(formatDateOnly(row.trade_date), col.date, "#111111", "Helvetica", 8);
+      drawCell(cleanText(row.trade_name), col.trade, "#111111", "Helvetica-Bold", 8);
+      drawCell(cleanText(row.platform_name), col.platform, "#111111", "Helvetica", 8);
+      drawCell(cleanText(row.segment_name), col.segment, "#111111", "Helvetica", 8);
+      drawCell(numberText(row.profit), col.profit, "#166534", "Helvetica-Bold", 8);
+      drawCell(numberText(row.loss), col.loss, "#dc2626", "Helvetica-Bold", 8);
+      drawCell(numberText(row.brokerage), col.brokerage, "#1d4ed8", "Helvetica-Bold", 8);
+      drawCell(
+        numberText(row.net_total),
+        col.net,
+        safeNumber(row.net_total) >= 0 ? "#166534" : "#b91c1c",
+        "Helvetica-Bold",
+        8
+      );
+
+      drawVerticalLines(rowTop, h);
       y += h;
+    }
+
+    function drawDetailBlock(row) {
+      const h = getDetailBlockHeight(row);
+      ensureSpace(h + 12);
+
+      const boxX = marginLeft;
+      const boxY = y + 4;
+      const boxW = contentWidth;
+
+      doc.roundedRect(boxX, boxY, boxW, h, 8).fill("#ffffff").stroke("#dbeafe");
+
+      const innerX = boxX + 11;
+      let innerY = boxY + 10;
+      const innerW = boxW - 22;
+
+      doc.fillColor("#111111").font("Helvetica-Bold").fontSize(9)
+        .text("Trade Logic", innerX, innerY, { width: innerW, align: "left" });
+
+      innerY += doc.heightOfString("Trade Logic", { width: innerW, align: "left" }) + 4;
+
+      doc.fillColor("#111111").font("Helvetica").fontSize(8.5)
+        .text(cleanText(row.trade_logic), innerX, innerY, {
+          width: innerW,
+          align: "left",
+          lineGap: 1.5,
+        });
+
+      innerY += doc.heightOfString(cleanText(row.trade_logic), {
+        width: innerW,
+        align: "left",
+        lineGap: 1.5,
+      }) + 8;
+
+      doc.fillColor("#b91c1c").font("Helvetica-Bold").fontSize(9)
+        .text("Mistakes", innerX, innerY, { width: innerW, align: "left" });
+
+      innerY += doc.heightOfString("Mistakes", { width: innerW, align: "left" }) + 4;
+
+      doc.fillColor("#dc2626").font("Helvetica").fontSize(8.5)
+        .text(cleanText(row.mistakes), innerX, innerY, {
+          width: innerW,
+          align: "left",
+          lineGap: 1.5,
+        });
+
+      y = boxY + h + 8;
     }
 
     function drawFooter() {
@@ -515,30 +567,42 @@ router.get("/export/pdf", auth, async (req, res) => {
         doc
           .font("Helvetica")
           .fontSize(8)
-          .fillColor("#64748B")
-          .text(
-            `Page ${i + 1} of ${range.count}`,
-            margin,
-            pageHeight - 22,
-            { align: "center", width: contentWidth }
-          );
+          .fillColor("#64748b")
+          .text(`Page ${i + 1} of ${range.count}`, marginLeft, pageHeight - 20, {
+            align: "center",
+            width: contentWidth,
+          });
       }
     }
 
-    drawHeaderBlock();
-    drawTableHeader();
+    drawPageTitle();
 
     if (!rows.length) {
+      ensureSpace(40);
       doc
         .fillColor("#111111")
         .font("Helvetica-Bold")
         .fontSize(12)
-        .text("No trading journal data found for selected filters.", margin, y + 20, {
+        .text("No trading journal data found for selected filters.", marginLeft, y + 10, {
           width: contentWidth,
           align: "center",
         });
     } else {
-      rows.forEach((row, index) => drawRow(row, index));
+      drawTableHeader();
+
+      rows.forEach((row, index) => {
+        const mainH = getMainRowHeight(row, index);
+        const detailH = getDetailBlockHeight(row);
+
+        if (y + mainH + detailH + 12 > pageHeight - marginBottom) {
+          doc.addPage();
+          y = marginTop;
+          drawTableHeader();
+        }
+
+        drawMainRow(row, index);
+        drawDetailBlock(row);
+      });
     }
 
     drawFooter();
@@ -548,13 +612,16 @@ router.get("/export/pdf", auth, async (req, res) => {
   }
 });
 
-/**
- * ✅ PUT /:id  (update row)
- */
+// ==============================
+// PUT /:id
+// ==============================
 router.put("/:id", auth, async (req, res) => {
   const userId = req.user.user_id;
   const journalId = Number(req.params.id);
-  if (!journalId) return res.status(400).json({ message: "Invalid journal_id" });
+
+  if (!journalId) {
+    return res.status(400).json({ message: "Invalid journal_id" });
+  }
 
   const {
     platform_id,
@@ -582,7 +649,7 @@ router.put("/:id", auth, async (req, res) => {
     return res.status(400).json({ message: "trade_name required (Index/Company/Symbol)" });
   }
 
-  if (!trade_logic?.trim()) {
+  if (!String(trade_logic || "").trim()) {
     return res.status(400).json({ message: "trade_logic required" });
   }
 
@@ -590,6 +657,7 @@ router.put("/:id", auth, async (req, res) => {
   if (v) return res.status(400).json({ message: v });
 
   const client = await pool.connect();
+
   try {
     await client.query("BEGIN");
 
@@ -659,7 +727,11 @@ router.put("/:id", auth, async (req, res) => {
         profit,
         loss,
         brokerage,
-        net_pnl,
+        CASE
+          WHEN profit > 0 THEN profit - brokerage
+          WHEN loss > 0 THEN -(loss + brokerage)
+          ELSE 0
+        END AS net_total,
         trade_logic,
         mistakes,
         created_at
@@ -673,8 +745,8 @@ router.put("/:id", auth, async (req, res) => {
         Math.trunc(Number(profit)),
         Math.trunc(Number(loss)),
         Math.trunc(Number(brokerage)),
-        trade_logic.trim(),
-        mistakes?.trim() ? mistakes.trim() : null,
+        String(trade_logic).trim(),
+        String(mistakes || "").trim() ? String(mistakes).trim() : null,
         userId,
         journalId,
       ]
@@ -690,9 +762,9 @@ router.put("/:id", auth, async (req, res) => {
   }
 });
 
-/**
- * ✅ DELETE /:id
- */
+// ==============================
+// DELETE /:id
+// ==============================
 router.delete("/:id", auth, async (req, res) => {
   const userId = req.user.user_id;
   const id = Number(req.params.id);
