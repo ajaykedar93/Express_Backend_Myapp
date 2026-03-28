@@ -49,6 +49,16 @@ function cleanText(value) {
   return text || "-";
 }
 
+function cleanOptionalText(value) {
+  if (value === null || value === undefined) return "";
+  const text = String(value).replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+  return text || "";
+}
+
+function hasRealText(value) {
+  return cleanOptionalText(value).length > 0;
+}
+
 function getFilterParams(req) {
   return {
     platformId: req.query.platform_id ? Number(req.query.platform_id) : null,
@@ -226,12 +236,19 @@ router.get("/export/txt", auth, async (req, res) => {
       lines.push(`Loss             : ${numberText(row.loss)}`);
       lines.push(`Brokerage        : ${numberText(row.brokerage)}`);
       lines.push(`Net Total        : ${numberText(row.net_total)}`);
-      lines.push("");
-      lines.push("Trade Logic:");
-      lines.push(cleanText(row.trade_logic));
-      lines.push("");
-      lines.push("Mistakes:");
-      lines.push(cleanText(row.mistakes));
+
+      if (hasRealText(row.trade_logic)) {
+        lines.push("");
+        lines.push("Trade Logic:");
+        lines.push(cleanOptionalText(row.trade_logic));
+      }
+
+      if (hasRealText(row.mistakes)) {
+        lines.push("");
+        lines.push("Mistakes:");
+        lines.push(cleanOptionalText(row.mistakes));
+      }
+
       lines.push("");
       lines.push("======================================================================");
       lines.push("");
@@ -334,23 +351,13 @@ router.get("/export/pdf", auth, async (req, res) => {
       col.net;
 
     let y = marginTop;
-    let isFirstPage = true;
 
     function addNewPage() {
       doc.addPage();
       y = marginTop;
-      isFirstPage = false;
-    }
-
-    function ensureSpace(requiredHeight) {
-      if (y + requiredHeight > pageHeight - marginBottom) {
-        addNewPage();
-      }
     }
 
     function drawReportHeader() {
-      ensureSpace(132);
-
       doc.roundedRect(marginLeft, y, contentWidth, 58, 12).fill("#0f172a");
 
       doc
@@ -430,8 +437,6 @@ router.get("/export/pdf", auth, async (req, res) => {
     }
 
     function drawMetaRow() {
-      ensureSpace(30);
-
       doc
         .roundedRect(marginLeft, y, contentWidth, 26, 6)
         .fill("#f8fafc")
@@ -447,8 +452,6 @@ router.get("/export/pdf", auth, async (req, res) => {
     }
 
     function drawTableHeader() {
-      ensureSpace(28);
-
       doc.roundedRect(marginLeft, y, tableWidth, 24, 4).fill("#0f172a");
 
       let x = marginLeft;
@@ -524,26 +527,32 @@ router.get("/export/pdf", auth, async (req, res) => {
     function getDetailBlockHeight(row) {
       const boxWidth = contentWidth;
       const innerWidth = boxWidth - 20;
+      let height = 0;
 
-      const logicTitleH = doc.heightOfString("Trade Logic", { width: innerWidth });
-      const logicTextH = doc.heightOfString(cleanText(row.trade_logic), {
-        width: innerWidth,
-        lineGap: 2,
-      });
+      if (hasRealText(row.trade_logic)) {
+        const logicTitleH = doc.heightOfString("Trade Logic", { width: innerWidth });
+        const logicTextH = doc.heightOfString(cleanOptionalText(row.trade_logic), {
+          width: innerWidth,
+          lineGap: 2,
+        });
+        height += logicTitleH + logicTextH + 14;
+      }
 
-      const mistakesTitleH = doc.heightOfString("Mistakes", { width: innerWidth });
-      const mistakesTextH = doc.heightOfString(cleanText(row.mistakes), {
-        width: innerWidth,
-        lineGap: 2,
-      });
+      if (hasRealText(row.mistakes)) {
+        const mistakesTitleH = doc.heightOfString("Mistakes", { width: innerWidth });
+        const mistakesTextH = doc.heightOfString(cleanOptionalText(row.mistakes), {
+          width: innerWidth,
+          lineGap: 2,
+        });
+        height += mistakesTitleH + mistakesTextH + 14;
+      }
 
-      return logicTitleH + logicTextH + mistakesTitleH + mistakesTextH + 34;
+      if (height === 0) return 0;
+      return height + 16;
     }
 
     function drawMainRow(row, index) {
       const h = getMainRowHeight(row, index);
-      ensureSpace(h + 6);
-
       const rowTop = y;
 
       doc
@@ -587,9 +596,12 @@ router.get("/export/pdf", auth, async (req, res) => {
     }
 
     function drawDetailBlock(row) {
-      const h = getDetailBlockHeight(row);
-      ensureSpace(h + 10);
+      const hasLogic = hasRealText(row.trade_logic);
+      const hasMistakes = hasRealText(row.mistakes);
 
+      if (!hasLogic && !hasMistakes) return;
+
+      const h = getDetailBlockHeight(row);
       const boxX = marginLeft;
       const boxY = y + 4;
       const boxW = contentWidth;
@@ -600,53 +612,57 @@ router.get("/export/pdf", auth, async (req, res) => {
       let innerY = boxY + 10;
       const innerW = boxW - 20;
 
-      doc
-        .fillColor("#0f172a")
-        .font("Helvetica-Bold")
-        .fontSize(9)
-        .text("Trade Logic", innerX, innerY, {
-          width: innerW,
-          align: "left",
-        });
+      if (hasLogic) {
+        doc
+          .fillColor("#0f172a")
+          .font("Helvetica-Bold")
+          .fontSize(9)
+          .text("Trade Logic", innerX, innerY, {
+            width: innerW,
+            align: "left",
+          });
 
-      innerY += doc.heightOfString("Trade Logic", { width: innerW }) + 4;
+        innerY += doc.heightOfString("Trade Logic", { width: innerW }) + 4;
 
-      doc
-        .fillColor("#334155")
-        .font("Helvetica")
-        .fontSize(8.5)
-        .text(cleanText(row.trade_logic), innerX, innerY, {
-          width: innerW,
-          align: "left",
-          lineGap: 2,
-        });
+        doc
+          .fillColor("#334155")
+          .font("Helvetica")
+          .fontSize(8.5)
+          .text(cleanOptionalText(row.trade_logic), innerX, innerY, {
+            width: innerW,
+            align: "left",
+            lineGap: 2,
+          });
 
-      innerY +=
-        doc.heightOfString(cleanText(row.trade_logic), {
-          width: innerW,
-          lineGap: 2,
-        }) + 8;
+        innerY +=
+          doc.heightOfString(cleanOptionalText(row.trade_logic), {
+            width: innerW,
+            lineGap: 2,
+          }) + 8;
+      }
 
-      doc
-        .fillColor("#991b1b")
-        .font("Helvetica-Bold")
-        .fontSize(9)
-        .text("Mistakes", innerX, innerY, {
-          width: innerW,
-          align: "left",
-        });
+      if (hasMistakes) {
+        doc
+          .fillColor("#991b1b")
+          .font("Helvetica-Bold")
+          .fontSize(9)
+          .text("Mistakes", innerX, innerY, {
+            width: innerW,
+            align: "left",
+          });
 
-      innerY += doc.heightOfString("Mistakes", { width: innerW }) + 4;
+        innerY += doc.heightOfString("Mistakes", { width: innerW }) + 4;
 
-      doc
-        .fillColor("#b91c1c")
-        .font("Helvetica")
-        .fontSize(8.5)
-        .text(cleanText(row.mistakes), innerX, innerY, {
-          width: innerW,
-          align: "left",
-          lineGap: 2,
-        });
+        doc
+          .fillColor("#b91c1c")
+          .font("Helvetica")
+          .fontSize(8.5)
+          .text(cleanOptionalText(row.mistakes), innerX, innerY, {
+            width: innerW,
+            align: "left",
+            lineGap: 2,
+          });
+      }
 
       y = boxY + h + 8;
     }
@@ -671,8 +687,6 @@ router.get("/export/pdf", auth, async (req, res) => {
     drawMetaRow();
 
     if (!rows.length) {
-      ensureSpace(70);
-
       doc
         .roundedRect(marginLeft, y, contentWidth, 52, 8)
         .fill("#ffffff")
@@ -694,7 +708,7 @@ router.get("/export/pdf", auth, async (req, res) => {
       rows.forEach((row, index) => {
         const mainH = getMainRowHeight(row, index);
         const detailH = getDetailBlockHeight(row);
-        const needed = mainH + detailH + 12;
+        const needed = mainH + (detailH > 0 ? detailH + 8 : 0) + 12;
 
         if (y + needed > pageHeight - marginBottom) {
           addNewPage();
