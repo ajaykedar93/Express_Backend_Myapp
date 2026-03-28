@@ -525,30 +525,31 @@ router.get("/export/pdf", auth, async (req, res) => {
     }
 
     function getDetailBlockHeight(row) {
-      const boxWidth = contentWidth;
-      const innerWidth = boxWidth - 20;
-      let height = 0;
+      const innerWidth = contentWidth - 20;
+      let total = 0;
 
       if (hasRealText(row.trade_logic)) {
-        const logicTitleH = doc.heightOfString("Trade Logic", { width: innerWidth });
-        const logicTextH = doc.heightOfString(cleanOptionalText(row.trade_logic), {
+        total += doc.heightOfString("Trade Logic", { width: innerWidth });
+        total += 4;
+        total += doc.heightOfString(cleanOptionalText(row.trade_logic), {
           width: innerWidth,
           lineGap: 2,
         });
-        height += logicTitleH + logicTextH + 14;
+        total += 8;
       }
 
       if (hasRealText(row.mistakes)) {
-        const mistakesTitleH = doc.heightOfString("Mistakes", { width: innerWidth });
-        const mistakesTextH = doc.heightOfString(cleanOptionalText(row.mistakes), {
+        total += doc.heightOfString("Mistakes", { width: innerWidth });
+        total += 4;
+        total += doc.heightOfString(cleanOptionalText(row.mistakes), {
           width: innerWidth,
           lineGap: 2,
         });
-        height += mistakesTitleH + mistakesTextH + 14;
+        total += 8;
       }
 
-      if (height === 0) return 0;
-      return height + 16;
+      if (total === 0) return 0;
+      return total + 20;
     }
 
     function drawMainRow(row, index) {
