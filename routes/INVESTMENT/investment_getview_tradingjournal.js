@@ -127,6 +127,25 @@ async function getTradingJournalRows({ userId, platformId, segmentId, planId, mo
   return rows;
 }
 
+function getDownloadFileName(prefix, ext) {
+  const now = new Date();
+  const yyyy = now.getFullYear();
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const dd = String(now.getDate()).padStart(2, "0");
+  const hh = String(now.getHours()).padStart(2, "0");
+  const mi = String(now.getMinutes()).padStart(2, "0");
+  const ss = String(now.getSeconds()).padStart(2, "0");
+  return `${prefix}_${yyyy}${mm}${dd}_${hh}${mi}${ss}.${ext}`;
+}
+
+function withLeftPadding(text, padSize = 6) {
+  const leftPad = " ".repeat(padSize);
+  return String(text)
+    .split("\n")
+    .map((line) => leftPad + line)
+    .join("\n");
+}
+
 // ==============================
 // GET /daily-summary
 // ==============================
@@ -167,6 +186,7 @@ router.get("/export/txt", auth, async (req, res) => {
 
     const totals = calcTotals(rows);
     const selectedMonth = month || new Date().toISOString().slice(0, 7) + "-01";
+    const fileName = getDownloadFileName("trading_journal", "txt");
 
     const lines = [];
     lines.push("TRADING JOURNAL REPORT");
@@ -207,23 +227,24 @@ router.get("/export/txt", auth, async (req, res) => {
       lines.push("");
     });
 
-    const txtContent = "\uFEFF" + lines.join("\n");
-    const fileName = `trading_journal_${Date.now()}.txt`;
+    // Left side spacing for all lines
+    const txtContent = "\uFEFF" + withLeftPadding(lines.join("\n"), 6);
 
-    res.setHeader("Content-Type", "application/octet-stream");
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${fileName}"; filename*=UTF-8''${encodeURIComponent(fileName)}`
-    );
-    res.setHeader("Content-Transfer-Encoding", "binary");
-    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
-    res.setHeader("Pragma", "no-cache");
-    res.setHeader("Expires", "0");
-    res.setHeader("Content-Length", Buffer.byteLength(txtContent, "utf8"));
+    res.status(200);
+    res.set({
+      "Content-Type": "text/plain; charset=utf-8",
+      "Content-Disposition": `attachment; filename="${fileName}"; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+      "Content-Transfer-Encoding": "binary",
+      "Cache-Control": "private, no-store, no-cache, must-revalidate, proxy-revalidate",
+      Pragma: "no-cache",
+      Expires: "0",
+      "X-Content-Type-Options": "nosniff",
+      "Content-Length": Buffer.byteLength(txtContent, "utf8"),
+    });
 
     return res.end(txtContent, "utf8");
   } catch (e) {
-    res.status(500).json({ message: "TXT export failed", error: e.message });
+    return res.status(500).json({ message: "TXT export failed", error: e.message });
   }
 });
 
@@ -244,18 +265,18 @@ router.get("/export/pdf", auth, async (req, res) => {
     });
 
     const totals = calcTotals(rows);
+    const fileName = getDownloadFileName("trading_journal", "pdf");
 
-    const fileName = `trading_journal_${Date.now()}.pdf`;
-
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${fileName}"; filename*=UTF-8''${encodeURIComponent(fileName)}`
-    );
-    res.setHeader("Content-Transfer-Encoding", "binary");
-    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
-    res.setHeader("Pragma", "no-cache");
-    res.setHeader("Expires", "0");
+    res.status(200);
+    res.set({
+      "Content-Type": "application/pdf",
+      "Content-Disposition": `attachment; filename="${fileName}"; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+      "Content-Transfer-Encoding": "binary",
+      "Cache-Control": "private, no-store, no-cache, must-revalidate, proxy-revalidate",
+      Pragma: "no-cache",
+      Expires: "0",
+      "X-Content-Type-Options": "nosniff",
+    });
 
     const doc = new PDFDocument({
       size: "A4",
@@ -644,7 +665,7 @@ router.get("/export/pdf", auth, async (req, res) => {
     drawFooter();
     doc.end();
   } catch (e) {
-    res.status(500).json({ message: "PDF export failed", error: e.message });
+    return res.status(500).json({ message: "PDF export failed", error: e.message });
   }
 });
 
