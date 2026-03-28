@@ -76,6 +76,16 @@ function calcTotals(rows) {
   );
 }
 
+function getMonthLabel(monthValue) {
+  const source = monthValue
+    ? String(monthValue).slice(0, 10)
+    : `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, "0")}-01`;
+
+  const d = new Date(source);
+  if (Number.isNaN(d.getTime())) return "Current Month";
+  return d.toLocaleString("en-US", { month: "long", year: "numeric" });
+}
+
 async function getTradingJournalRows({ userId, platformId, segmentId, planId, month }) {
   const { rows } = await pool.query(
     `
@@ -191,7 +201,7 @@ router.get("/export/txt", auth, async (req, res) => {
     const lines = [];
     lines.push("TRADING JOURNAL REPORT");
     lines.push("======================================================================");
-    lines.push(`Month            : ${selectedMonth}`);
+    lines.push(`Month            : ${getMonthLabel(selectedMonth)}`);
     lines.push(`Platform Id      : ${platformId ?? "All"}`);
     lines.push(`Segment Id       : ${segmentId ?? "All"}`);
     lines.push(`Plan Id          : ${planId ?? "All"}`);
@@ -227,7 +237,6 @@ router.get("/export/txt", auth, async (req, res) => {
       lines.push("");
     });
 
-    // Left side spacing for all lines
     const txtContent = "\uFEFF" + withLeftPadding(lines.join("\n"), 6);
 
     res.status(200);
@@ -266,6 +275,7 @@ router.get("/export/pdf", auth, async (req, res) => {
 
     const totals = calcTotals(rows);
     const fileName = getDownloadFileName("trading_journal", "pdf");
+    const monthLabel = getMonthLabel(month);
 
     res.status(200);
     res.set({
@@ -280,30 +290,36 @@ router.get("/export/pdf", auth, async (req, res) => {
 
     const doc = new PDFDocument({
       size: "A4",
-      margins: { top: 24, bottom: 24, left: 12, right: 12 },
+      margins: { top: 24, bottom: 24, left: 20, right: 20 },
+      autoFirstPage: true,
       bufferPages: true,
+      info: {
+        Title: "Trading Journal",
+        Author: "Trading Journal System",
+        Subject: "Trading Journal Monthly Export",
+      },
     });
 
     doc.pipe(res);
 
     const pageWidth = doc.page.width;
     const pageHeight = doc.page.height;
-    const marginLeft = 12;
-    const marginRight = 12;
+    const marginLeft = 20;
+    const marginRight = 20;
     const marginTop = 24;
     const marginBottom = 24;
     const contentWidth = pageWidth - marginLeft - marginRight;
 
     const col = {
-      sr: 24,
-      date: 62,
-      trade: 92,
-      platform: 58,
-      segment: 58,
-      profit: 44,
-      loss: 44,
-      brokerage: 58,
-      net: 48,
+      sr: 26,
+      date: 68,
+      trade: 108,
+      platform: 70,
+      segment: 68,
+      profit: 52,
+      loss: 52,
+      brokerage: 64,
+      net: 56,
     };
 
     const tableWidth =
@@ -318,53 +334,48 @@ router.get("/export/pdf", auth, async (req, res) => {
       col.net;
 
     let y = marginTop;
+    let isFirstPage = true;
+
+    function addNewPage() {
+      doc.addPage();
+      y = marginTop;
+      isFirstPage = false;
+    }
 
     function ensureSpace(requiredHeight) {
       if (y + requiredHeight > pageHeight - marginBottom) {
-        doc.addPage();
-        y = marginTop;
+        addNewPage();
       }
     }
 
-    function drawPageTitle() {
-      ensureSpace(150);
+    function drawReportHeader() {
+      ensureSpace(132);
 
-      doc.roundedRect(marginLeft, y, contentWidth, 62, 10).fill("#0f172a");
+      doc.roundedRect(marginLeft, y, contentWidth, 58, 12).fill("#0f172a");
 
       doc
         .fillColor("#ffffff")
         .font("Helvetica-Bold")
-        .fontSize(19)
-        .text("TRADING JOURNAL REPORT", marginLeft + 10, y + 14, {
-          width: contentWidth - 20,
+        .fontSize(20)
+        .text("TRADING JOURNAL", marginLeft + 14, y + 12, {
+          width: contentWidth - 28,
           align: "left",
         });
 
       doc
-        .fillColor("#cbd5e1")
+        .fillColor("#dbeafe")
         .font("Helvetica")
-        .fontSize(9)
-        .text(`Generated: ${new Date().toLocaleString()}`, marginLeft + 10, y + 39, {
-          width: contentWidth - 20,
+        .fontSize(11)
+        .text(monthLabel, marginLeft + 14, y + 35, {
+          width: contentWidth - 28,
           align: "left",
         });
 
-      y += 74;
-
-      doc.roundedRect(marginLeft, y, contentWidth, 54, 8).fill("#f8fafc").stroke("#cbd5e1");
-
-      doc.fillColor("#111827").font("Helvetica-Bold").fontSize(10);
-      doc.text(`Month: ${month || "Current Month"}`, marginLeft + 10, y + 10);
-      doc.text(`Platform: ${platformId ?? "All"}`, marginLeft + 185, y + 10);
-      doc.text(`Segment: ${segmentId ?? "All"}`, marginLeft + 350, y + 10);
-      doc.text(`Plan: ${planId ?? "All"}`, marginLeft + 10, y + 30);
-      doc.text(`Total Rows: ${rows.length}`, marginLeft + 185, y + 30);
-
-      y += 66;
+      y += 72;
 
       const gap = 8;
       const statW = (contentWidth - gap * 3) / 4;
-      const statH = 48;
+      const statH = 46;
 
       const stats = [
         {
@@ -407,15 +418,32 @@ router.get("/export/pdf", auth, async (req, res) => {
           .fillColor("#64748b")
           .font("Helvetica-Bold")
           .fontSize(7.5)
-          .text(item.label, item.x + 8, y + 8, { width: statW - 16 });
+          .text(item.label, item.x + 8, y + 8, { width: statW - 16, align: "left" });
         doc
           .fillColor(item.valueColor)
           .font("Helvetica-Bold")
           .fontSize(12)
-          .text(item.value, item.x + 8, y + 23, { width: statW - 16 });
+          .text(item.value, item.x + 8, y + 22, { width: statW - 16, align: "left" });
       });
 
-      y += statH + 16;
+      y += statH + 14;
+    }
+
+    function drawMetaRow() {
+      ensureSpace(30);
+
+      doc
+        .roundedRect(marginLeft, y, contentWidth, 26, 6)
+        .fill("#f8fafc")
+        .stroke("#e2e8f0");
+
+      doc.fillColor("#334155").font("Helvetica").fontSize(9);
+      doc.text(`Platform: ${platformId ?? "All"}`, marginLeft + 10, y + 8);
+      doc.text(`Segment: ${segmentId ?? "All"}`, marginLeft + 160, y + 8);
+      doc.text(`Plan: ${planId ?? "All"}`, marginLeft + 290, y + 8);
+      doc.text(`Rows: ${rows.length}`, marginLeft + 420, y + 8);
+
+      y += 36;
     }
 
     function drawTableHeader() {
@@ -441,8 +469,8 @@ router.get("/export/pdf", auth, async (req, res) => {
           .fillColor("#ffffff")
           .font("Helvetica-Bold")
           .fontSize(7.5)
-          .text(label, x + 3, y + 8, {
-            width: width - 6,
+          .text(label, x + 4, y + 8, {
+            width: width - 8,
             align: "left",
           });
         x += width;
@@ -467,22 +495,27 @@ router.get("/export/pdf", auth, async (req, res) => {
 
       for (let i = 0; i < widths.length - 1; i++) {
         x += widths[i];
-        doc.moveTo(x, rowTop).lineTo(x, rowTop + rowHeight).strokeColor("#e5e7eb").stroke();
+        doc
+          .moveTo(x, rowTop)
+          .lineTo(x, rowTop + rowHeight)
+          .strokeColor("#e5e7eb")
+          .lineWidth(0.5)
+          .stroke();
       }
     }
 
     function getMainRowHeight(row, index) {
       return (
         Math.max(
-          doc.heightOfString(String(index + 1), { width: col.sr - 6, align: "left" }),
-          doc.heightOfString(formatDateOnly(row.trade_date), { width: col.date - 6, align: "left" }),
-          doc.heightOfString(cleanText(row.trade_name), { width: col.trade - 6, align: "left" }),
-          doc.heightOfString(cleanText(row.platform_name), { width: col.platform - 6, align: "left" }),
-          doc.heightOfString(cleanText(row.segment_name), { width: col.segment - 6, align: "left" }),
-          doc.heightOfString(numberText(row.profit), { width: col.profit - 6, align: "left" }),
-          doc.heightOfString(numberText(row.loss), { width: col.loss - 6, align: "left" }),
-          doc.heightOfString(numberText(row.brokerage), { width: col.brokerage - 6, align: "left" }),
-          doc.heightOfString(numberText(row.net_total), { width: col.net - 6, align: "left" }),
+          doc.heightOfString(String(index + 1), { width: col.sr - 8 }),
+          doc.heightOfString(formatDateOnly(row.trade_date), { width: col.date - 8 }),
+          doc.heightOfString(cleanText(row.trade_name), { width: col.trade - 8 }),
+          doc.heightOfString(cleanText(row.platform_name), { width: col.platform - 8 }),
+          doc.heightOfString(cleanText(row.segment_name), { width: col.segment - 8 }),
+          doc.heightOfString(numberText(row.profit), { width: col.profit - 8 }),
+          doc.heightOfString(numberText(row.loss), { width: col.loss - 8 }),
+          doc.heightOfString(numberText(row.brokerage), { width: col.brokerage - 8 }),
+          doc.heightOfString(numberText(row.net_total), { width: col.net - 8 }),
           14
         ) + 12
       );
@@ -490,34 +523,26 @@ router.get("/export/pdf", auth, async (req, res) => {
 
     function getDetailBlockHeight(row) {
       const boxWidth = contentWidth;
-      const innerWidth = boxWidth - 14;
+      const innerWidth = boxWidth - 20;
 
-      const logicTitleH = doc.heightOfString("Trade Logic", {
-        width: innerWidth,
-        align: "left",
-      });
-
+      const logicTitleH = doc.heightOfString("Trade Logic", { width: innerWidth });
       const logicTextH = doc.heightOfString(cleanText(row.trade_logic), {
         width: innerWidth,
-        align: "left",
+        lineGap: 2,
       });
 
-      const mistakesTitleH = doc.heightOfString("Mistakes", {
-        width: innerWidth,
-        align: "left",
-      });
-
+      const mistakesTitleH = doc.heightOfString("Mistakes", { width: innerWidth });
       const mistakesTextH = doc.heightOfString(cleanText(row.mistakes), {
         width: innerWidth,
-        align: "left",
+        lineGap: 2,
       });
 
-      return logicTitleH + logicTextH + mistakesTitleH + mistakesTextH + 30;
+      return logicTitleH + logicTextH + mistakesTitleH + mistakesTextH + 34;
     }
 
     function drawMainRow(row, index) {
       const h = getMainRowHeight(row, index);
-      ensureSpace(h + 10);
+      ensureSpace(h + 6);
 
       const rowTop = y;
 
@@ -530,10 +555,14 @@ router.get("/export/pdf", auth, async (req, res) => {
       const topY = y + 6;
 
       function drawCell(text, width, color = "#111111", font = "Helvetica", size = 8) {
-        doc.fillColor(color).font(font).fontSize(size).text(String(text ?? "-"), x + 3, topY, {
-          width: width - 6,
-          align: "left",
-        });
+        doc
+          .fillColor(color)
+          .font(font)
+          .fontSize(size)
+          .text(String(text ?? "-"), x + 4, topY, {
+            width: width - 8,
+            align: "left",
+          });
         x += width;
       }
 
@@ -559,7 +588,7 @@ router.get("/export/pdf", auth, async (req, res) => {
 
     function drawDetailBlock(row) {
       const h = getDetailBlockHeight(row);
-      ensureSpace(h + 12);
+      ensureSpace(h + 10);
 
       const boxX = marginLeft;
       const boxY = y + 4;
@@ -567,51 +596,56 @@ router.get("/export/pdf", auth, async (req, res) => {
 
       doc.roundedRect(boxX, boxY, boxW, h, 8).fill("#ffffff").stroke("#dbeafe");
 
-      const innerX = boxX + 7;
+      const innerX = boxX + 10;
       let innerY = boxY + 10;
-      const innerW = boxW - 14;
+      const innerW = boxW - 20;
 
       doc
-        .fillColor("#111111")
+        .fillColor("#0f172a")
         .font("Helvetica-Bold")
         .fontSize(9)
-        .text("Trade Logic", innerX, innerY, { width: innerW, align: "left" });
+        .text("Trade Logic", innerX, innerY, {
+          width: innerW,
+          align: "left",
+        });
 
-      innerY += doc.heightOfString("Trade Logic", { width: innerW, align: "left" }) + 4;
+      innerY += doc.heightOfString("Trade Logic", { width: innerW }) + 4;
 
       doc
-        .fillColor("#111111")
+        .fillColor("#334155")
         .font("Helvetica")
         .fontSize(8.5)
         .text(cleanText(row.trade_logic), innerX, innerY, {
           width: innerW,
           align: "left",
-          lineGap: 1.5,
+          lineGap: 2,
         });
 
       innerY +=
         doc.heightOfString(cleanText(row.trade_logic), {
           width: innerW,
-          align: "left",
-          lineGap: 1.5,
+          lineGap: 2,
         }) + 8;
 
       doc
-        .fillColor("#b91c1c")
+        .fillColor("#991b1b")
         .font("Helvetica-Bold")
         .fontSize(9)
-        .text("Mistakes", innerX, innerY, { width: innerW, align: "left" });
+        .text("Mistakes", innerX, innerY, {
+          width: innerW,
+          align: "left",
+        });
 
-      innerY += doc.heightOfString("Mistakes", { width: innerW, align: "left" }) + 4;
+      innerY += doc.heightOfString("Mistakes", { width: innerW }) + 4;
 
       doc
-        .fillColor("#dc2626")
+        .fillColor("#b91c1c")
         .font("Helvetica")
         .fontSize(8.5)
         .text(cleanText(row.mistakes), innerX, innerY, {
           width: innerW,
           align: "left",
-          lineGap: 1.5,
+          lineGap: 2,
         });
 
       y = boxY + h + 8;
@@ -619,41 +653,51 @@ router.get("/export/pdf", auth, async (req, res) => {
 
     function drawFooter() {
       const range = doc.bufferedPageRange();
+
       for (let i = 0; i < range.count; i++) {
         doc.switchToPage(i);
         doc
           .font("Helvetica")
           .fontSize(8)
           .fillColor("#64748b")
-          .text(`Page ${i + 1} of ${range.count}`, marginLeft, pageHeight - 18, {
+          .text(`Page ${i + 1} of ${range.count}`, marginLeft, pageHeight - 16, {
             align: "center",
             width: contentWidth,
           });
       }
     }
 
-    drawPageTitle();
+    drawReportHeader();
+    drawMetaRow();
 
     if (!rows.length) {
-      ensureSpace(40);
+      ensureSpace(70);
+
       doc
-        .fillColor("#111111")
+        .roundedRect(marginLeft, y, contentWidth, 52, 8)
+        .fill("#ffffff")
+        .stroke("#e5e7eb");
+
+      doc
+        .fillColor("#111827")
         .font("Helvetica-Bold")
         .fontSize(12)
-        .text("No trading journal data found for selected filters.", marginLeft, y + 10, {
+        .text("No trading journal data found for selected filters.", marginLeft, y + 18, {
           width: contentWidth,
           align: "center",
         });
+
+      y += 60;
     } else {
       drawTableHeader();
 
       rows.forEach((row, index) => {
         const mainH = getMainRowHeight(row, index);
         const detailH = getDetailBlockHeight(row);
+        const needed = mainH + detailH + 12;
 
-        if (y + mainH + detailH + 12 > pageHeight - marginBottom) {
-          doc.addPage();
-          y = marginTop;
+        if (y + needed > pageHeight - marginBottom) {
+          addNewPage();
           drawTableHeader();
         }
 
