@@ -207,13 +207,21 @@ router.get("/export/txt", auth, async (req, res) => {
       lines.push("");
     });
 
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    const txtContent = "\uFEFF" + lines.join("\n");
+    const fileName = `trading_journal_${Date.now()}.txt`;
+
+    res.setHeader("Content-Type", "application/octet-stream");
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename="trading_journal_${Date.now()}.txt"`
+      `attachment; filename="${fileName}"; filename*=UTF-8''${encodeURIComponent(fileName)}`
     );
+    res.setHeader("Content-Transfer-Encoding", "binary");
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+    res.setHeader("Content-Length", Buffer.byteLength(txtContent, "utf8"));
 
-    res.send(lines.join("\n"));
+    return res.end(txtContent, "utf8");
   } catch (e) {
     res.status(500).json({ message: "TXT export failed", error: e.message });
   }
@@ -237,26 +245,32 @@ router.get("/export/pdf", auth, async (req, res) => {
 
     const totals = calcTotals(rows);
 
-    const doc = new PDFDocument({
-      size: "A4",
-      margins: { top: 32, bottom: 32, left: 28, right: 28 },
-      bufferPages: true,
-    });
+    const fileName = `trading_journal_${Date.now()}.pdf`;
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename="trading_journal_${Date.now()}.pdf"`
+      `attachment; filename="${fileName}"; filename*=UTF-8''${encodeURIComponent(fileName)}`
     );
+    res.setHeader("Content-Transfer-Encoding", "binary");
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+
+    const doc = new PDFDocument({
+      size: "A4",
+      margins: { top: 24, bottom: 24, left: 12, right: 12 },
+      bufferPages: true,
+    });
 
     doc.pipe(res);
 
     const pageWidth = doc.page.width;
     const pageHeight = doc.page.height;
-    const marginLeft = 28;
-    const marginRight = 28;
-    const marginTop = 32;
-    const marginBottom = 32;
+    const marginLeft = 12;
+    const marginRight = 12;
+    const marginTop = 24;
+    const marginBottom = 24;
     const contentWidth = pageWidth - marginLeft - marginRight;
 
     const col = {
@@ -300,8 +314,8 @@ router.get("/export/pdf", auth, async (req, res) => {
         .fillColor("#ffffff")
         .font("Helvetica-Bold")
         .fontSize(19)
-        .text("TRADING JOURNAL REPORT", marginLeft + 14, y + 14, {
-          width: contentWidth - 28,
+        .text("TRADING JOURNAL REPORT", marginLeft + 10, y + 14, {
+          width: contentWidth - 20,
           align: "left",
         });
 
@@ -309,8 +323,8 @@ router.get("/export/pdf", auth, async (req, res) => {
         .fillColor("#cbd5e1")
         .font("Helvetica")
         .fontSize(9)
-        .text(`Generated: ${new Date().toLocaleString()}`, marginLeft + 14, y + 39, {
-          width: contentWidth - 28,
+        .text(`Generated: ${new Date().toLocaleString()}`, marginLeft + 10, y + 39, {
+          width: contentWidth - 20,
           align: "left",
         });
 
@@ -319,11 +333,11 @@ router.get("/export/pdf", auth, async (req, res) => {
       doc.roundedRect(marginLeft, y, contentWidth, 54, 8).fill("#f8fafc").stroke("#cbd5e1");
 
       doc.fillColor("#111827").font("Helvetica-Bold").fontSize(10);
-      doc.text(`Month: ${month || "Current Month"}`, marginLeft + 12, y + 10);
-      doc.text(`Platform: ${platformId ?? "All"}`, marginLeft + 190, y + 10);
-      doc.text(`Segment: ${segmentId ?? "All"}`, marginLeft + 360, y + 10);
-      doc.text(`Plan: ${planId ?? "All"}`, marginLeft + 12, y + 30);
-      doc.text(`Total Rows: ${rows.length}`, marginLeft + 190, y + 30);
+      doc.text(`Month: ${month || "Current Month"}`, marginLeft + 10, y + 10);
+      doc.text(`Platform: ${platformId ?? "All"}`, marginLeft + 185, y + 10);
+      doc.text(`Segment: ${segmentId ?? "All"}`, marginLeft + 350, y + 10);
+      doc.text(`Plan: ${planId ?? "All"}`, marginLeft + 10, y + 30);
+      doc.text(`Total Rows: ${rows.length}`, marginLeft + 185, y + 30);
 
       y += 66;
 
@@ -368,9 +382,15 @@ router.get("/export/pdf", auth, async (req, res) => {
 
       stats.forEach((item) => {
         doc.roundedRect(item.x, y, statW, statH, 8).fill(item.fill).stroke(item.stroke);
-        doc.fillColor("#64748b").font("Helvetica-Bold").fontSize(7.5)
+        doc
+          .fillColor("#64748b")
+          .font("Helvetica-Bold")
+          .fontSize(7.5)
           .text(item.label, item.x + 8, y + 8, { width: statW - 16 });
-        doc.fillColor(item.valueColor).font("Helvetica-Bold").fontSize(12)
+        doc
+          .fillColor(item.valueColor)
+          .font("Helvetica-Bold")
+          .fontSize(12)
           .text(item.value, item.x + 8, y + 23, { width: statW - 16 });
       });
 
@@ -400,8 +420,8 @@ router.get("/export/pdf", auth, async (req, res) => {
           .fillColor("#ffffff")
           .font("Helvetica-Bold")
           .fontSize(7.5)
-          .text(label, x + 4, y + 8, {
-            width: width - 8,
+          .text(label, x + 3, y + 8, {
+            width: width - 6,
             align: "left",
           });
         x += width;
@@ -431,25 +451,25 @@ router.get("/export/pdf", auth, async (req, res) => {
     }
 
     function getMainRowHeight(row, index) {
-      const size = 8;
-
-      return Math.max(
-        doc.heightOfString(String(index + 1), { width: col.sr - 8, align: "left" }),
-        doc.heightOfString(formatDateOnly(row.trade_date), { width: col.date - 8, align: "left" }),
-        doc.heightOfString(cleanText(row.trade_name), { width: col.trade - 8, align: "left" }),
-        doc.heightOfString(cleanText(row.platform_name), { width: col.platform - 8, align: "left" }),
-        doc.heightOfString(cleanText(row.segment_name), { width: col.segment - 8, align: "left" }),
-        doc.heightOfString(numberText(row.profit), { width: col.profit - 8, align: "left" }),
-        doc.heightOfString(numberText(row.loss), { width: col.loss - 8, align: "left" }),
-        doc.heightOfString(numberText(row.brokerage), { width: col.brokerage - 8, align: "left" }),
-        doc.heightOfString(numberText(row.net_total), { width: col.net - 8, align: "left" }),
-        14
-      ) + 12;
+      return (
+        Math.max(
+          doc.heightOfString(String(index + 1), { width: col.sr - 6, align: "left" }),
+          doc.heightOfString(formatDateOnly(row.trade_date), { width: col.date - 6, align: "left" }),
+          doc.heightOfString(cleanText(row.trade_name), { width: col.trade - 6, align: "left" }),
+          doc.heightOfString(cleanText(row.platform_name), { width: col.platform - 6, align: "left" }),
+          doc.heightOfString(cleanText(row.segment_name), { width: col.segment - 6, align: "left" }),
+          doc.heightOfString(numberText(row.profit), { width: col.profit - 6, align: "left" }),
+          doc.heightOfString(numberText(row.loss), { width: col.loss - 6, align: "left" }),
+          doc.heightOfString(numberText(row.brokerage), { width: col.brokerage - 6, align: "left" }),
+          doc.heightOfString(numberText(row.net_total), { width: col.net - 6, align: "left" }),
+          14
+        ) + 12
+      );
     }
 
     function getDetailBlockHeight(row) {
       const boxWidth = contentWidth;
-      const innerWidth = boxWidth - 22;
+      const innerWidth = boxWidth - 14;
 
       const logicTitleH = doc.heightOfString("Trade Logic", {
         width: innerWidth,
@@ -471,7 +491,7 @@ router.get("/export/pdf", auth, async (req, res) => {
         align: "left",
       });
 
-      return logicTitleH + logicTextH + mistakesTitleH + mistakesTextH + 34;
+      return logicTitleH + logicTextH + mistakesTitleH + mistakesTextH + 30;
     }
 
     function drawMainRow(row, index) {
@@ -480,14 +500,17 @@ router.get("/export/pdf", auth, async (req, res) => {
 
       const rowTop = y;
 
-      doc.rect(marginLeft, y, tableWidth, h).fill(index % 2 === 0 ? "#ffffff" : "#f8fafc").stroke("#e5e7eb");
+      doc
+        .rect(marginLeft, y, tableWidth, h)
+        .fill(index % 2 === 0 ? "#ffffff" : "#f8fafc")
+        .stroke("#e5e7eb");
 
       let x = marginLeft;
       const topY = y + 6;
 
       function drawCell(text, width, color = "#111111", font = "Helvetica", size = 8) {
-        doc.fillColor(color).font(font).fontSize(size).text(String(text ?? "-"), x + 4, topY, {
-          width: width - 8,
+        doc.fillColor(color).font(font).fontSize(size).text(String(text ?? "-"), x + 3, topY, {
+          width: width - 6,
           align: "left",
         });
         x += width;
@@ -523,34 +546,47 @@ router.get("/export/pdf", auth, async (req, res) => {
 
       doc.roundedRect(boxX, boxY, boxW, h, 8).fill("#ffffff").stroke("#dbeafe");
 
-      const innerX = boxX + 11;
+      const innerX = boxX + 7;
       let innerY = boxY + 10;
-      const innerW = boxW - 22;
+      const innerW = boxW - 14;
 
-      doc.fillColor("#111111").font("Helvetica-Bold").fontSize(9)
+      doc
+        .fillColor("#111111")
+        .font("Helvetica-Bold")
+        .fontSize(9)
         .text("Trade Logic", innerX, innerY, { width: innerW, align: "left" });
 
       innerY += doc.heightOfString("Trade Logic", { width: innerW, align: "left" }) + 4;
 
-      doc.fillColor("#111111").font("Helvetica").fontSize(8.5)
+      doc
+        .fillColor("#111111")
+        .font("Helvetica")
+        .fontSize(8.5)
         .text(cleanText(row.trade_logic), innerX, innerY, {
           width: innerW,
           align: "left",
           lineGap: 1.5,
         });
 
-      innerY += doc.heightOfString(cleanText(row.trade_logic), {
-        width: innerW,
-        align: "left",
-        lineGap: 1.5,
-      }) + 8;
+      innerY +=
+        doc.heightOfString(cleanText(row.trade_logic), {
+          width: innerW,
+          align: "left",
+          lineGap: 1.5,
+        }) + 8;
 
-      doc.fillColor("#b91c1c").font("Helvetica-Bold").fontSize(9)
+      doc
+        .fillColor("#b91c1c")
+        .font("Helvetica-Bold")
+        .fontSize(9)
         .text("Mistakes", innerX, innerY, { width: innerW, align: "left" });
 
       innerY += doc.heightOfString("Mistakes", { width: innerW, align: "left" }) + 4;
 
-      doc.fillColor("#dc2626").font("Helvetica").fontSize(8.5)
+      doc
+        .fillColor("#dc2626")
+        .font("Helvetica")
+        .fontSize(8.5)
         .text(cleanText(row.mistakes), innerX, innerY, {
           width: innerW,
           align: "left",
@@ -568,7 +604,7 @@ router.get("/export/pdf", auth, async (req, res) => {
           .font("Helvetica")
           .fontSize(8)
           .fillColor("#64748b")
-          .text(`Page ${i + 1} of ${range.count}`, marginLeft, pageHeight - 20, {
+          .text(`Page ${i + 1} of ${range.count}`, marginLeft, pageHeight - 18, {
             align: "center",
             width: contentWidth,
           });
