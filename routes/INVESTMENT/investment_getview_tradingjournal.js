@@ -291,8 +291,8 @@ router.get("/export/pdf", auth, async (req, res) => {
     const doc = new PDFDocument({
       size: "A4",
       margins: { top: 24, bottom: 24, left: 20, right: 20 },
-      autoFirstPage: true,
       bufferPages: true,
+      autoFirstPage: false,
       info: {
         Title: "Trading Journal",
         Author: "Trading Journal System",
@@ -301,6 +301,8 @@ router.get("/export/pdf", auth, async (req, res) => {
     });
 
     doc.pipe(res);
+
+    doc.addPage();
 
     const pageWidth = doc.page.width;
     const pageHeight = doc.page.height;
@@ -334,23 +336,18 @@ router.get("/export/pdf", auth, async (req, res) => {
       col.net;
 
     let y = marginTop;
-    let isFirstPage = true;
 
-    function addNewPage() {
+    function startNewContentPage() {
       doc.addPage();
       y = marginTop;
-      isFirstPage = false;
+      drawTableHeader();
     }
 
-    function ensureSpace(requiredHeight) {
-      if (y + requiredHeight > pageHeight - marginBottom) {
-        addNewPage();
-      }
+    function remainingHeight() {
+      return pageHeight - marginBottom - y;
     }
 
     function drawReportHeader() {
-      ensureSpace(132);
-
       doc.roundedRect(marginLeft, y, contentWidth, 58, 12).fill("#0f172a");
 
       doc
@@ -372,7 +369,9 @@ router.get("/export/pdf", auth, async (req, res) => {
         });
 
       y += 72;
+    }
 
+    function drawStats() {
       const gap = 8;
       const statW = (contentWidth - gap * 3) / 4;
       const statH = 46;
@@ -418,24 +417,19 @@ router.get("/export/pdf", auth, async (req, res) => {
           .fillColor("#64748b")
           .font("Helvetica-Bold")
           .fontSize(7.5)
-          .text(item.label, item.x + 8, y + 8, { width: statW - 16, align: "left" });
+          .text(item.label, item.x + 8, y + 8, { width: statW - 16 });
         doc
           .fillColor(item.valueColor)
           .font("Helvetica-Bold")
           .fontSize(12)
-          .text(item.value, item.x + 8, y + 22, { width: statW - 16, align: "left" });
+          .text(item.value, item.x + 8, y + 22, { width: statW - 16 });
       });
 
       y += statH + 14;
     }
 
     function drawMetaRow() {
-      ensureSpace(30);
-
-      doc
-        .roundedRect(marginLeft, y, contentWidth, 26, 6)
-        .fill("#f8fafc")
-        .stroke("#e2e8f0");
+      doc.roundedRect(marginLeft, y, contentWidth, 26, 6).fill("#f8fafc").stroke("#e2e8f0");
 
       doc.fillColor("#334155").font("Helvetica").fontSize(9);
       doc.text(`Platform: ${platformId ?? "All"}`, marginLeft + 10, y + 8);
@@ -447,8 +441,6 @@ router.get("/export/pdf", auth, async (req, res) => {
     }
 
     function drawTableHeader() {
-      ensureSpace(28);
-
       doc.roundedRect(marginLeft, y, tableWidth, 24, 4).fill("#0f172a");
 
       let x = marginLeft;
@@ -522,8 +514,7 @@ router.get("/export/pdf", auth, async (req, res) => {
     }
 
     function getDetailBlockHeight(row) {
-      const boxWidth = contentWidth;
-      const innerWidth = boxWidth - 20;
+      const innerWidth = contentWidth - 20;
 
       const logicTitleH = doc.heightOfString("Trade Logic", { width: innerWidth });
       const logicTextH = doc.heightOfString(cleanText(row.trade_logic), {
@@ -542,8 +533,6 @@ router.get("/export/pdf", auth, async (req, res) => {
 
     function drawMainRow(row, index) {
       const h = getMainRowHeight(row, index);
-      ensureSpace(h + 6);
-
       const rowTop = y;
 
       doc
@@ -588,8 +577,6 @@ router.get("/export/pdf", auth, async (req, res) => {
 
     function drawDetailBlock(row) {
       const h = getDetailBlockHeight(row);
-      ensureSpace(h + 10);
-
       const boxX = marginLeft;
       const boxY = y + 4;
       const boxW = contentWidth;
@@ -667,16 +654,19 @@ router.get("/export/pdf", auth, async (req, res) => {
       }
     }
 
+    // First page content
     drawReportHeader();
+    drawStats();
     drawMetaRow();
 
     if (!rows.length) {
-      ensureSpace(70);
+      const noDataHeight = 52;
+      if (remainingHeight() < noDataHeight + 8) {
+        doc.addPage();
+        y = marginTop;
+      }
 
-      doc
-        .roundedRect(marginLeft, y, contentWidth, 52, 8)
-        .fill("#ffffff")
-        .stroke("#e5e7eb");
+      doc.roundedRect(marginLeft, y, contentWidth, 52, 8).fill("#ffffff").stroke("#e5e7eb");
 
       doc
         .fillColor("#111827")
@@ -689,16 +679,19 @@ router.get("/export/pdf", auth, async (req, res) => {
 
       y += 60;
     } else {
-      drawTableHeader();
+      if (remainingHeight() < 24) {
+        startNewContentPage();
+      } else {
+        drawTableHeader();
+      }
 
       rows.forEach((row, index) => {
         const mainH = getMainRowHeight(row, index);
         const detailH = getDetailBlockHeight(row);
-        const needed = mainH + detailH + 12;
+        const neededHeight = mainH + detailH + 12;
 
-        if (y + needed > pageHeight - marginBottom) {
-          addNewPage();
-          drawTableHeader();
+        if (remainingHeight() < neededHeight) {
+          startNewContentPage();
         }
 
         drawMainRow(row, index);
