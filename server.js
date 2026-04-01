@@ -189,6 +189,9 @@ const monthDprRoutes = require("./routes/monthdpr");
 app.use("/api/monthdpr", monthDprRoutes);
 
 
+//test download jouranal pdf api
+app.use("/api/investment/tradingjournal-view", require("./routes/INVESTMENT/investmenttestjouranlpdf"));
+
 
 /* ---------------- Health Check ---------------- */
 app.get("/health", (_req, res) => res.json({ status: "OK--(API LOAD START)" }));
