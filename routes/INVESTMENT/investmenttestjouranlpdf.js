@@ -90,12 +90,11 @@ router.get("/export/pdf", auth, async (req, res) => {
       size: "A4",
       margins: {
         top: 34,
-        bottom: 28,
+        bottom: 34,
         left: 28,
         right: 28,
       },
       autoFirstPage: true,
-      bufferPages: true,
       info: {
         Title: `Trading Journal - ${monthLabel}`,
         Author: "Investment Management",
@@ -112,29 +111,25 @@ router.get("/export/pdf", auth, async (req, res) => {
       left: 28,
       right: 28,
       top: 34,
-      bottom: 28,
+      bottom: 34,
     };
 
     const contentWidth = page.width - page.left - page.right;
+    const safeBottomY = page.height - page.bottom;
     let y = page.top;
 
     const colors = {
-      text: "#0f172a",
-      subText: "#64748b",
+      text: "#111111",
+      subText: "#5b6472",
       white: "#ffffff",
-      border: "#e2e8f0",
-      lightBorder: "#edf2f7",
+      border: "#d9e0e7",
+      lightBorder: "#e9eef4",
 
       dark: "#111827",
       blackBlue: "#0f172a",
 
       accentBlue: "#2563eb",
       accentPurple: "#7c3aed",
-      accentPink: "#ff3d8d",
-      accentOrange: "#ffb703",
-
-      pageBgTop: "#eef4ff",
-      pageBgSoft: "#f8fbff",
 
       chipProfitBg: "#ecfdf3",
       chipProfitText: "#15803d",
@@ -153,11 +148,12 @@ router.get("/export/pdf", auth, async (req, res) => {
       mistakeBg: "#fff5f5",
       mistakeBorder: "#fecaca",
       mistakeText: "#b91c1c",
+
+      pageBgSoft: "#f8fbff",
     };
 
     function ensureSpace(requiredHeight) {
-      const availableHeight = page.height - page.bottom;
-      if (y + requiredHeight <= availableHeight) return;
+      if (y + requiredHeight <= safeBottomY) return;
 
       doc.addPage();
       y = page.top;
@@ -188,10 +184,16 @@ router.get("/export/pdf", auth, async (req, res) => {
         color = colors.text,
         align = "left",
         lineGap = 0,
+        lineBreak = true,
       } = options;
 
       doc.font(font).fontSize(size).fillColor(color);
-      doc.text(String(text ?? ""), x, textY, { width, align, lineGap });
+      doc.text(String(text ?? ""), x, textY, {
+        width,
+        align,
+        lineGap,
+        lineBreak,
+      });
     }
 
     function measureTextHeight(text, width, options = {}) {
@@ -214,6 +216,7 @@ router.get("/export/pdf", auth, async (req, res) => {
       if (!value) return "-";
       const d = new Date(value);
       if (Number.isNaN(d.getTime())) return String(value);
+
       return new Intl.DateTimeFormat("en-GB", {
         day: "2-digit",
         month: "short",
@@ -225,6 +228,7 @@ router.get("/export/pdf", auth, async (req, res) => {
       if (!value) return { day: "--", month: "---" };
       const d = new Date(value);
       if (Number.isNaN(d.getTime())) return { day: "--", month: "---" };
+
       return {
         day: String(d.getDate()).padStart(2, "0"),
         month: d.toLocaleString("en-US", { month: "short" }).toUpperCase(),
@@ -266,6 +270,7 @@ router.get("/export/pdf", auth, async (req, res) => {
         size: 9,
         color: fg,
         align: "center",
+        lineBreak: false,
       });
 
       return chipW;
@@ -276,12 +281,10 @@ router.get("/export/pdf", auth, async (req, res) => {
       doc.rect(0, 0, page.width, 92).fill(colors.pageBgSoft);
       doc.restore();
 
-      // left soft effect
       doc.save();
       doc.circle(60, 20, 85).fillOpacity(0.10).fill(colors.accentPurple);
       doc.restore();
 
-      // right soft effect
       doc.save();
       doc.circle(page.width - 50, 24, 75).fillOpacity(0.08).fill(colors.accentBlue);
       doc.restore();
@@ -295,6 +298,7 @@ router.get("/export/pdf", auth, async (req, res) => {
         font: "Helvetica-Bold",
         size: 22,
         color: colors.text,
+        lineBreak: false,
       });
 
       writeText("Professional monthly export", page.left, 50, {
@@ -302,6 +306,7 @@ router.get("/export/pdf", auth, async (req, res) => {
         font: "Helvetica",
         size: 10,
         color: colors.subText,
+        lineBreak: false,
       });
 
       const statY = 18;
@@ -347,6 +352,7 @@ router.get("/export/pdf", auth, async (req, res) => {
           font: "Helvetica-Bold",
           size: 7,
           color: colors.subText,
+          lineBreak: false,
         });
 
         writeText(item.value, x + 8, statY + 21, {
@@ -354,6 +360,7 @@ router.get("/export/pdf", auth, async (req, res) => {
           font: "Helvetica-Bold",
           size: 10,
           color: item.color,
+          lineBreak: false,
         });
 
         x += statW + gap;
@@ -378,6 +385,7 @@ router.get("/export/pdf", auth, async (req, res) => {
         font: "Helvetica-Bold",
         size: 13,
         color: colors.text,
+        lineBreak: false,
       });
 
       writeText(monthLabel, page.left, y + 16, {
@@ -385,6 +393,7 @@ router.get("/export/pdf", auth, async (req, res) => {
         font: "Helvetica",
         size: 9,
         color: colors.subText,
+        lineBreak: false,
       });
 
       y += 34;
@@ -421,7 +430,6 @@ router.get("/export/pdf", auth, async (req, res) => {
 
       drawRoundedBox(page.left, y, contentWidth, cardH, 18, colors.white, colors.border);
 
-      // left accent line
       doc.save();
       doc.roundedRect(page.left, y, 5, cardH, 18).fill(colors.accentBlue);
       doc.restore();
@@ -436,6 +444,7 @@ router.get("/export/pdf", auth, async (req, res) => {
         size: 18,
         color: colors.white,
         align: "center",
+        lineBreak: false,
       });
 
       writeText(date.month, page.left + 14, y + 48, {
@@ -444,6 +453,7 @@ router.get("/export/pdf", auth, async (req, res) => {
         size: 8,
         color: "#e5e7eb",
         align: "center",
+        lineBreak: false,
       });
 
       const mainX = page.left + 82;
@@ -465,6 +475,7 @@ router.get("/export/pdf", auth, async (req, res) => {
           font: "Helvetica",
           size: 9,
           color: colors.subText,
+          lineBreak: false,
         }
       );
 
@@ -475,6 +486,7 @@ router.get("/export/pdf", auth, async (req, res) => {
         size: 8,
         color: colors.chipNeutralText,
         align: "center",
+        lineBreak: false,
       });
 
       let chipX = mainX;
@@ -499,6 +511,7 @@ router.get("/export/pdf", auth, async (req, res) => {
         font: "Helvetica-Bold",
         size: 8,
         color: colors.subText,
+        lineBreak: false,
       });
 
       sectionY += 14;
@@ -526,6 +539,7 @@ router.get("/export/pdf", auth, async (req, res) => {
         font: "Helvetica-Bold",
         size: 8,
         color: colors.subText,
+        lineBreak: false,
       });
 
       sectionY += 14;
@@ -555,11 +569,22 @@ router.get("/export/pdf", auth, async (req, res) => {
           lineGap: 2,
         });
       } else {
-        writeText("No mistakes added", page.left + 16, sectionY + 1, {
-          width: contentWidth - 32,
+        drawRoundedBox(
+          page.left + 14,
+          sectionY,
+          contentWidth - 28,
+          30,
+          12,
+          "#fafafa",
+          colors.border
+        );
+
+        writeText("No mistakes added", page.left + 22, sectionY + 9, {
+          width: contentWidth - 44,
           font: "Helvetica",
           size: 10,
           color: colors.subText,
+          lineBreak: false,
         });
       }
 
@@ -569,6 +594,7 @@ router.get("/export/pdf", auth, async (req, res) => {
     function drawEmptyState() {
       const h = 78;
       ensureSpace(h + 10);
+
       drawRoundedBox(page.left, y, contentWidth, h, 18, colors.white, colors.border);
 
       writeText("No trading journal data found.", page.left, y + 22, {
@@ -577,6 +603,7 @@ router.get("/export/pdf", auth, async (req, res) => {
         size: 14,
         color: colors.text,
         align: "center",
+        lineBreak: false,
       });
 
       writeText("Try another month, platform, or segment filter.", page.left, y + 44, {
@@ -585,30 +612,10 @@ router.get("/export/pdf", auth, async (req, res) => {
         size: 10,
         color: colors.subText,
         align: "center",
+        lineBreak: false,
       });
 
       y += h + 10;
-    }
-
-    function drawFooterAllPages() {
-      const range = doc.bufferedPageRange();
-
-      for (let i = 0; i < range.count; i++) {
-        doc.switchToPage(i);
-
-        writeText(
-          `Page ${i + 1} of ${range.count}`,
-          page.left,
-          page.height - 18,
-          {
-            width: contentWidth,
-            font: "Helvetica",
-            size: 8,
-            color: colors.subText,
-            align: "center",
-          }
-        );
-      }
     }
 
     drawMainHeader();
@@ -619,9 +626,10 @@ router.get("/export/pdf", auth, async (req, res) => {
       rows.forEach((row) => drawJournalCard(row));
     }
 
-    drawFooterAllPages();
     doc.end();
   } catch (error) {
+    console.error("Trading journal PDF export failed:", error);
+
     if (!res.headersSent) {
       return res.status(500).json({
         message: "Trading journal PDF export failed",
@@ -639,6 +647,7 @@ function toNumber(v) {
 function getMonthLabel(value) {
   try {
     const base = value ? new Date(value) : new Date();
+
     if (Number.isNaN(base.getTime())) {
       const now = new Date();
       return new Intl.DateTimeFormat("en-GB", {

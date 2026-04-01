@@ -190,7 +190,7 @@ app.use("/api/monthdpr", monthDprRoutes);
 
 
 //test download jouranal pdf api
-app.use("/api/investment/tradingjournal-view", require("./routes/INVESTMENT/investmenttestjouranlpdf"));
+app.use("/api/investment/tradingjournal-pdf", require("./routes/INVESTMENT/investmenttestjouranlpdf"));
 
 
 /* ---------------- Health Check ---------------- */
