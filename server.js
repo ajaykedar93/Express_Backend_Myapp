@@ -192,6 +192,17 @@ app.use("/api/monthdpr", monthDprRoutes);
 //test download jouranal pdf api
 app.use("/api/investment/tradingjournal-pdf", require("./routes/INVESTMENT/investmenttestjouranlpdf"));
 
+//Taggle Transaction New Page
+const tagTransactionRoutes = require("./routes/NewProject/tag_transaction");
+app.use("/api/tag_transaction", tagTransactionRoutes);
+
+const tagCatSubRoutes  = require("./routes/NewProject/tag_catsub");
+app.use("/api", tagCatSubRoutes);
+
+
+
+
+
 
 /* ---------------- Health Check ---------------- */
 app.get("/health", (_req, res) => res.json({ status: "OK--(API LOAD START)" }));
