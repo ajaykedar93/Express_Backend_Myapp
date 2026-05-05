@@ -1,8 +1,4 @@
 // routes/inward.js
-// ✅ PostgreSQL + Express + PDFKit + Multer (memory) -> BYTEA in DB
-// ✅ ONE BILL FILE per inward (bill) + optional legacy files[]/fileIndexMap
-// ✅ upload routes BEFORE "/:id"
-// ✅ GET ONE returns ABSOLUTE file_url so React opens correctly
 
 const express = require("express");
 const PDFDocument = require("pdfkit");
@@ -10,13 +6,11 @@ const multer = require("multer");
 const db = require("../db");
 const ExcelJS = require("exceljs");
 
-
 const router = express.Router();
 
-// Multer in-memory (DB BYTEA)
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+  limits: { fileSize: 10 * 1024 * 1024 },
 });
 
 /* ---------------- helpers ---------------- */
@@ -30,9 +24,11 @@ function toISODate(d) {
   if (typeof d === "string") return d.slice(0, 10);
   const dt = new Date(d);
   if (Number.isNaN(dt.getTime())) return null;
+
   const yyyy = dt.getFullYear();
   const mm = String(dt.getMonth() + 1).padStart(2, "0");
   const dd = String(dt.getDate()).padStart(2, "0");
+
   return `${yyyy}-${mm}-${dd}`;
 }
 
@@ -60,7 +56,6 @@ function isMultipart(req) {
   return ct.includes("multipart/form-data");
 }
 
-// ✅ build absolute url for frontend (important)
 function getBaseUrl(req) {
   const proto = (req.headers["x-forwarded-proto"] || req.protocol || "http")
     .toString()
@@ -75,16 +70,6 @@ function getBaseUrl(req) {
   return `${proto}://${host}`;
 }
 
-/**
- * JSON:
- *  {work_date, store, items:[...]}
- *
- * multipart:
- *  work_date, store
- *  items (json string)
- *  bill (single file)  ✅ NEW
- *  fileIndexMap + files[] (legacy support)
- */
 function readPayload(req) {
   if (!isMultipart(req)) {
     return {
@@ -100,8 +85,6 @@ function readPayload(req) {
   const items = safeJsonParse(req.body?.items || "[]", []);
   const fileIndexMap = safeJsonParse(req.body?.fileIndexMap || "{}", {});
 
-  // ✅ multer.fields -> req.files is OBJECT: { bill:[...], files:[...] }
-  // ✅ multer.array -> req.files is ARRAY
   let billFile = null;
   let files = [];
 
@@ -119,7 +102,8 @@ function readPayload(req) {
     store: req.body?.store,
     items: Array.isArray(items) ? items : [],
     billFile,
-    fileIndexMap: fileIndexMap && typeof fileIndexMap === "object" ? fileIndexMap : {},
+    fileIndexMap:
+      fileIndexMap && typeof fileIndexMap === "object" ? fileIndexMap : {},
     files,
   };
 }
@@ -138,21 +122,25 @@ function validateHeaderAndItems(payload) {
   const cleanItems = rawItems.map((it, idx) => {
     const material = isNonEmptyString(it.material) ? it.material.trim() : "";
 
-    // ✅ OPTIONAL for b/c..., REQUIRED only for a) (idx==0)
-    const material_use = isNonEmptyString(it.material_use) ? it.material_use.trim() : null;
+    const material_use = isNonEmptyString(it.material_use)
+      ? it.material_use.trim()
+      : null;
 
     const quantity =
       it.quantity === null || it.quantity === undefined || it.quantity === ""
         ? null
         : Number(it.quantity);
 
-    const quantity_type = isNonEmptyString(it.quantity_type) ? it.quantity_type.trim() : null;
+    const quantity_type = isNonEmptyString(it.quantity_type)
+      ? it.quantity_type.trim()
+      : null;
 
-    const image_path = isNonEmptyString(it.image_path) ? it.image_path.trim() : null;
+    const image_path = isNonEmptyString(it.image_path)
+      ? it.image_path.trim()
+      : null;
 
     if (!material) errors.push(`items[${idx}].material is required.`);
 
-    // ✅ Only first row (a) requires material_use
     if (idx === 0 && !material_use) {
       errors.push(`items[${idx}].material_use is required for subpoint a).`);
     }
@@ -172,22 +160,30 @@ function validateHeaderAndItems(payload) {
     };
   });
 
-  // ✅ block duplicates inside same request
   const seen = new Set();
+
   for (let i = 0; i < cleanItems.length; i++) {
     const useKey = (cleanItems[i].material_use || "").toLowerCase();
-    const k = `${work_date}||${store.toLowerCase()}||${cleanItems[i].material.toLowerCase()}||${useKey}`;
+    const k = `${work_date}||${store.toLowerCase()}||${cleanItems[
+      i
+    ].material.toLowerCase()}||${useKey}`;
+
     if (seen.has(k)) {
       errors.push(`Duplicate not allowed inside request (Row ${i + 1}).`);
       break;
     }
+
     seen.add(k);
   }
 
-  return { ok: errors.length === 0, errors, work_date, store, items: cleanItems };
+  return {
+    ok: errors.length === 0,
+    errors,
+    work_date,
+    store,
+    items: cleanItems,
+  };
 }
-
-/* ---------------- FILE -> DB helpers ---------------- */
 
 function isAllowedBillFile(file) {
   if (!file) return false;
@@ -201,17 +197,16 @@ async function insertUpload(client, file) {
     VALUES ($1, $2, $3)
     RETURNING id
   `;
+
   const r = await client.query(q, [
     file.originalname || "file",
     file.mimetype || "application/octet-stream",
     file.buffer,
   ]);
+
   return r.rows[0].id;
 }
 
-/**
- * legacy: fileIndexMap {"0":true,"2":true} + files[] ordered by key
- */
 function buildIndexToFileMap(fileIndexMap, files) {
   const idxs = Object.keys(fileIndexMap || {})
     .filter((k) => fileIndexMap[k])
@@ -220,73 +215,100 @@ function buildIndexToFileMap(fileIndexMap, files) {
     .sort((a, b) => a - b);
 
   const map = new Map();
+
   for (let i = 0; i < idxs.length; i++) {
     map.set(idxs[i], files[i]);
   }
+
   return map;
 }
 
 /* =========================================================
-   ✅ UPLOAD ROUTES (BEFORE "/:id")
+   UPLOAD ROUTES
    ========================================================= */
 
-/**
- * ✅ PREVIEW uploaded file INLINE (for <img> and <iframe>)
- * GET /api/inward/upload/:uploadId/view
- */
 router.get("/upload/:uploadId/view", async (req, res) => {
   const uploadId = Number(req.params.uploadId);
-  if (Number.isNaN(uploadId)) return res.status(400).json({ success: false, message: "Invalid uploadId" });
+
+  if (Number.isNaN(uploadId)) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid uploadId",
+    });
+  }
 
   try {
     const r = await db.query(
       `SELECT id, file_name, mime_type, file_data FROM inward_uploads WHERE id=$1`,
       [uploadId]
     );
-    if (r.rowCount === 0) return res.status(404).json({ success: false, message: "File not found" });
+
+    if (r.rowCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "File not found",
+      });
+    }
 
     const f = r.rows[0];
     const safeName = String(f.file_name || "file").replace(/"/g, "");
+
     res.setHeader("Content-Type", f.mime_type || "application/octet-stream");
     res.setHeader("Content-Disposition", `inline; filename="${safeName}"`);
+
     return res.end(f.file_data);
   } catch (err) {
-    return res.status(500).json({ success: false, message: "Server error", error: String(err) });
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: String(err),
+    });
   }
 });
 
-/**
- * ✅ DOWNLOAD uploaded file (force download)
- * GET /api/inward/upload/:uploadId/download
- */
 router.get("/upload/:uploadId/download", async (req, res) => {
   const uploadId = Number(req.params.uploadId);
-  if (Number.isNaN(uploadId)) return res.status(400).json({ success: false, message: "Invalid uploadId" });
+
+  if (Number.isNaN(uploadId)) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid uploadId",
+    });
+  }
 
   try {
     const r = await db.query(
       `SELECT id, file_name, mime_type, file_data FROM inward_uploads WHERE id=$1`,
       [uploadId]
     );
-    if (r.rowCount === 0) return res.status(404).json({ success: false, message: "File not found" });
+
+    if (r.rowCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "File not found",
+      });
+    }
 
     const f = r.rows[0];
     const safeName = String(f.file_name || "file").replace(/"/g, "");
 
     res.setHeader("Content-Type", f.mime_type || "application/octet-stream");
     res.setHeader("Content-Disposition", `attachment; filename="${safeName}"`);
+
     return res.end(f.file_data);
   } catch (err) {
-    return res.status(500).json({ success: false, message: "Server error", error: String(err) });
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: String(err),
+    });
   }
 });
 
-/* ---------------- ROUTES ---------------- */
+/* =========================================================
+   LIST
+   ========================================================= */
 
-/**
- * ✅ LIST
- * GET /api/inward?from=YYYY-MM-DD&to=YYYY-MM-DD
- */
 router.get("/", async (req, res) => {
   const from = toISODate(req.query.from);
   const to = toISODate(req.query.to);
@@ -300,37 +322,40 @@ router.get("/", async (req, res) => {
       params.push(from);
       where.push(`work_date >= $${params.length}`);
     }
+
     if (to) {
       params.push(to);
       where.push(`work_date <= $${params.length}`);
     }
+
     if (where.length) q += ` WHERE ` + where.join(" AND ");
+
     q += ` ORDER BY seq_no DESC`;
 
     const r = await db.query(q, params);
-    return res.json({ success: true, data: r.rows });
+
+    return res.json({
+      success: true,
+      data: r.rows,
+    });
   } catch (err) {
-    return res.status(500).json({ success: false, message: "Server error", error: String(err) });
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: String(err),
+    });
   }
 });
 
-/**
- * ✅ MULTI PDF (range)
- * GET /api/inward/pdf?from=YYYY-MM-DD&to=YYYY-MM-DD
- *
- * ✅ PDF ONLY RULES (UPDATED as you asked):
- * 1) Sr.No is ENTRY-wise sequence starting from 1 within the filtered range
- *    - Each inward record (store entry) gets Sr.No on its first row
- *    - Remaining rows of same entry => Sr.No blank
- * 2) Same Date + Same Store + Same Material => Quantity ADD (merge in PDF output only)
- * 3) Date + Store prints only for first row of that entry
- */
+/* =========================================================
+   MULTI PDF
+   ========================================================= */
+
 router.get("/pdf", async (req, res) => {
   const from = toISODate(req.query.from);
   const to = toISODate(req.query.to);
 
   try {
-    // headers (keep your structure)
     let q = `SELECT id, seq_no, work_date, store FROM inward`;
     const params = [];
     const where = [];
@@ -339,18 +364,25 @@ router.get("/pdf", async (req, res) => {
       params.push(from);
       where.push(`work_date >= $${params.length}`);
     }
+
     if (to) {
       params.push(to);
       where.push(`work_date <= $${params.length}`);
     }
+
     if (where.length) q += ` WHERE ` + where.join(" AND ");
 
-    // ✅ order: old -> new, store, id
     q += ` ORDER BY work_date ASC, store ASC, id ASC`;
 
     const headers = await db.query(q, params);
     const ids = headers.rows.map((r) => r.id);
-    if (ids.length === 0) return res.status(404).json({ success: false, message: "No records found" });
+
+    if (ids.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "No records found",
+      });
+    }
 
     const itemsRes = await db.query(
       `
@@ -362,522 +394,108 @@ router.get("/pdf", async (req, res) => {
       [ids]
     );
 
-    // build id -> header
     const headerMap = new Map();
-    for (const h of headers.rows) headerMap.set(h.id, { ...h, items: [] });
+
+    for (const h of headers.rows) {
+      headerMap.set(h.id, { ...h, items: [] });
+    }
 
     for (const it of itemsRes.rows) {
       const rec = headerMap.get(it.inward_id);
       if (rec) rec.items.push(it);
     }
 
-    // ========= ✅ PDF MERGE (Same Date + Same Store + Same Material => Quantity ADD) =========
     const recordsMerged = [];
 
     for (const rec of headerMap.values()) {
       const items = Array.isArray(rec.items) ? rec.items : [];
+
       if (items.length === 0) continue;
 
-      // merge inside this one entry by material only
       const byMat = new Map();
 
       for (const it of items) {
         const matKey = String(it.material || "").toLowerCase();
+
         if (!matKey) continue;
 
         const existing = byMat.get(matKey);
+
         if (!existing) {
-          byMat.set(matKey, { ...it }); // copy
+          byMat.set(matKey, { ...it });
           continue;
         }
 
-        // add quantity
-        const a = existing.quantity === null || existing.quantity === undefined ? 0 : Number(existing.quantity);
-        const b = it.quantity === null || it.quantity === undefined ? 0 : Number(it.quantity);
-        existing.quantity = (Number.isNaN(a) ? 0 : a) + (Number.isNaN(b) ? 0 : b);
+        const a =
+          existing.quantity === null || existing.quantity === undefined
+            ? 0
+            : Number(existing.quantity);
 
-        // keep quantity_type/material_use (prefer existing, else new)
-        existing.quantity_type = existing.quantity_type || it.quantity_type || null;
-        existing.material_use = existing.material_use || it.material_use || null;
+        const b =
+          it.quantity === null || it.quantity === undefined
+            ? 0
+            : Number(it.quantity);
 
-        // keep any upload/image
+        existing.quantity =
+          (Number.isNaN(a) ? 0 : a) + (Number.isNaN(b) ? 0 : b);
+
+        existing.quantity_type =
+          existing.quantity_type || it.quantity_type || null;
+
+        existing.material_use =
+          existing.material_use || it.material_use || null;
+
         existing.upload_id = existing.upload_id || it.upload_id || null;
         existing.image_path = existing.image_path || it.image_path || null;
       }
 
-      // convert merged map to array with fresh item_order 1..N
       const mergedItems = Array.from(byMat.values())
-        .sort((x, y) => String(x.material || "").localeCompare(String(y.material || "")))
-        .map((x, idx) => ({ ...x, item_order: idx + 1 }));
+        .sort((x, y) =>
+          String(x.material || "").localeCompare(String(y.material || ""))
+        )
+        .map((x, idx) => ({
+          ...x,
+          item_order: idx + 1,
+        }));
 
-      recordsMerged.push({ ...rec, items: mergedItems });
+      recordsMerged.push({
+        ...rec,
+        items: mergedItems,
+      });
     }
 
-    // final sort (same as query)
     recordsMerged.sort((a, b) => {
       const da = String(a.work_date || "").slice(0, 10);
       const dbb = String(b.work_date || "").slice(0, 10);
+
       if (da !== dbb) return da.localeCompare(dbb);
+
       const sa = String(a.store || "");
       const sb = String(b.store || "");
+
       if (sa !== sb) return sa.localeCompare(sb);
+
       return Number(a.id || 0) - Number(b.id || 0);
     });
 
-    // ========= ✅ ENTRY-WISE Sr.No (start 1..N for each entry) =========
     recordsMerged.forEach((rec, idx) => {
-      rec.seq_no = idx + 1; // override ONLY for PDF rendering
+      rec.seq_no = idx + 1;
     });
 
     return drawInwardPDF(res, recordsMerged, "inward-details.pdf");
   } catch (err) {
-    return res.status(500).json({ success: false, message: "Server error", error: String(err) });
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: String(err),
+    });
   }
 });
 
-/**
- * ✅ GET ONE (returns ABSOLUTE file_url)
- * GET /api/inward/:id
- */
-router.get("/:id", async (req, res) => {
-  const inwardId = Number(req.params.id);
-  if (Number.isNaN(inwardId)) return res.status(400).json({ success: false, message: "Invalid id" });
+/* =========================================================
+   EXCEL DOWNLOAD - IMPORTANT: BEFORE /:id
+   ========================================================= */
 
-  try {
-    const header = await db.query(
-      `SELECT id, seq_no, work_date, store, created_at FROM inward WHERE id=$1`,
-      [inwardId]
-    );
-    if (header.rowCount === 0) return res.status(404).json({ success: false, message: "Inward not found" });
-
-    const base = getBaseUrl(req);
-
-    const items = await db.query(
-      `
-      SELECT
-        id, item_order, material, quantity, quantity_type, material_use, image_path, upload_id, created_at,
-        CASE
-          WHEN upload_id IS NOT NULL THEN $2 || '/api/inward/upload/' || upload_id || '/view'
-          ELSE image_path
-        END AS file_url
-      FROM inward_items
-      WHERE inward_id=$1
-      ORDER BY item_order
-      `,
-      [inwardId, base]
-    );
-
-    return res.json({ success: true, data: { ...header.rows[0], items: items.rows } });
-  } catch (err) {
-    return res.status(500).json({ success: false, message: "Server error", error: String(err) });
-  }
-});
-
-/**
- * ✅ SINGLE PDF
- * GET /api/inward/:id/pdf
- */
-router.get("/:id/pdf", async (req, res) => {
-  const inwardId = Number(req.params.id);
-  if (Number.isNaN(inwardId)) return res.status(400).json({ success: false, message: "Invalid id" });
-
-  try {
-    const header = await db.query(`SELECT id, seq_no, work_date, store FROM inward WHERE id=$1`, [inwardId]);
-    if (header.rowCount === 0) return res.status(404).json({ success: false, message: "Inward not found" });
-
-    const items = await db.query(
-      `
-      SELECT item_order, material, quantity, quantity_type, material_use, image_path, upload_id
-      FROM inward_items
-      WHERE inward_id=$1
-      ORDER BY item_order
-      `,
-      [inwardId]
-    );
-
-    const rec = { ...header.rows[0], items: items.rows };
-    return drawInwardPDF(res, [rec], `inward-${rec.seq_no}.pdf`);
-  } catch (err) {
-    return res.status(500).json({ success: false, message: "Server error", error: String(err) });
-  }
-});
-
-/**
- * ✅ CREATE
- * POST /api/inward
- * Accepts:
- *  - bill (single file) ✅ preferred
- *  - or legacy files[] + fileIndexMap
- */
-router.post(
-  "/",
-  upload.fields([{ name: "bill", maxCount: 1 }, { name: "files", maxCount: 50 }]),
-  async (req, res) => {
-    const payload = readPayload(req);
-    const v = validateHeaderAndItems(payload);
-
-    if (!v.ok) {
-      return res.status(400).json({ success: false, message: "Validation failed", errors: v.errors });
-    }
-
-    const client = await db.connect();
-    try {
-      await client.query("BEGIN");
-
-      const header = await client.query(
-        `INSERT INTO inward (work_date, store) VALUES ($1,$2) RETURNING id, seq_no, work_date, store`,
-        [v.work_date, v.store]
-      );
-      const inwardId = header.rows[0].id;
-
-      // ✅ NEW: one bill file for whole inward
-      let commonUploadId = null;
-      if (payload.billFile && payload.billFile.buffer) {
-        if (!isAllowedBillFile(payload.billFile)) {
-          await client.query("ROLLBACK");
-          return res.status(400).json({ success: false, message: "Only image or PDF allowed for bill." });
-        }
-        commonUploadId = await insertUpload(client, payload.billFile);
-      }
-
-      // legacy support (optional)
-      let indexToFile = new Map();
-      if (!commonUploadId && isMultipart(req)) {
-        indexToFile = buildIndexToFileMap(payload.fileIndexMap, payload.files);
-      }
-
-      for (let idx = 0; idx < v.items.length; idx++) {
-        const it = v.items[idx];
-
-        if (commonUploadId) {
-          it.upload_id = commonUploadId;
-        } else {
-          const file = indexToFile.get(idx);
-          if (file && file.buffer) {
-            if (!isAllowedBillFile(file)) {
-              await client.query("ROLLBACK");
-              return res.status(400).json({ success: false, message: "Only image or PDF allowed for bill." });
-            }
-            const uploadId = await insertUpload(client, file);
-            it.upload_id = uploadId;
-          }
-        }
-
-        await client.query(
-          `
-        INSERT INTO inward_items
-          (inward_id, item_order, material, quantity, quantity_type, material_use, image_path, upload_id)
-        VALUES
-          ($1,$2,$3,$4,$5,$6,$7,$8)
-        `,
-          [inwardId, it.item_order, it.material, it.quantity, it.quantity_type, it.material_use, it.image_path, it.upload_id]
-        );
-      }
-
-      await client.query("COMMIT");
-      return res.json({ success: true, message: "Inward created", data: header.rows[0] });
-    } catch (err) {
-      await client.query("ROLLBACK");
-
-      if (pgDuplicateError(err)) {
-        return res.status(409).json({
-          success: false,
-          message: "Duplicate entry not allowed (Same Date + Store + Material + Material Use must be unique).",
-          error: err.detail || String(err),
-        });
-      }
-
-      return res.status(500).json({ success: false, message: "Server error", error: String(err) });
-    } finally {
-      client.release();
-    }
-  }
-);
-
-/**
- * ✅ UPDATE (replaces all items)
- * PUT /api/inward/:id
- *
- * Note: If bill not sent, it keeps previous bill (if any) by reading old upload_id.
- */
-router.put(
-  "/:id",
-  upload.fields([{ name: "bill", maxCount: 1 }, { name: "files", maxCount: 50 }]),
-  async (req, res) => {
-    const inwardId = Number(req.params.id);
-    if (Number.isNaN(inwardId)) return res.status(400).json({ success: false, message: "Invalid id" });
-
-    const payload = readPayload(req);
-    const v = validateHeaderAndItems(payload);
-
-    if (!v.ok) {
-      return res.status(400).json({ success: false, message: "Validation failed", errors: v.errors });
-    }
-
-    const client = await db.connect();
-    try {
-      await client.query("BEGIN");
-
-      const existing = await client.query(`SELECT id FROM inward WHERE id=$1`, [inwardId]);
-      if (existing.rowCount === 0) {
-        await client.query("ROLLBACK");
-        return res.status(404).json({ success: false, message: "Inward not found" });
-      }
-
-      const header = await client.query(
-        `UPDATE inward SET work_date=$1, store=$2 WHERE id=$3 RETURNING id, seq_no, work_date, store`,
-        [v.work_date, v.store, inwardId]
-      );
-
-      // ✅ find old upload_id (to keep if new bill not provided)
-      const oldUpload = await client.query(
-        `SELECT upload_id FROM inward_items WHERE inward_id=$1 AND upload_id IS NOT NULL ORDER BY id LIMIT 1`,
-        [inwardId]
-      );
-      const oldUploadId = oldUpload.rowCount ? oldUpload.rows[0].upload_id : null;
-
-      // ✅ new bill?
-      let commonUploadId = oldUploadId;
-      if (payload.billFile && payload.billFile.buffer) {
-        if (!isAllowedBillFile(payload.billFile)) {
-          await client.query("ROLLBACK");
-          return res.status(400).json({ success: false, message: "Only image or PDF allowed for bill." });
-        }
-        commonUploadId = await insertUpload(client, payload.billFile);
-      }
-
-      // replace items
-      await client.query(`DELETE FROM inward_items WHERE inward_id=$1`, [inwardId]);
-
-      // legacy support (ONLY if there is no commonUploadId)
-      let indexToFile = new Map();
-      if (!commonUploadId && isMultipart(req)) {
-        indexToFile = buildIndexToFileMap(payload.fileIndexMap, payload.files);
-      }
-
-      for (let idx = 0; idx < v.items.length; idx++) {
-        const it = v.items[idx];
-
-        if (commonUploadId) {
-          it.upload_id = commonUploadId;
-        } else {
-          const file = indexToFile.get(idx);
-          if (file && file.buffer) {
-            if (!isAllowedBillFile(file)) {
-              await client.query("ROLLBACK");
-              return res.status(400).json({ success: false, message: "Only image or PDF allowed for bill." });
-            }
-            const uploadId = await insertUpload(client, file);
-            it.upload_id = uploadId;
-          }
-        }
-
-        await client.query(
-          `
-        INSERT INTO inward_items
-          (inward_id, item_order, material, quantity, quantity_type, material_use, image_path, upload_id)
-        VALUES
-          ($1,$2,$3,$4,$5,$6,$7,$8)
-        `,
-          [inwardId, it.item_order, it.material, it.quantity, it.quantity_type, it.material_use, it.image_path, it.upload_id]
-        );
-      }
-
-      await client.query("COMMIT");
-      return res.json({ success: true, message: "Inward updated", data: header.rows[0] });
-    } catch (err) {
-      await client.query("ROLLBACK");
-
-      if (pgDuplicateError(err)) {
-        return res.status(409).json({
-          success: false,
-          message: "Duplicate entry not allowed (Same Date + Store + Material + Material Use must be unique).",
-          error: err.detail || String(err),
-        });
-      }
-
-      return res.status(500).json({ success: false, message: "Server error", error: String(err) });
-    } finally {
-      client.release();
-    }
-  }
-);
-
-/**
- * ✅ DELETE
- * DELETE /api/inward/:id
- */
-router.delete("/:id", async (req, res) => {
-  const inwardId = Number(req.params.id);
-  if (Number.isNaN(inwardId)) return res.status(400).json({ success: false, message: "Invalid id" });
-
-  try {
-    const del = await db.query(`DELETE FROM inward WHERE id=$1 RETURNING id`, [inwardId]);
-    if (del.rowCount === 0) return res.status(404).json({ success: false, message: "Inward not found" });
-
-    return res.json({ success: true, message: "Inward deleted" });
-  } catch (err) {
-    return res.status(500).json({ success: false, message: "Server error", error: String(err) });
-  }
-});
-
-/* ---------------- PDF ---------------- */
-
-function drawInwardPDF(res, records, fileName = "inward-details.pdf") {
-  const doc = new PDFDocument({
-    size: "A4",
-    layout: "portrait",
-    margins: { top: 40, bottom: 40, left: 40, right: 40 },
-    autoFirstPage: true,
-  });
-
-  res.setHeader("Content-Type", "application/pdf");
-  res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
-  doc.pipe(res);
-
-  const pageWidth = doc.page.width;
-  const { left, right, top, bottom } = doc.page.margins;
-  const usableWidth = pageWidth - left - right;
-
-  doc.font("Times-Bold").fontSize(16);
-  doc.text("Inward Details", left, top, { width: usableWidth, align: "center" });
-
-  let y = top + 30;
-
-  const cols = [
-    { key: "srno", label: "Sr.No", w: 50, align: "center" },
-    { key: "date", label: "Date", w: 70, align: "center" },
-    { key: "material", label: "Material", w: 150, align: "left" },
-    { key: "qty", label: "Quantity", w: 80, align: "center" },
-    { key: "store", label: "Store", w: 90, align: "left" },
-    { key: "use", label: "Material Use", w: usableWidth - (50 + 70 + 150 + 80 + 90), align: "left" },
-  ];
-
-  const tableLeft = left;
-  const tableRight = left + usableWidth;
-
-  function ensurePageSpace(needed) {
-    const pageBottomY = doc.page.height - bottom;
-    if (y + needed > pageBottomY) {
-      doc.addPage();
-      doc.font("Times-Bold").fontSize(14);
-      doc.text("Inward Details", left, doc.page.margins.top, { width: usableWidth, align: "center" });
-      y = doc.page.margins.top + 26;
-      drawHeaderRow();
-    }
-  }
-
-  function drawTableBorder(x, y0, w, h, thick = 0.7) {
-    doc.lineWidth(thick).rect(x, y0, w, h).stroke();
-  }
-
-  function drawHeaderRow() {
-    const headerH = 24;
-    ensurePageSpace(headerH + 10);
-
-    drawTableBorder(tableLeft, y, usableWidth, headerH, 1);
-
-    let x = tableLeft;
-    doc.font("Times-Bold").fontSize(11);
-    for (const c of cols) {
-      doc.lineWidth(0.7).moveTo(x, y).lineTo(x, y + headerH).stroke();
-      doc.text(c.label, x + 4, y + 6, { width: c.w - 8, align: c.align });
-      x += c.w;
-    }
-    doc.lineWidth(0.7).moveTo(tableRight, y).lineTo(tableRight, y + headerH).stroke();
-    y += headerH;
-  }
-
-  function measureCellHeight(text, width, fontName, fontSize) {
-    doc.font(fontName).fontSize(fontSize);
-    return doc.heightOfString(text || "", { width: Math.max(10, width), align: "left" });
-  }
-
-  function drawRow(cells, rowH) {
-    ensurePageSpace(rowH + 5);
-    drawTableBorder(tableLeft, y, usableWidth, rowH, 0.7);
-
-    let x = tableLeft;
-    for (const c of cols) {
-      doc.lineWidth(0.7).moveTo(x, y).lineTo(x, y + rowH).stroke();
-
-      const padX = 4;
-      const padY = 4;
-      doc.font("Times-Roman").fontSize(10);
-
-      doc.text(String(cells[c.key] ?? ""), x + padX, y + padY, {
-        width: c.w - padX * 2,
-        height: rowH - padY * 2,
-        align: c.align,
-      });
-
-      x += c.w;
-    }
-    doc.lineWidth(0.7).moveTo(tableRight, y).lineTo(tableRight, y + rowH).stroke();
-    y += rowH;
-  }
-
-  function drawBoldSeparationLine() {
-    ensurePageSpace(10);
-    doc.lineWidth(2).moveTo(tableLeft, y).lineTo(tableRight, y).stroke();
-    y += 8;
-  }
-
-  drawHeaderRow();
-
-  // ✅ UPDATED RULE: Sr.No prints for EACH ENTRY (inward record) only on first row, others blank
-  for (const rec of records) {
-    const items = rec.items || [];
-    if (items.length === 0) continue;
-
-    const dateKey = String(rec.work_date || "").slice(0, 10);
-
-    for (let idx = 0; idx < items.length; idx++) {
-      const it = items[idx];
-      const subLetter = String.fromCharCode(97 + ((it.item_order || (idx + 1)) - 1));
-      const materialText = `${subLetter}) ${it.material || ""}`.trim();
-
-      const qtyText =
-        it.quantity === null || it.quantity === undefined
-          ? ""
-          : `${it.quantity}${it.quantity_type ? " " + it.quantity_type : ""}`;
-
-      const srText = idx === 0 ? String(rec.seq_no) : "";
-      const dateText = idx === 0 ? formatDateDDMMYYYY(dateKey) : "";
-      const storeText = idx === 0 ? String(rec.store || "") : "";
-      const useText = it.material_use || "";
-
-      const materialH = measureCellHeight(
-        materialText,
-        cols.find((c) => c.key === "material").w - 8,
-        "Times-Roman",
-        10
-      );
-      const useH = measureCellHeight(
-        useText,
-        cols.find((c) => c.key === "use").w - 8,
-        "Times-Roman",
-        10
-      );
-      const rowH = Math.max(22, Math.ceil(Math.max(materialH, useH) + 8));
-
-      drawRow(
-        { srno: srText, date: dateText, material: materialText, qty: qtyText, store: storeText, use: useText },
-        rowH
-      );
-    }
-
-    drawBoldSeparationLine();
-  }
-
-  doc.end();
-}
-
-
-/**
- * ✅ EXCEL DOWNLOAD
- * GET /api/inward/excel?from=YYYY-MM-DD&to=YYYY-MM-DD
- */
 router.get("/excel", async (req, res) => {
   const from = toISODate(req.query.from);
   const to = toISODate(req.query.to);
@@ -897,9 +515,7 @@ router.get("/excel", async (req, res) => {
       where.push(`work_date <= $${params.length}`);
     }
 
-    if (where.length) {
-      q += ` WHERE ` + where.join(" AND ");
-    }
+    if (where.length) q += ` WHERE ` + where.join(" AND ");
 
     q += ` ORDER BY work_date ASC, store ASC, id ASC`;
 
@@ -916,13 +532,7 @@ router.get("/excel", async (req, res) => {
 
     const itemsRes = await db.query(
       `
-      SELECT 
-        inward_id,
-        item_order,
-        material,
-        quantity,
-        quantity_type,
-        material_use
+      SELECT inward_id, item_order, material, quantity, quantity_type, material_use
       FROM inward_items
       WHERE inward_id = ANY($1::bigint[])
       ORDER BY inward_id, item_order
@@ -1013,13 +623,10 @@ router.get("/excel", async (req, res) => {
       const dateKey = String(rec.work_date || "").slice(0, 10);
       const items = Array.isArray(rec.items) ? rec.items : [];
 
-      if (items.length === 0) {
-        continue;
-      }
+      if (items.length === 0) continue;
 
       for (let idx = 0; idx < items.length; idx++) {
         const it = items[idx];
-
         const subLetter = String.fromCharCode(97 + idx);
 
         const materialText = `${subLetter}) ${it.material || ""}`;
@@ -1101,5 +708,675 @@ router.get("/excel", async (req, res) => {
     });
   }
 });
+
+/* =========================================================
+   SINGLE PDF - BEFORE /:id
+   ========================================================= */
+
+router.get("/:id/pdf", async (req, res) => {
+  const inwardId = Number(req.params.id);
+
+  if (Number.isNaN(inwardId)) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid id",
+    });
+  }
+
+  try {
+    const header = await db.query(
+      `SELECT id, seq_no, work_date, store FROM inward WHERE id=$1`,
+      [inwardId]
+    );
+
+    if (header.rowCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Inward not found",
+      });
+    }
+
+    const items = await db.query(
+      `
+      SELECT item_order, material, quantity, quantity_type, material_use, image_path, upload_id
+      FROM inward_items
+      WHERE inward_id=$1
+      ORDER BY item_order
+      `,
+      [inwardId]
+    );
+
+    const rec = {
+      ...header.rows[0],
+      items: items.rows,
+    };
+
+    return drawInwardPDF(res, [rec], `inward-${rec.seq_no}.pdf`);
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: String(err),
+    });
+  }
+});
+
+/* =========================================================
+   GET ONE - AFTER STATIC ROUTES
+   ========================================================= */
+
+router.get("/:id", async (req, res) => {
+  const inwardId = Number(req.params.id);
+
+  if (Number.isNaN(inwardId)) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid id",
+    });
+  }
+
+  try {
+    const header = await db.query(
+      `SELECT id, seq_no, work_date, store, created_at FROM inward WHERE id=$1`,
+      [inwardId]
+    );
+
+    if (header.rowCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Inward not found",
+      });
+    }
+
+    const base = getBaseUrl(req);
+
+    const items = await db.query(
+      `
+      SELECT
+        id, item_order, material, quantity, quantity_type, material_use, image_path, upload_id, created_at,
+        CASE
+          WHEN upload_id IS NOT NULL THEN $2 || '/api/inward/upload/' || upload_id || '/view'
+          ELSE image_path
+        END AS file_url
+      FROM inward_items
+      WHERE inward_id=$1
+      ORDER BY item_order
+      `,
+      [inwardId, base]
+    );
+
+    return res.json({
+      success: true,
+      data: {
+        ...header.rows[0],
+        items: items.rows,
+      },
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: String(err),
+    });
+  }
+});
+
+/* =========================================================
+   CREATE
+   ========================================================= */
+
+router.post(
+  "/",
+  upload.fields([
+    { name: "bill", maxCount: 1 },
+    { name: "files", maxCount: 50 },
+  ]),
+  async (req, res) => {
+    const payload = readPayload(req);
+    const v = validateHeaderAndItems(payload);
+
+    if (!v.ok) {
+      return res.status(400).json({
+        success: false,
+        message: "Validation failed",
+        errors: v.errors,
+      });
+    }
+
+    const client = await db.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      const header = await client.query(
+        `INSERT INTO inward (work_date, store) VALUES ($1,$2) RETURNING id, seq_no, work_date, store`,
+        [v.work_date, v.store]
+      );
+
+      const inwardId = header.rows[0].id;
+
+      let commonUploadId = null;
+
+      if (payload.billFile && payload.billFile.buffer) {
+        if (!isAllowedBillFile(payload.billFile)) {
+          await client.query("ROLLBACK");
+
+          return res.status(400).json({
+            success: false,
+            message: "Only image or PDF allowed for bill.",
+          });
+        }
+
+        commonUploadId = await insertUpload(client, payload.billFile);
+      }
+
+      let indexToFile = new Map();
+
+      if (!commonUploadId && isMultipart(req)) {
+        indexToFile = buildIndexToFileMap(payload.fileIndexMap, payload.files);
+      }
+
+      for (let idx = 0; idx < v.items.length; idx++) {
+        const it = v.items[idx];
+
+        if (commonUploadId) {
+          it.upload_id = commonUploadId;
+        } else {
+          const file = indexToFile.get(idx);
+
+          if (file && file.buffer) {
+            if (!isAllowedBillFile(file)) {
+              await client.query("ROLLBACK");
+
+              return res.status(400).json({
+                success: false,
+                message: "Only image or PDF allowed for bill.",
+              });
+            }
+
+            const uploadId = await insertUpload(client, file);
+            it.upload_id = uploadId;
+          }
+        }
+
+        await client.query(
+          `
+          INSERT INTO inward_items
+            (inward_id, item_order, material, quantity, quantity_type, material_use, image_path, upload_id)
+          VALUES
+            ($1,$2,$3,$4,$5,$6,$7,$8)
+          `,
+          [
+            inwardId,
+            it.item_order,
+            it.material,
+            it.quantity,
+            it.quantity_type,
+            it.material_use,
+            it.image_path,
+            it.upload_id,
+          ]
+        );
+      }
+
+      await client.query("COMMIT");
+
+      return res.json({
+        success: true,
+        message: "Inward created",
+        data: header.rows[0],
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+
+      if (pgDuplicateError(err)) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "Duplicate entry not allowed (Same Date + Store + Material + Material Use must be unique).",
+          error: err.detail || String(err),
+        });
+      }
+
+      return res.status(500).json({
+        success: false,
+        message: "Server error",
+        error: String(err),
+      });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+/* =========================================================
+   UPDATE
+   ========================================================= */
+
+router.put(
+  "/:id",
+  upload.fields([
+    { name: "bill", maxCount: 1 },
+    { name: "files", maxCount: 50 },
+  ]),
+  async (req, res) => {
+    const inwardId = Number(req.params.id);
+
+    if (Number.isNaN(inwardId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid id",
+      });
+    }
+
+    const payload = readPayload(req);
+    const v = validateHeaderAndItems(payload);
+
+    if (!v.ok) {
+      return res.status(400).json({
+        success: false,
+        message: "Validation failed",
+        errors: v.errors,
+      });
+    }
+
+    const client = await db.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      const existing = await client.query(`SELECT id FROM inward WHERE id=$1`, [
+        inwardId,
+      ]);
+
+      if (existing.rowCount === 0) {
+        await client.query("ROLLBACK");
+
+        return res.status(404).json({
+          success: false,
+          message: "Inward not found",
+        });
+      }
+
+      const header = await client.query(
+        `UPDATE inward SET work_date=$1, store=$2 WHERE id=$3 RETURNING id, seq_no, work_date, store`,
+        [v.work_date, v.store, inwardId]
+      );
+
+      const oldUpload = await client.query(
+        `SELECT upload_id FROM inward_items WHERE inward_id=$1 AND upload_id IS NOT NULL ORDER BY id LIMIT 1`,
+        [inwardId]
+      );
+
+      const oldUploadId = oldUpload.rowCount
+        ? oldUpload.rows[0].upload_id
+        : null;
+
+      let commonUploadId = oldUploadId;
+
+      if (payload.billFile && payload.billFile.buffer) {
+        if (!isAllowedBillFile(payload.billFile)) {
+          await client.query("ROLLBACK");
+
+          return res.status(400).json({
+            success: false,
+            message: "Only image or PDF allowed for bill.",
+          });
+        }
+
+        commonUploadId = await insertUpload(client, payload.billFile);
+      }
+
+      await client.query(`DELETE FROM inward_items WHERE inward_id=$1`, [
+        inwardId,
+      ]);
+
+      let indexToFile = new Map();
+
+      if (!commonUploadId && isMultipart(req)) {
+        indexToFile = buildIndexToFileMap(payload.fileIndexMap, payload.files);
+      }
+
+      for (let idx = 0; idx < v.items.length; idx++) {
+        const it = v.items[idx];
+
+        if (commonUploadId) {
+          it.upload_id = commonUploadId;
+        } else {
+          const file = indexToFile.get(idx);
+
+          if (file && file.buffer) {
+            if (!isAllowedBillFile(file)) {
+              await client.query("ROLLBACK");
+
+              return res.status(400).json({
+                success: false,
+                message: "Only image or PDF allowed for bill.",
+              });
+            }
+
+            const uploadId = await insertUpload(client, file);
+            it.upload_id = uploadId;
+          }
+        }
+
+        await client.query(
+          `
+          INSERT INTO inward_items
+            (inward_id, item_order, material, quantity, quantity_type, material_use, image_path, upload_id)
+          VALUES
+            ($1,$2,$3,$4,$5,$6,$7,$8)
+          `,
+          [
+            inwardId,
+            it.item_order,
+            it.material,
+            it.quantity,
+            it.quantity_type,
+            it.material_use,
+            it.image_path,
+            it.upload_id,
+          ]
+        );
+      }
+
+      await client.query("COMMIT");
+
+      return res.json({
+        success: true,
+        message: "Inward updated",
+        data: header.rows[0],
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+
+      if (pgDuplicateError(err)) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "Duplicate entry not allowed (Same Date + Store + Material + Material Use must be unique).",
+          error: err.detail || String(err),
+        });
+      }
+
+      return res.status(500).json({
+        success: false,
+        message: "Server error",
+        error: String(err),
+      });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+/* =========================================================
+   DELETE
+   ========================================================= */
+
+router.delete("/:id", async (req, res) => {
+  const inwardId = Number(req.params.id);
+
+  if (Number.isNaN(inwardId)) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid id",
+    });
+  }
+
+  try {
+    const del = await db.query(`DELETE FROM inward WHERE id=$1 RETURNING id`, [
+      inwardId,
+    ]);
+
+    if (del.rowCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Inward not found",
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: "Inward deleted",
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: String(err),
+    });
+  }
+});
+
+/* =========================================================
+   PDF FUNCTION
+   ========================================================= */
+
+function drawInwardPDF(res, records, fileName = "inward-details.pdf") {
+  const doc = new PDFDocument({
+    size: "A4",
+    layout: "portrait",
+    margins: {
+      top: 40,
+      bottom: 40,
+      left: 40,
+      right: 40,
+    },
+    autoFirstPage: true,
+  });
+
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+
+  doc.pipe(res);
+
+  const pageWidth = doc.page.width;
+  const { left, right, top, bottom } = doc.page.margins;
+  const usableWidth = pageWidth - left - right;
+
+  doc.font("Times-Bold").fontSize(16);
+  doc.text("Inward Details", left, top, {
+    width: usableWidth,
+    align: "center",
+  });
+
+  let y = top + 30;
+
+  const cols = [
+    {
+      key: "srno",
+      label: "Sr.No",
+      w: 50,
+      align: "center",
+    },
+    {
+      key: "date",
+      label: "Date",
+      w: 70,
+      align: "center",
+    },
+    {
+      key: "material",
+      label: "Material",
+      w: 150,
+      align: "left",
+    },
+    {
+      key: "qty",
+      label: "Quantity",
+      w: 80,
+      align: "center",
+    },
+    {
+      key: "store",
+      label: "Store",
+      w: 90,
+      align: "left",
+    },
+    {
+      key: "use",
+      label: "Material Use",
+      w: usableWidth - (50 + 70 + 150 + 80 + 90),
+      align: "left",
+    },
+  ];
+
+  const tableLeft = left;
+  const tableRight = left + usableWidth;
+
+  function ensurePageSpace(needed) {
+    const pageBottomY = doc.page.height - bottom;
+
+    if (y + needed > pageBottomY) {
+      doc.addPage();
+      doc.font("Times-Bold").fontSize(14);
+      doc.text("Inward Details", left, doc.page.margins.top, {
+        width: usableWidth,
+        align: "center",
+      });
+
+      y = doc.page.margins.top + 26;
+      drawHeaderRow();
+    }
+  }
+
+  function drawTableBorder(x, y0, w, h, thick = 0.7) {
+    doc.lineWidth(thick).rect(x, y0, w, h).stroke();
+  }
+
+  function drawHeaderRow() {
+    const headerH = 24;
+
+    ensurePageSpace(headerH + 10);
+
+    drawTableBorder(tableLeft, y, usableWidth, headerH, 1);
+
+    let x = tableLeft;
+
+    doc.font("Times-Bold").fontSize(11);
+
+    for (const c of cols) {
+      doc.lineWidth(0.7).moveTo(x, y).lineTo(x, y + headerH).stroke();
+
+      doc.text(c.label, x + 4, y + 6, {
+        width: c.w - 8,
+        align: c.align,
+      });
+
+      x += c.w;
+    }
+
+    doc.lineWidth(0.7).moveTo(tableRight, y).lineTo(tableRight, y + headerH).stroke();
+
+    y += headerH;
+  }
+
+  function measureCellHeight(text, width, fontName, fontSize) {
+    doc.font(fontName).fontSize(fontSize);
+
+    return doc.heightOfString(text || "", {
+      width: Math.max(10, width),
+      align: "left",
+    });
+  }
+
+  function drawRow(cells, rowH) {
+    ensurePageSpace(rowH + 5);
+
+    drawTableBorder(tableLeft, y, usableWidth, rowH, 0.7);
+
+    let x = tableLeft;
+
+    for (const c of cols) {
+      doc.lineWidth(0.7).moveTo(x, y).lineTo(x, y + rowH).stroke();
+
+      const padX = 4;
+      const padY = 4;
+
+      doc.font("Times-Roman").fontSize(10);
+
+      doc.text(String(cells[c.key] ?? ""), x + padX, y + padY, {
+        width: c.w - padX * 2,
+        height: rowH - padY * 2,
+        align: c.align,
+      });
+
+      x += c.w;
+    }
+
+    doc.lineWidth(0.7).moveTo(tableRight, y).lineTo(tableRight, y + rowH).stroke();
+
+    y += rowH;
+  }
+
+  function drawBoldSeparationLine() {
+    ensurePageSpace(10);
+    doc.lineWidth(2).moveTo(tableLeft, y).lineTo(tableRight, y).stroke();
+    y += 8;
+  }
+
+  drawHeaderRow();
+
+  for (const rec of records) {
+    const items = rec.items || [];
+
+    if (items.length === 0) continue;
+
+    const dateKey = String(rec.work_date || "").slice(0, 10);
+
+    for (let idx = 0; idx < items.length; idx++) {
+      const it = items[idx];
+
+      const subLetter = String.fromCharCode(
+        97 + ((it.item_order || idx + 1) - 1)
+      );
+
+      const materialText = `${subLetter}) ${it.material || ""}`.trim();
+
+      const qtyText =
+        it.quantity === null || it.quantity === undefined
+          ? ""
+          : `${it.quantity}${it.quantity_type ? " " + it.quantity_type : ""}`;
+
+      const srText = idx === 0 ? String(rec.seq_no) : "";
+      const dateText = idx === 0 ? formatDateDDMMYYYY(dateKey) : "";
+      const storeText = idx === 0 ? String(rec.store || "") : "";
+      const useText = it.material_use || "";
+
+      const materialH = measureCellHeight(
+        materialText,
+        cols.find((c) => c.key === "material").w - 8,
+        "Times-Roman",
+        10
+      );
+
+      const useH = measureCellHeight(
+        useText,
+        cols.find((c) => c.key === "use").w - 8,
+        "Times-Roman",
+        10
+      );
+
+      const rowH = Math.max(22, Math.ceil(Math.max(materialH, useH) + 8));
+
+      drawRow(
+        {
+          srno: srText,
+          date: dateText,
+          material: materialText,
+          qty: qtyText,
+          store: storeText,
+          use: useText,
+        },
+        rowH
+      );
+    }
+
+    drawBoldSeparationLine();
+  }
+
+  doc.end();
+}
 
 module.exports = router;
