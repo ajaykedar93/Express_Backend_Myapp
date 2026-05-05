@@ -873,6 +873,7 @@ function drawInwardPDF(res, records, fileName = "inward-details.pdf") {
   doc.end();
 }
 
+
 /**
  * ✅ EXCEL DOWNLOAD
  * GET /api/inward/excel?from=YYYY-MM-DD&to=YYYY-MM-DD
@@ -896,22 +897,32 @@ router.get("/excel", async (req, res) => {
       where.push(`work_date <= $${params.length}`);
     }
 
-    if (where.length) q += ` WHERE ` + where.join(" AND ");
+    if (where.length) {
+      q += ` WHERE ` + where.join(" AND ");
+    }
+
     q += ` ORDER BY work_date ASC, store ASC, id ASC`;
 
     const headers = await db.query(q, params);
-    const ids = headers.rows.map((r) => r.id);
 
-    if (ids.length === 0) {
+    if (headers.rowCount === 0) {
       return res.status(404).json({
         success: false,
         message: "No records found",
       });
     }
 
+    const ids = headers.rows.map((r) => r.id);
+
     const itemsRes = await db.query(
       `
-      SELECT inward_id, item_order, material, quantity, quantity_type, material_use
+      SELECT 
+        inward_id,
+        item_order,
+        material,
+        quantity,
+        quantity_type,
+        material_use
       FROM inward_items
       WHERE inward_id = ANY($1::bigint[])
       ORDER BY inward_id, item_order
@@ -922,11 +933,14 @@ router.get("/excel", async (req, res) => {
     const headerMap = new Map();
 
     for (const h of headers.rows) {
-      headerMap.set(h.id, { ...h, items: [] });
+      headerMap.set(Number(h.id), {
+        ...h,
+        items: [],
+      });
     }
 
     for (const it of itemsRes.rows) {
-      const rec = headerMap.get(it.inward_id);
+      const rec = headerMap.get(Number(it.inward_id));
       if (rec) rec.items.push(it);
     }
 
@@ -937,12 +951,24 @@ router.get("/excel", async (req, res) => {
     });
 
     const workbook = new ExcelJS.Workbook();
+
+    workbook.creator = "Inward Management System";
+    workbook.created = new Date();
+
     const sheet = workbook.addWorksheet("Inward Details");
 
     sheet.mergeCells("A1:F1");
     sheet.getCell("A1").value = "Inward Details";
-    sheet.getCell("A1").font = { bold: true, size: 16 };
-    sheet.getCell("A1").alignment = { horizontal: "center", vertical: "middle" };
+    sheet.getCell("A1").font = {
+      bold: true,
+      size: 16,
+    };
+    sheet.getCell("A1").alignment = {
+      horizontal: "center",
+      vertical: "middle",
+    };
+
+    sheet.getRow(1).height = 28;
 
     sheet.addRow([]);
 
@@ -955,14 +981,26 @@ router.get("/excel", async (req, res) => {
       "Material Use",
     ]);
 
+    headerRow.height = 24;
+
     headerRow.eachCell((cell) => {
-      cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+      cell.font = {
+        bold: true,
+        color: { argb: "FFFFFFFF" },
+      };
+
       cell.fill = {
         type: "pattern",
         pattern: "solid",
         fgColor: { argb: "FF1F4E78" },
       };
-      cell.alignment = { horizontal: "center", vertical: "middle" };
+
+      cell.alignment = {
+        horizontal: "center",
+        vertical: "middle",
+        wrapText: true,
+      };
+
       cell.border = {
         top: { style: "thin" },
         left: { style: "thin" },
@@ -973,12 +1011,17 @@ router.get("/excel", async (req, res) => {
 
     for (const rec of records) {
       const dateKey = String(rec.work_date || "").slice(0, 10);
-      const items = rec.items || [];
+      const items = Array.isArray(rec.items) ? rec.items : [];
+
+      if (items.length === 0) {
+        continue;
+      }
 
       for (let idx = 0; idx < items.length; idx++) {
         const it = items[idx];
 
         const subLetter = String.fromCharCode(97 + idx);
+
         const materialText = `${subLetter}) ${it.material || ""}`;
 
         const qtyText =
@@ -991,7 +1034,7 @@ router.get("/excel", async (req, res) => {
           idx === 0 ? formatDateDDMMYYYY(dateKey) : "",
           materialText,
           qtyText,
-          idx === 0 ? rec.store : "",
+          idx === 0 ? rec.store || "" : "",
           it.material_use || "",
         ]);
 
@@ -1000,6 +1043,7 @@ router.get("/excel", async (req, res) => {
             vertical: "top",
             wrapText: true,
           };
+
           cell.border = {
             top: { style: "thin" },
             left: { style: "thin" },
@@ -1014,15 +1058,20 @@ router.get("/excel", async (req, res) => {
     }
 
     sheet.columns = [
-      { width: 10 },
-      { width: 15 },
-      { width: 30 },
-      { width: 15 },
-      { width: 22 },
-      { width: 40 },
+      { key: "srno", width: 10 },
+      { key: "date", width: 15 },
+      { key: "material", width: 35 },
+      { key: "quantity", width: 18 },
+      { key: "store", width: 25 },
+      { key: "material_use", width: 45 },
     ];
 
-    sheet.views = [{ state: "frozen", ySplit: 3 }];
+    sheet.views = [
+      {
+        state: "frozen",
+        ySplit: 3,
+      },
+    ];
 
     sheet.pageSetup = {
       paperSize: 9,
@@ -1036,13 +1085,14 @@ router.get("/excel", async (req, res) => {
       "Content-Type",
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     );
+
     res.setHeader(
       "Content-Disposition",
       `attachment; filename="inward-details.xlsx"`
     );
 
     await workbook.xlsx.write(res);
-    res.end();
+    return res.end();
   } catch (err) {
     return res.status(500).json({
       success: false,
