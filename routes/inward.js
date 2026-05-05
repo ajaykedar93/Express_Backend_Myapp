@@ -8,6 +8,8 @@ const express = require("express");
 const PDFDocument = require("pdfkit");
 const multer = require("multer");
 const db = require("../db");
+const ExcelJS = require("exceljs");
+
 
 const router = express.Router();
 
@@ -870,5 +872,184 @@ function drawInwardPDF(res, records, fileName = "inward-details.pdf") {
 
   doc.end();
 }
+
+/**
+ * ✅ EXCEL DOWNLOAD
+ * GET /api/inward/excel?from=YYYY-MM-DD&to=YYYY-MM-DD
+ */
+router.get("/excel", async (req, res) => {
+  const from = toISODate(req.query.from);
+  const to = toISODate(req.query.to);
+
+  try {
+    let q = `SELECT id, seq_no, work_date, store FROM inward`;
+    const params = [];
+    const where = [];
+
+    if (from) {
+      params.push(from);
+      where.push(`work_date >= $${params.length}`);
+    }
+
+    if (to) {
+      params.push(to);
+      where.push(`work_date <= $${params.length}`);
+    }
+
+    if (where.length) q += ` WHERE ` + where.join(" AND ");
+    q += ` ORDER BY work_date ASC, store ASC, id ASC`;
+
+    const headers = await db.query(q, params);
+    const ids = headers.rows.map((r) => r.id);
+
+    if (ids.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "No records found",
+      });
+    }
+
+    const itemsRes = await db.query(
+      `
+      SELECT inward_id, item_order, material, quantity, quantity_type, material_use
+      FROM inward_items
+      WHERE inward_id = ANY($1::bigint[])
+      ORDER BY inward_id, item_order
+      `,
+      [ids]
+    );
+
+    const headerMap = new Map();
+
+    for (const h of headers.rows) {
+      headerMap.set(h.id, { ...h, items: [] });
+    }
+
+    for (const it of itemsRes.rows) {
+      const rec = headerMap.get(it.inward_id);
+      if (rec) rec.items.push(it);
+    }
+
+    const records = Array.from(headerMap.values());
+
+    records.forEach((rec, index) => {
+      rec.excel_srno = index + 1;
+    });
+
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet("Inward Details");
+
+    sheet.mergeCells("A1:F1");
+    sheet.getCell("A1").value = "Inward Details";
+    sheet.getCell("A1").font = { bold: true, size: 16 };
+    sheet.getCell("A1").alignment = { horizontal: "center", vertical: "middle" };
+
+    sheet.addRow([]);
+
+    const headerRow = sheet.addRow([
+      "Sr.No",
+      "Date",
+      "Material",
+      "Quantity",
+      "Store",
+      "Material Use",
+    ]);
+
+    headerRow.eachCell((cell) => {
+      cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+      cell.fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: { argb: "FF1F4E78" },
+      };
+      cell.alignment = { horizontal: "center", vertical: "middle" };
+      cell.border = {
+        top: { style: "thin" },
+        left: { style: "thin" },
+        bottom: { style: "thin" },
+        right: { style: "thin" },
+      };
+    });
+
+    for (const rec of records) {
+      const dateKey = String(rec.work_date || "").slice(0, 10);
+      const items = rec.items || [];
+
+      for (let idx = 0; idx < items.length; idx++) {
+        const it = items[idx];
+
+        const subLetter = String.fromCharCode(97 + idx);
+        const materialText = `${subLetter}) ${it.material || ""}`;
+
+        const qtyText =
+          it.quantity === null || it.quantity === undefined
+            ? ""
+            : `${it.quantity}${it.quantity_type ? " " + it.quantity_type : ""}`;
+
+        const row = sheet.addRow([
+          idx === 0 ? rec.excel_srno : "",
+          idx === 0 ? formatDateDDMMYYYY(dateKey) : "",
+          materialText,
+          qtyText,
+          idx === 0 ? rec.store : "",
+          it.material_use || "",
+        ]);
+
+        row.eachCell((cell) => {
+          cell.alignment = {
+            vertical: "top",
+            wrapText: true,
+          };
+          cell.border = {
+            top: { style: "thin" },
+            left: { style: "thin" },
+            bottom: { style: "thin" },
+            right: { style: "thin" },
+          };
+        });
+      }
+
+      const blankRow = sheet.addRow([]);
+      blankRow.height = 6;
+    }
+
+    sheet.columns = [
+      { width: 10 },
+      { width: 15 },
+      { width: 30 },
+      { width: 15 },
+      { width: 22 },
+      { width: 40 },
+    ];
+
+    sheet.views = [{ state: "frozen", ySplit: 3 }];
+
+    sheet.pageSetup = {
+      paperSize: 9,
+      orientation: "portrait",
+      fitToPage: true,
+      fitToWidth: 1,
+      fitToHeight: 0,
+    };
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="inward-details.xlsx"`
+    );
+
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: String(err),
+    });
+  }
+});
 
 module.exports = router;
