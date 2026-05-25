@@ -201,6 +201,12 @@ app.use("/api", tagCatSubRoutes);
 
 
 
+// NEW INVOICE TABLE
+const invoiceRoutes = require("./routes/Invoice");
+
+app.use("/api", invoiceRoutes);
+
+
 
 
 
