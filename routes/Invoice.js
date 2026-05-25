@@ -1320,6 +1320,178 @@ router.post("/invoices/pdf-preview", async (req, res) => {
   }
 });
 
+router.put("/invoices/:id", async (req, res) => {
+  const client = await db.connect();
+
+  try {
+    const body = req.body || {};
+    const validationErrors = validateInvoiceRequest(body);
+
+    if (validationErrors.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Validation failed",
+        errors: validationErrors,
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const existingInvoice = await client.query(
+      "SELECT * FROM invoices WHERE id = $1",
+      [req.params.id]
+    );
+
+    if (existingInvoice.rows.length === 0) {
+      await client.query("ROLLBACK");
+
+      return res.status(404).json({
+        success: false,
+        message: "Invoice not found",
+      });
+    }
+
+    const calculation = calculateInvoice(body.items || [], body.igst_rate || 5);
+
+    const invoiceResult = await client.query(
+      `
+      UPDATE invoices SET
+        invoice_no = $1,
+        invoice_date = $2,
+
+        supplier_name = $3,
+        supplier_address = $4,
+        supplier_gstin = $5,
+        supplier_state_name = $6,
+        supplier_state_code = $7,
+
+        consignee_name = $8,
+        consignee_state_name = $9,
+        consignee_state_code = $10,
+
+        buyer_name = $11,
+        buyer_gstin = $12,
+        buyer_state_name = $13,
+        buyer_state_code = $14,
+        buyer_address = $15,
+
+        bank_name = $16,
+        bank_account_no = $17,
+        bank_branch = $18,
+        bank_ifsc = $19,
+
+        taxable_amount = $20,
+        igst_rate = $21,
+        igst_amount = $22,
+        round_up = $23,
+        grand_total = $24,
+        amount_in_words = $25,
+        tax_amount_in_words = $26,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = $27
+      RETURNING *
+      `,
+      [
+        body.invoice_no,
+        body.invoice_date,
+
+        body.supplier_name,
+        body.supplier_address,
+        body.supplier_gstin,
+        body.supplier_state_name,
+        body.supplier_state_code,
+
+        body.consignee_name,
+        body.consignee_state_name,
+        body.consignee_state_code,
+
+        body.buyer_name,
+        body.buyer_gstin,
+        body.buyer_state_name,
+        body.buyer_state_code,
+        body.buyer_address,
+
+        body.bank_name,
+        body.bank_account_no,
+        body.bank_branch,
+        body.bank_ifsc,
+
+        calculation.taxableAmount,
+        calculation.igstRate,
+        calculation.igstAmount,
+        calculation.roundUp,
+        calculation.grandTotal,
+        calculation.amountInWords,
+        calculation.taxAmountInWords,
+
+        req.params.id,
+      ]
+    );
+
+    await client.query("DELETE FROM invoice_items WHERE invoice_id = $1", [
+      req.params.id,
+    ]);
+
+    for (const item of calculation.items) {
+      await client.query(
+        `
+        INSERT INTO invoice_items (
+          invoice_id,
+          sr_no,
+          description,
+          hsn_sac,
+          gst_rate,
+          quantity,
+          rate,
+          per,
+          amount
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        `,
+        [
+          req.params.id,
+          item.sr_no,
+          item.description,
+          item.hsn_sac,
+          item.gst_rate,
+          item.quantity,
+          item.rate,
+          item.per,
+          item.amount,
+        ]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    res.json({
+      success: true,
+      message: "Invoice updated successfully",
+      invoice: invoiceResult.rows[0],
+      items: calculation.items,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    console.error("Update invoice error:", error);
+
+    if (error.code === "23505") {
+      return res.status(409).json({
+        success: false,
+        message: "Invoice number already exists. Please use another invoice number.",
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to update invoice",
+      error: error.message,
+    });
+  } finally {
+    client.release();
+  }
+}); 
+
 /* =========================================================
    API 7: Delete Invoice
    DELETE /api/invoices/:id
