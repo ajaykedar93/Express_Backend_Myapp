@@ -204,9 +204,19 @@ app.use("/api", tagCatSubRoutes);
 // NEW INVOICE TABLE
 const invoiceRoutes = require("./routes/Invoice");
 
+const invoicePdfRoutes = require("./routes/invoicepdf");
+
 app.use("/api", invoiceRoutes);
+app.use("/api", invoicePdfRoutes);
+
+const teligramMessageRoutes = require("./routes/TELIGRAM/teligram_message");
+const teligramChannelRoutes = require("./routes/TELIGRAM/teligram_channel");
+const path = require("path");
 
 
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+app.use("/api/telegram-notes", teligramMessageRoutes);
+app.use("/api/telegram-channels", teligramChannelRoutes);
 
 
 
