@@ -53,6 +53,19 @@ const upload = multer({
   },
 });
 
+const uploadImage = (req, res, next) => {
+  upload.single("image")(req, res, function (error) {
+    if (error) {
+      return res.status(400).json({
+        success: false,
+        message: error.message || "Image upload failed",
+      });
+    }
+
+    next();
+  });
+};
+
 /* ===============================
    Helper Functions
 ================================ */
@@ -61,18 +74,35 @@ const getBaseUrl = (req) => {
 };
 
 const deleteOldImage = (imagePath) => {
-  if (!imagePath) return;
+  try {
+    if (!imagePath) return;
 
-  const fileName = path.basename(imagePath);
-  const fullPath = path.join(uploadDir, fileName);
+    const fileName = path.basename(imagePath);
+    const fullPath = path.join(uploadDir, fileName);
 
-  if (fs.existsSync(fullPath)) {
-    fs.unlinkSync(fullPath);
+    if (fs.existsSync(fullPath)) {
+      fs.unlinkSync(fullPath);
+    }
+  } catch (error) {
+    console.error("Delete image error:", error);
   }
 };
 
 const isValidColor = (color) => {
   return /^#[0-9A-Fa-f]{6}$/.test(color || "");
+};
+
+const cleanPin = (pin) => {
+  return String(pin || "").replace(/\D/g, "").slice(0, 4);
+};
+
+const getRequestPin = (req) => {
+  return cleanPin(
+    req.headers["x-channel-pin"] ||
+      req.body?.channel_pin ||
+      req.query?.channel_pin ||
+      ""
+  );
 };
 
 const cleanHtml = (html) => {
@@ -193,8 +223,68 @@ const updateChannelLastMessageAfterDelete = async (channelId) => {
 };
 
 /* ===============================
+   Private Channel Access Check
+================================ */
+const checkChannelAccess = async (req, res, channelId) => {
+  if (!channelId) {
+    res.status(400).json({
+      success: false,
+      message: "channel_id is required",
+    });
+
+    return false;
+  }
+
+  const channelResult = await db.query(
+    `SELECT channel_id, user_id, channel_name, is_private, private_pin
+     FROM telegram_channels
+     WHERE channel_id = $1`,
+    [channelId]
+  );
+
+  if (channelResult.rows.length === 0) {
+    res.status(404).json({
+      success: false,
+      message: "Channel not found",
+    });
+
+    return false;
+  }
+
+  const channel = channelResult.rows[0];
+
+  if (!channel.is_private) {
+    return true;
+  }
+
+  const enteredPin = getRequestPin(req);
+
+  if (!/^[0-9]{4}$/.test(enteredPin)) {
+    res.status(403).json({
+      success: false,
+      message: "Private channel PIN required",
+    });
+
+    return false;
+  }
+
+  if (String(channel.private_pin) !== String(enteredPin)) {
+    res.status(403).json({
+      success: false,
+      message: "Wrong PIN",
+    });
+
+    return false;
+  }
+
+  return true;
+};
+
+/* ===============================
    1. Get Notes
    GET /api/telegram-notes?user_id=7&channel_id=1
+   For private channel send header:
+   x-channel-pin: 1234
 ================================ */
 router.get("/", async (req, res) => {
   try {
@@ -207,8 +297,19 @@ router.get("/", async (req, res) => {
       });
     }
 
-    let query = `
-      SELECT
+    if (!channel_id) {
+      return res.status(400).json({
+        success: false,
+        message: "channel_id is required",
+      });
+    }
+
+    const allowed = await checkChannelAccess(req, res, channel_id);
+
+    if (!allowed) return;
+
+    const result = await db.query(
+      `SELECT
           note_id,
           user_id,
           channel_id,
@@ -218,30 +319,25 @@ router.get("/", async (req, res) => {
           image_url,
           image_path,
           is_pinned,
+          is_private,
+          pin_hint,
           created_at,
           updated_at
        FROM telegram_notes
        WHERE user_id = $1
-    `;
+         AND channel_id = $2
+       ORDER BY created_at ASC, note_id ASC`,
+      [user_id, channel_id]
+    );
 
-    const values = [user_id];
-
-    if (channel_id) {
-      query += ` AND channel_id = $2`;
-      values.push(channel_id);
-    }
-
-    query += ` ORDER BY created_at ASC, note_id ASC`;
-
-    const result = await db.query(query, values);
-
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       notes: result.rows,
     });
   } catch (error) {
     console.error("Get notes error:", error);
-    res.status(500).json({
+
+    return res.status(500).json({
       success: false,
       message: "Server error while fetching notes",
     });
@@ -267,6 +363,8 @@ router.get("/:note_id", async (req, res) => {
           image_url,
           image_path,
           is_pinned,
+          is_private,
+          pin_hint,
           created_at,
           updated_at
        FROM telegram_notes
@@ -281,13 +379,20 @@ router.get("/:note_id", async (req, res) => {
       });
     }
 
-    res.status(200).json({
+    const note = result.rows[0];
+
+    const allowed = await checkChannelAccess(req, res, note.channel_id);
+
+    if (!allowed) return;
+
+    return res.status(200).json({
       success: true,
-      note: result.rows[0],
+      note,
     });
   } catch (error) {
     console.error("Get single note error:", error);
-    res.status(500).json({
+
+    return res.status(500).json({
       success: false,
       message: "Server error while fetching note",
     });
@@ -297,8 +402,11 @@ router.get("/:note_id", async (req, res) => {
 /* ===============================
    3. Add New Note
    POST /api/telegram-notes
+
+   For private channel send:
+   x-channel-pin: 1234
 ================================ */
-router.post("/", upload.single("image"), async (req, res) => {
+router.post("/", uploadImage, async (req, res) => {
   try {
     const { user_id, channel_id, title, content_html, text_color } = req.body;
 
@@ -316,10 +424,20 @@ router.post("/", upload.single("image"), async (req, res) => {
       });
     }
 
+    const allowed = await checkChannelAccess(req, res, channel_id);
+
+    if (!allowed) {
+      if (req.file) {
+        deleteOldImage(`/uploads/telegram-notes/${req.file.filename}`);
+      }
+
+      return;
+    }
+
     const finalTitle = title ? title.trim() : null;
     const finalContent = cleanHtml(content_html);
     const finalPlainText = getPlainText(finalContent);
-    const finalColor = isValidColor(text_color) ? text_color : "#111111";
+    const finalColor = isValidColor(text_color) ? text_color : "#111827";
 
     let imageUrl = null;
     let imagePath = null;
@@ -330,6 +448,10 @@ router.post("/", upload.single("image"), async (req, res) => {
     }
 
     if (!finalTitle && !finalPlainText && !imageUrl) {
+      if (imagePath) {
+        deleteOldImage(imagePath);
+      }
+
       return res.status(400).json({
         success: false,
         message: "Please add text or image",
@@ -361,6 +483,8 @@ router.post("/", upload.single("image"), async (req, res) => {
           image_url,
           image_path,
           is_pinned,
+          is_private,
+          pin_hint,
           created_at,
           updated_at`,
       [
@@ -376,14 +500,15 @@ router.post("/", upload.single("image"), async (req, res) => {
 
     await updateChannelLastMessage(channel_id, finalContent, imageUrl);
 
-    res.status(201).json({
+    return res.status(201).json({
       success: true,
       message: "Message added successfully",
       note: result.rows[0],
     });
   } catch (error) {
     console.error("Add note error:", error);
-    res.status(500).json({
+
+    return res.status(500).json({
       success: false,
       message: "Server error while adding message",
     });
@@ -394,7 +519,7 @@ router.post("/", upload.single("image"), async (req, res) => {
    4. Update Note
    PUT /api/telegram-notes/:note_id
 ================================ */
-router.put("/:note_id", upload.single("image"), async (req, res) => {
+router.put("/:note_id", uploadImage, async (req, res) => {
   try {
     const { note_id } = req.params;
     const { title, content_html, text_color, remove_image } = req.body;
@@ -407,6 +532,10 @@ router.put("/:note_id", upload.single("image"), async (req, res) => {
     );
 
     if (oldNoteResult.rows.length === 0) {
+      if (req.file) {
+        deleteOldImage(`/uploads/telegram-notes/${req.file.filename}`);
+      }
+
       return res.status(404).json({
         success: false,
         message: "Message not found",
@@ -415,10 +544,20 @@ router.put("/:note_id", upload.single("image"), async (req, res) => {
 
     const oldNote = oldNoteResult.rows[0];
 
+    const allowed = await checkChannelAccess(req, res, oldNote.channel_id);
+
+    if (!allowed) {
+      if (req.file) {
+        deleteOldImage(`/uploads/telegram-notes/${req.file.filename}`);
+      }
+
+      return;
+    }
+
     const finalTitle = title ? title.trim() : null;
     const finalContent = cleanHtml(content_html);
     const finalPlainText = getPlainText(finalContent);
-    const finalColor = isValidColor(text_color) ? text_color : "#111111";
+    const finalColor = isValidColor(text_color) ? text_color : "#111827";
 
     let imageUrl = oldNote.image_url;
     let imagePath = oldNote.image_path;
@@ -437,6 +576,10 @@ router.put("/:note_id", upload.single("image"), async (req, res) => {
     }
 
     if (!finalTitle && !finalPlainText && !imageUrl) {
+      if (req.file) {
+        deleteOldImage(imagePath);
+      }
+
       return res.status(400).json({
         success: false,
         message: "Please add text or image",
@@ -463,6 +606,8 @@ router.put("/:note_id", upload.single("image"), async (req, res) => {
           image_url,
           image_path,
           is_pinned,
+          is_private,
+          pin_hint,
           created_at,
           updated_at`,
       [
@@ -481,14 +626,15 @@ router.put("/:note_id", upload.single("image"), async (req, res) => {
       imageUrl
     );
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       message: "Message updated successfully",
       note: result.rows[0],
     });
   } catch (error) {
     console.error("Update note error:", error);
-    res.status(500).json({
+
+    return res.status(500).json({
       success: false,
       message: "Server error while updating message",
     });
@@ -519,6 +665,10 @@ router.delete("/:note_id", async (req, res) => {
 
     const oldNote = oldNoteResult.rows[0];
 
+    const allowed = await checkChannelAccess(req, res, oldNote.channel_id);
+
+    if (!allowed) return;
+
     deleteOldImage(oldNote.image_path);
 
     await db.query(
@@ -529,15 +679,16 @@ router.delete("/:note_id", async (req, res) => {
 
     await updateChannelLastMessageAfterDelete(oldNote.channel_id);
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       message: "Message deleted successfully",
-      deleted_note_id: note_id,
+      deleted_note_id: Number(note_id),
       channel_id: oldNote.channel_id,
     });
   } catch (error) {
     console.error("Delete note error:", error);
-    res.status(500).json({
+
+    return res.status(500).json({
       success: false,
       message: "Server error while deleting message",
     });

@@ -16,7 +16,7 @@ if (!fs.existsSync(uploadDir)) {
 }
 
 /* ===============================
-   Multer Logo Upload Config
+   Multer Config
 ================================ */
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
@@ -52,6 +52,19 @@ const upload = multer({
   },
 });
 
+const uploadLogo = (req, res, next) => {
+  upload.single("logo")(req, res, function (error) {
+    if (error) {
+      return res.status(400).json({
+        success: false,
+        message: error.message || "Logo upload failed",
+      });
+    }
+
+    next();
+  });
+};
+
 /* ===============================
    Helper Functions
 ================================ */
@@ -60,13 +73,17 @@ const getBaseUrl = (req) => {
 };
 
 const deleteFile = (filePath, folderPath) => {
-  if (!filePath) return;
+  try {
+    if (!filePath) return;
 
-  const fileName = path.basename(filePath);
-  const fullPath = path.join(folderPath, fileName);
+    const fileName = path.basename(filePath);
+    const fullPath = path.join(folderPath, fileName);
 
-  if (fs.existsSync(fullPath)) {
-    fs.unlinkSync(fullPath);
+    if (fs.existsSync(fullPath)) {
+      fs.unlinkSync(fullPath);
+    }
+  } catch (error) {
+    console.error("File delete error:", error);
   }
 };
 
@@ -90,8 +107,21 @@ const deleteChannelNoteImages = async (channelId) => {
   });
 };
 
-const cleanChannelName = (name) => {
-  return String(name || "").trim().replace(/\s+/g, " ");
+const cleanText = (value) => {
+  return String(value || "").trim().replace(/\s+/g, " ");
+};
+
+const cleanTagline = (value) => {
+  const finalValue = cleanText(value);
+  return finalValue || null;
+};
+
+const isTrue = (value) => {
+  return value === true || value === "true" || value === 1 || value === "1";
+};
+
+const cleanPin = (pin) => {
+  return String(pin || "").replace(/\D/g, "").slice(0, 4);
 };
 
 /* ===============================
@@ -114,30 +144,34 @@ router.get("/", async (req, res) => {
           c.channel_id,
           c.user_id,
           c.channel_name,
+          c.channel_tagline,
           c.logo_url,
           c.logo_path,
+          c.is_private,
           c.subscribers_count,
           c.last_message,
           c.last_message_time,
           c.created_at,
           c.updated_at,
-          COUNT(n.note_id)::INT AS total_messages
+          (
+            SELECT COUNT(n.note_id)::INT
+            FROM telegram_notes n
+            WHERE n.channel_id = c.channel_id
+          ) AS total_messages
        FROM telegram_channels c
-       LEFT JOIN telegram_notes n
-          ON n.channel_id = c.channel_id
        WHERE c.user_id = $1
-       GROUP BY c.channel_id
        ORDER BY c.updated_at DESC, c.created_at DESC`,
       [user_id]
     );
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       channels: result.rows,
     });
   } catch (error) {
     console.error("Get channels error:", error);
-    res.status(500).json({
+
+    return res.status(500).json({
       success: false,
       message: "Server error while fetching channels",
     });
@@ -157,19 +191,22 @@ router.get("/:channel_id", async (req, res) => {
           c.channel_id,
           c.user_id,
           c.channel_name,
+          c.channel_tagline,
           c.logo_url,
           c.logo_path,
+          c.is_private,
           c.subscribers_count,
           c.last_message,
           c.last_message_time,
           c.created_at,
           c.updated_at,
-          COUNT(n.note_id)::INT AS total_messages
+          (
+            SELECT COUNT(n.note_id)::INT
+            FROM telegram_notes n
+            WHERE n.channel_id = c.channel_id
+          ) AS total_messages
        FROM telegram_channels c
-       LEFT JOIN telegram_notes n
-          ON n.channel_id = c.channel_id
-       WHERE c.channel_id = $1
-       GROUP BY c.channel_id`,
+       WHERE c.channel_id = $1`,
       [channel_id]
     );
 
@@ -180,13 +217,14 @@ router.get("/:channel_id", async (req, res) => {
       });
     }
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       channel: result.rows[0],
     });
   } catch (error) {
     console.error("Get single channel error:", error);
-    res.status(500).json({
+
+    return res.status(500).json({
       success: false,
       message: "Server error while fetching channel",
     });
@@ -196,14 +234,16 @@ router.get("/:channel_id", async (req, res) => {
 /* ===============================
    3. Create Channel
    POST /api/telegram-channels
-   form-data:
-   user_id
-   channel_name
-   logo
 ================================ */
-router.post("/", upload.single("logo"), async (req, res) => {
+router.post("/", uploadLogo, async (req, res) => {
   try {
-    const { user_id, channel_name } = req.body;
+    const {
+      user_id,
+      channel_name,
+      channel_tagline,
+      is_private,
+      private_pin,
+    } = req.body;
 
     if (!user_id) {
       return res.status(400).json({
@@ -212,12 +252,23 @@ router.post("/", upload.single("logo"), async (req, res) => {
       });
     }
 
-    const finalName = cleanChannelName(channel_name);
+    const finalName = cleanText(channel_name);
 
     if (!finalName) {
       return res.status(400).json({
         success: false,
         message: "Channel name is required",
+      });
+    }
+
+    const finalTagline = cleanTagline(channel_tagline);
+    const finalIsPrivate = isTrue(is_private);
+    const finalPrivatePin = finalIsPrivate ? cleanPin(private_pin) : null;
+
+    if (finalIsPrivate && !/^[0-9]{4}$/.test(finalPrivatePin)) {
+      return res.status(400).json({
+        success: false,
+        message: "Private PIN must be exactly 4 digits",
       });
     }
 
@@ -234,8 +285,11 @@ router.post("/", upload.single("logo"), async (req, res) => {
         (
           user_id,
           channel_name,
+          channel_tagline,
           logo_url,
           logo_path,
+          is_private,
+          private_pin,
           subscribers_count,
           last_message,
           last_message_time,
@@ -243,22 +297,45 @@ router.post("/", upload.single("logo"), async (req, res) => {
           updated_at
         )
        VALUES
-        ($1, $2, $3, $4, 1, 'No messages yet', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        (
+          $1,
+          $2,
+          $3,
+          $4,
+          $5,
+          $6,
+          $7,
+          1,
+          'No messages yet',
+          CURRENT_TIMESTAMP,
+          CURRENT_TIMESTAMP,
+          CURRENT_TIMESTAMP
+        )
        RETURNING
           channel_id,
           user_id,
           channel_name,
+          channel_tagline,
           logo_url,
           logo_path,
+          is_private,
           subscribers_count,
           last_message,
           last_message_time,
           created_at,
           updated_at`,
-      [user_id, finalName, logoUrl, logoPath]
+      [
+        user_id,
+        finalName,
+        finalTagline,
+        logoUrl,
+        logoPath,
+        finalIsPrivate,
+        finalIsPrivate ? finalPrivatePin : null,
+      ]
     );
 
-    res.status(201).json({
+    return res.status(201).json({
       success: true,
       message: "Channel created successfully",
       channel: {
@@ -268,7 +345,8 @@ router.post("/", upload.single("logo"), async (req, res) => {
     });
   } catch (error) {
     console.error("Create channel error:", error);
-    res.status(500).json({
+
+    return res.status(500).json({
       success: false,
       message: "Server error while creating channel",
     });
@@ -278,15 +356,19 @@ router.post("/", upload.single("logo"), async (req, res) => {
 /* ===============================
    4. Update Channel
    PUT /api/telegram-channels/:channel_id
-   form-data:
-   channel_name
-   logo
-   remove_logo = true / false
+
+   Update only:
+   - channel_name
+   - channel_tagline
+   - logo
+   - remove logo
+
+   Private status will not change here.
 ================================ */
-router.put("/:channel_id", upload.single("logo"), async (req, res) => {
+router.put("/:channel_id", uploadLogo, async (req, res) => {
   try {
     const { channel_id } = req.params;
-    const { channel_name, remove_logo } = req.body;
+    const { channel_name, channel_tagline, remove_logo } = req.body;
 
     const oldResult = await db.query(
       `SELECT *
@@ -304,8 +386,12 @@ router.put("/:channel_id", upload.single("logo"), async (req, res) => {
 
     const oldChannel = oldResult.rows[0];
 
-    const finalName =
-      cleanChannelName(channel_name) || oldChannel.channel_name;
+    const finalName = cleanText(channel_name) || oldChannel.channel_name;
+
+    const finalTagline =
+      channel_tagline === undefined
+        ? oldChannel.channel_tagline
+        : cleanTagline(channel_tagline);
 
     let logoUrl = oldChannel.logo_url;
     let logoPath = oldChannel.logo_path;
@@ -327,22 +413,25 @@ router.put("/:channel_id", upload.single("logo"), async (req, res) => {
       `UPDATE telegram_channels
        SET
           channel_name = $1,
-          logo_url = $2,
-          logo_path = $3,
+          channel_tagline = $2,
+          logo_url = $3,
+          logo_path = $4,
           updated_at = CURRENT_TIMESTAMP
-       WHERE channel_id = $4
+       WHERE channel_id = $5
        RETURNING
           channel_id,
           user_id,
           channel_name,
+          channel_tagline,
           logo_url,
           logo_path,
+          is_private,
           subscribers_count,
           last_message,
           last_message_time,
           created_at,
           updated_at`,
-      [finalName, logoUrl, logoPath, channel_id]
+      [finalName, finalTagline, logoUrl, logoPath, channel_id]
     );
 
     const countResult = await db.query(
@@ -352,7 +441,7 @@ router.put("/:channel_id", upload.single("logo"), async (req, res) => {
       [channel_id]
     );
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       message: "Channel updated successfully",
       channel: {
@@ -362,7 +451,8 @@ router.put("/:channel_id", upload.single("logo"), async (req, res) => {
     });
   } catch (error) {
     console.error("Update channel error:", error);
-    res.status(500).json({
+
+    return res.status(500).json({
       success: false,
       message: "Server error while updating channel",
     });
@@ -370,7 +460,79 @@ router.put("/:channel_id", upload.single("logo"), async (req, res) => {
 });
 
 /* ===============================
-   5. Delete Channel
+   5. Verify Private Channel PIN
+   POST /api/telegram-channels/:channel_id/verify-pin
+================================ */
+router.post("/:channel_id/verify-pin", async (req, res) => {
+  try {
+    const { channel_id } = req.params;
+    const { pin } = req.body;
+
+    const finalPin = cleanPin(pin);
+
+    if (!/^[0-9]{4}$/.test(finalPin)) {
+      return res.status(400).json({
+        success: false,
+        message: "Enter valid 4 digit PIN",
+        unlocked: false,
+      });
+    }
+
+    const result = await db.query(
+      `SELECT
+          channel_id,
+          channel_name,
+          is_private,
+          private_pin
+       FROM telegram_channels
+       WHERE channel_id = $1`,
+      [channel_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Channel not found",
+        unlocked: false,
+      });
+    }
+
+    const channel = result.rows[0];
+
+    if (!channel.is_private) {
+      return res.status(200).json({
+        success: true,
+        message: "Channel is public",
+        unlocked: true,
+      });
+    }
+
+    if (String(channel.private_pin) !== String(finalPin)) {
+      return res.status(401).json({
+        success: false,
+        message: "Wrong PIN",
+        unlocked: false,
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "PIN verified successfully",
+      unlocked: true,
+    });
+  } catch (error) {
+    console.error("Verify PIN error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Server error while verifying PIN",
+      unlocked: false,
+    });
+  }
+});
+
+/* ===============================
+   6. Delete Channel
    DELETE /api/telegram-channels/:channel_id
 ================================ */
 router.delete("/:channel_id", async (req, res) => {
@@ -402,14 +564,15 @@ router.delete("/:channel_id", async (req, res) => {
       [channel_id]
     );
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       message: "Channel deleted successfully",
       deleted_channel_id: Number(channel_id),
     });
   } catch (error) {
     console.error("Delete channel error:", error);
-    res.status(500).json({
+
+    return res.status(500).json({
       success: false,
       message: "Server error while deleting channel",
     });
@@ -417,7 +580,7 @@ router.delete("/:channel_id", async (req, res) => {
 });
 
 /* ===============================
-   6. Update Last Message
+   7. Update Last Message
    PATCH /api/telegram-channels/:channel_id/last-message
 ================================ */
 router.patch("/:channel_id/last-message", async (req, res) => {
@@ -439,8 +602,10 @@ router.patch("/:channel_id/last-message", async (req, res) => {
           channel_id,
           user_id,
           channel_name,
+          channel_tagline,
           logo_url,
           logo_path,
+          is_private,
           subscribers_count,
           last_message,
           last_message_time,
@@ -456,14 +621,15 @@ router.patch("/:channel_id/last-message", async (req, res) => {
       });
     }
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       message: "Last message updated successfully",
       channel: result.rows[0],
     });
   } catch (error) {
     console.error("Update last message error:", error);
-    res.status(500).json({
+
+    return res.status(500).json({
       success: false,
       message: "Server error while updating last message",
     });
