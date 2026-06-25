@@ -49,7 +49,7 @@ const upload = multer({
   storage,
   fileFilter,
   limits: {
-    fileSize: 5 * 1024 * 1024,
+    fileSize: 20 * 1024 * 1024,
   },
 });
 
@@ -71,6 +71,54 @@ const uploadImage = (req, res, next) => {
 ================================ */
 const getBaseUrl = (req) => {
   return process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`;
+};
+
+const getSafeFileName = (value) => {
+  if (!value) return "";
+
+  const cleanValue = String(value)
+    .replace(/\\/g, "/")
+    .split("?")[0]
+    .split("#")[0];
+
+  return path.basename(cleanValue);
+};
+
+const getImageViewUrl = (req, imagePathOrUrl) => {
+  const fileName = getSafeFileName(imagePathOrUrl);
+  if (!fileName) return null;
+
+  return `${getBaseUrl(req)}/api/telegram-notes/image/${encodeURIComponent(fileName)}`;
+};
+
+const getImageDownloadUrl = (req, imagePathOrUrl) => {
+  const fileName = getSafeFileName(imagePathOrUrl);
+  if (!fileName) return null;
+
+  return `${getBaseUrl(req)}/api/telegram-notes/image/download/${encodeURIComponent(fileName)}`;
+};
+
+const normalizeNoteImage = (req, note) => {
+  if (!note) return note;
+
+  const imageSource = note.image_path || note.image_url;
+
+  if (!imageSource) {
+    return {
+      ...note,
+      image_url: null,
+      image_path: null,
+      download_url: null,
+    };
+  }
+
+  return {
+    ...note,
+    // Always return a stable backend API URL, so old /uploads URLs also work after refresh.
+    image_url: getImageViewUrl(req, imageSource),
+    image_path: note.image_path,
+    download_url: getImageDownloadUrl(req, imageSource),
+  };
 };
 
 const deleteOldImage = (imagePath) => {
@@ -330,9 +378,11 @@ router.get("/", async (req, res) => {
       [user_id, channel_id]
     );
 
+    const notes = result.rows.map((note) => normalizeNoteImage(req, note));
+
     return res.status(200).json({
       success: true,
-      notes: result.rows,
+      notes,
     });
   } catch (error) {
     console.error("Get notes error:", error);
@@ -340,6 +390,57 @@ router.get("/", async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Server error while fetching notes",
+    });
+  }
+});
+
+/* ===============================
+   Image View + Download
+   GET /api/telegram-notes/image/:filename
+   GET /api/telegram-notes/image/download/:filename
+================================ */
+router.get("/image/download/:filename", (req, res) => {
+  try {
+    const fileName = getSafeFileName(req.params.filename);
+    const fullPath = path.join(uploadDir, fileName);
+
+    if (!fileName || !fs.existsSync(fullPath)) {
+      return res.status(404).json({
+        success: false,
+        message: "Image not found",
+      });
+    }
+
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    return res.download(fullPath, fileName);
+  } catch (error) {
+    console.error("Image download error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Server error while downloading image",
+    });
+  }
+});
+
+router.get("/image/:filename", (req, res) => {
+  try {
+    const fileName = getSafeFileName(req.params.filename);
+    const fullPath = path.join(uploadDir, fileName);
+
+    if (!fileName || !fs.existsSync(fullPath)) {
+      return res.status(404).json({
+        success: false,
+        message: "Image not found",
+      });
+    }
+
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    return res.sendFile(fullPath);
+  } catch (error) {
+    console.error("Image fetch error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Server error while fetching image",
     });
   }
 });
@@ -387,7 +488,7 @@ router.get("/:note_id", async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      note,
+      note: normalizeNoteImage(req, note),
     });
   } catch (error) {
     console.error("Get single note error:", error);
@@ -444,7 +545,7 @@ router.post("/", uploadImage, async (req, res) => {
 
     if (req.file) {
       imagePath = `/uploads/telegram-notes/${req.file.filename}`;
-      imageUrl = `${getBaseUrl(req)}${imagePath}`;
+      imageUrl = getImageViewUrl(req, imagePath);
     }
 
     if (!finalTitle && !finalPlainText && !imageUrl) {
@@ -503,7 +604,7 @@ router.post("/", uploadImage, async (req, res) => {
     return res.status(201).json({
       success: true,
       message: "Message added successfully",
-      note: result.rows[0],
+      note: normalizeNoteImage(req, result.rows[0]),
     });
   } catch (error) {
     console.error("Add note error:", error);
@@ -572,7 +673,7 @@ router.put("/:note_id", uploadImage, async (req, res) => {
       deleteOldImage(oldNote.image_path);
 
       imagePath = `/uploads/telegram-notes/${req.file.filename}`;
-      imageUrl = `${getBaseUrl(req)}${imagePath}`;
+      imageUrl = getImageViewUrl(req, imagePath);
     }
 
     if (!finalTitle && !finalPlainText && !imageUrl) {
@@ -629,7 +730,7 @@ router.put("/:note_id", uploadImage, async (req, res) => {
     return res.status(200).json({
       success: true,
       message: "Message updated successfully",
-      note: result.rows[0],
+      note: normalizeNoteImage(req, result.rows[0]),
     });
   } catch (error) {
     console.error("Update note error:", error);
