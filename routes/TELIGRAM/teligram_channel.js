@@ -89,6 +89,12 @@ const normalizeChannelLogo = (req, channel) => {
       ? getLogoUrl(req, channel.channel_id, channel.updated_at)
       : null,
     logo_path: null,
+
+    // Important:
+    // Do not expose created_device_id in public API response.
+    // If exposed, another device can copy it and delete channel.
+    created_device_id: undefined,
+    private_pin: undefined,
   };
 };
 
@@ -107,6 +113,22 @@ const isTrue = (value) => {
 
 const cleanPin = (pin) => {
   return String(pin || "").replace(/\D/g, "").slice(0, 4);
+};
+
+const cleanDeviceId = (value) => {
+  return String(value || "")
+    .trim()
+    .replace(/[^a-zA-Z0-9._:-]/g, "")
+    .slice(0, 120);
+};
+
+const getRequestDeviceId = (req) => {
+  return cleanDeviceId(
+    req.body?.device_id ||
+      req.body?.created_device_id ||
+      req.headers["x-device-id"] ||
+      req.query?.device_id
+  );
 };
 
 /* ===============================
@@ -268,6 +290,13 @@ router.get("/:channel_id", async (req, res) => {
    3. Create Channel
    POST /api/telegram-channels
 
+   Required from frontend:
+   - user_id
+   - channel_name
+   - created_device_id OR device_id
+   - is_private
+   - private_pin if private
+
    FormData image field name:
    logo
 ================================ */
@@ -279,12 +308,23 @@ router.post("/", uploadLogo, async (req, res) => {
       channel_tagline,
       is_private,
       private_pin,
+      created_device_id,
+      device_id,
     } = req.body;
 
     if (!user_id) {
       return res.status(400).json({
         success: false,
         message: "user_id is required",
+      });
+    }
+
+    const finalDeviceId = cleanDeviceId(created_device_id || device_id);
+
+    if (!finalDeviceId) {
+      return res.status(400).json({
+        success: false,
+        message: "created_device_id is required",
       });
     }
 
@@ -331,6 +371,7 @@ router.post("/", uploadLogo, async (req, res) => {
           logo_path,
           is_private,
           private_pin,
+          created_device_id,
           subscribers_count,
           last_message,
           last_message_time,
@@ -349,6 +390,7 @@ router.post("/", uploadLogo, async (req, res) => {
           NULL,
           $7,
           $8,
+          $9,
           1,
           'No messages yet',
           CURRENT_TIMESTAMP,
@@ -378,6 +420,7 @@ router.post("/", uploadLogo, async (req, res) => {
         logoName,
         finalIsPrivate,
         finalIsPrivate ? finalPrivatePin : null,
+        finalDeviceId,
       ]
     );
 
@@ -481,14 +524,7 @@ router.put("/:channel_id", uploadLogo, async (req, res) => {
           last_message_time,
           created_at,
           updated_at`,
-      [
-        finalName,
-        finalTagline,
-        logoData,
-        logoMime,
-        logoName,
-        channel_id,
-      ]
+      [finalName, finalTagline, logoData, logoMime, logoName, channel_id]
     );
 
     const countResult = await db.query(
@@ -567,7 +603,7 @@ router.post("/:channel_id/verify-pin", async (req, res) => {
     if (String(channel.private_pin) !== String(finalPin)) {
       return res.status(401).json({
         success: false,
-        message: "Wrong PIN",
+        message: "PIN mismatch",
         unlocked: false,
       });
     }
@@ -591,13 +627,39 @@ router.post("/:channel_id/verify-pin", async (req, res) => {
 /* ===============================
    6. Delete Channel
    DELETE /api/telegram-channels/:channel_id
+
+   Required:
+   - device_id
+
+   Private channel:
+   - device_id
+   - pin
+
+   Rules:
+   - Public channel: same created device only
+   - Private channel: same created device + correct PIN only
 ================================ */
 router.delete("/:channel_id", async (req, res) => {
   try {
     const { channel_id } = req.params;
+    const { pin } = req.body || {};
+
+    const requestDeviceId = getRequestDeviceId(req);
+
+    if (!requestDeviceId) {
+      return res.status(400).json({
+        success: false,
+        message: "device_id is required",
+      });
+    }
 
     const oldResult = await db.query(
-      `SELECT *
+      `SELECT
+          channel_id,
+          channel_name,
+          is_private,
+          private_pin,
+          created_device_id
        FROM telegram_channels
        WHERE channel_id = $1`,
       [channel_id]
@@ -608,6 +670,44 @@ router.delete("/:channel_id", async (req, res) => {
         success: false,
         message: "Channel not found",
       });
+    }
+
+    const channel = oldResult.rows[0];
+
+    const storedDeviceId = cleanDeviceId(channel.created_device_id);
+
+    if (!storedDeviceId) {
+      return res.status(403).json({
+        success: false,
+        message:
+          "Delete blocked. This old channel has no creator device saved.",
+      });
+    }
+
+    if (String(storedDeviceId) !== String(requestDeviceId)) {
+      return res.status(403).json({
+        success: false,
+        message:
+          "Delete blocked. Only the device that created this channel can delete it.",
+      });
+    }
+
+    if (channel.is_private) {
+      const finalPin = cleanPin(pin);
+
+      if (!/^[0-9]{4}$/.test(finalPin)) {
+        return res.status(400).json({
+          success: false,
+          message: "Enter valid 4 digit PIN",
+        });
+      }
+
+      if (String(channel.private_pin) !== String(finalPin)) {
+        return res.status(401).json({
+          success: false,
+          message: "PIN mismatch",
+        });
+      }
     }
 
     await db.query(
@@ -640,8 +740,7 @@ router.patch("/:channel_id/last-message", async (req, res) => {
     const { channel_id } = req.params;
     const { last_message } = req.body;
 
-    const finalMessage =
-      String(last_message || "").trim() || "No messages yet";
+    const finalMessage = String(last_message || "").trim() || "No messages yet";
 
     const result = await db.query(
       `UPDATE telegram_channels
