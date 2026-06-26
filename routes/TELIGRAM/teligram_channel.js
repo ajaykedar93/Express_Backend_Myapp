@@ -131,6 +131,13 @@ const getRequestDeviceId = (req) => {
   );
 };
 
+
+const setNoStoreHeaders = (res) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+};
+
 /* ===============================
    Logo Fetch API
    GET /api/telegram-channels/logo/:channel_id
@@ -555,19 +562,29 @@ router.put("/:channel_id", uploadLogo, async (req, res) => {
 /* ===============================
    5. Verify Private Channel PIN
    POST /api/telegram-channels/:channel_id/verify-pin
+
+   Important:
+   - No mismatch message text is returned from this API.
+   - Wrong PIN returns 200 with unlocked:false, so frontend can show clean
+     "Wrong PIN" only when actually wrong.
+   - Correct PIN always returns the same success fields, so old/stale frontend
+     logic cannot read a correct PIN as failed.
 ================================ */
 router.post("/:channel_id/verify-pin", async (req, res) => {
+  setNoStoreHeaders(res);
+
   try {
     const { channel_id } = req.params;
-    const { pin } = req.body;
+    const finalPin = cleanPin(req.body?.pin || req.body?.private_pin || "");
 
-    const finalPin = cleanPin(pin);
-
-    if (!/^[0-9]{4}$/.test(finalPin)) {
-      return res.status(400).json({
+    if (!/^\d{4}$/.test(finalPin)) {
+      return res.status(200).json({
         success: false,
         message: "Enter valid 4 digit PIN",
         unlocked: false,
+        verified: false,
+        valid: false,
+        pin_match: false,
       });
     }
 
@@ -587,24 +604,35 @@ router.post("/:channel_id/verify-pin", async (req, res) => {
         success: false,
         message: "Channel not found",
         unlocked: false,
+        verified: false,
+        valid: false,
+        pin_match: false,
       });
     }
 
     const channel = result.rows[0];
 
-    if (!channel.is_private) {
+    if (!isTrue(channel.is_private)) {
       return res.status(200).json({
         success: true,
         message: "Channel is public",
         unlocked: true,
+        verified: true,
+        valid: true,
+        pin_match: true,
       });
     }
 
-    if (String(channel.private_pin) !== String(finalPin)) {
-      return res.status(401).json({
+    const storedPin = cleanPin(channel.private_pin);
+
+    if (!/^\d{4}$/.test(storedPin) || storedPin !== finalPin) {
+      return res.status(200).json({
         success: false,
-        message: "PIN mismatch",
+        message: "Wrong PIN",
         unlocked: false,
+        verified: false,
+        valid: false,
+        pin_match: false,
       });
     }
 
@@ -612,6 +640,9 @@ router.post("/:channel_id/verify-pin", async (req, res) => {
       success: true,
       message: "PIN verified successfully",
       unlocked: true,
+      verified: true,
+      valid: true,
+      pin_match: true,
     });
   } catch (error) {
     console.error("Verify PIN error:", error);
@@ -620,6 +651,9 @@ router.post("/:channel_id/verify-pin", async (req, res) => {
       success: false,
       message: "Server error while verifying PIN",
       unlocked: false,
+      verified: false,
+      valid: false,
+      pin_match: false,
     });
   }
 });
@@ -705,7 +739,7 @@ router.delete("/:channel_id", async (req, res) => {
       if (String(channel.private_pin) !== String(finalPin)) {
         return res.status(401).json({
           success: false,
-          message: "PIN mismatch",
+          message: "Wrong PIN",
         });
       }
     }
