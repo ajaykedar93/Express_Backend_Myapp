@@ -1,47 +1,38 @@
 const express = require("express");
 const multer = require("multer");
 const path = require("path");
-const fs = require("fs");
 const db = require("../../db");
 
 const router = express.Router();
 
 /* ===============================
-   Upload Folder Setup
-================================ */
-const uploadDir = path.join(__dirname, "../../uploads/telegram-channels");
-
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
-}
-
-/* ===============================
    Multer Config
+   Direct DB upload using memoryStorage
 ================================ */
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, uploadDir);
-  },
-
-  filename: function (req, file, cb) {
-    const uniqueName =
-      Date.now() +
-      "-" +
-      Math.round(Math.random() * 1e9) +
-      path.extname(file.originalname);
-
-    cb(null, uniqueName);
-  },
-});
+const storage = multer.memoryStorage();
 
 const fileFilter = (req, file, cb) => {
-  const allowedTypes = ["image/jpeg", "image/jpg", "image/png", "image/webp"];
+  const allowedExt = /jpeg|jpg|png|gif|webp/;
 
-  if (allowedTypes.includes(file.mimetype)) {
-    cb(null, true);
-  } else {
-    cb(new Error("Only JPG, PNG, and WEBP images are allowed"), false);
+  const allowedMime = [
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+  ];
+
+  const extname = allowedExt.test(
+    path.extname(file.originalname).toLowerCase()
+  );
+
+  const mimetype = allowedMime.includes(file.mimetype);
+
+  if (extname && mimetype) {
+    return cb(null, true);
   }
+
+  cb(new Error("Only JPG, PNG, GIF, and WEBP images are allowed"), false);
 };
 
 const upload = multer({
@@ -72,39 +63,33 @@ const getBaseUrl = (req) => {
   return process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`;
 };
 
-const deleteFile = (filePath, folderPath) => {
-  try {
-    if (!filePath) return;
+const getSafeFileName = (value) => {
+  if (!value) return "logo.jpg";
 
-    const fileName = path.basename(filePath);
-    const fullPath = path.join(folderPath, fileName);
-
-    if (fs.existsSync(fullPath)) {
-      fs.unlinkSync(fullPath);
-    }
-  } catch (error) {
-    console.error("File delete error:", error);
-  }
+  return path
+    .basename(String(value))
+    .replace(/[/\\?%*:|"<>]/g, "-")
+    .trim();
 };
 
-const deleteOldLogo = (logoPath) => {
-  deleteFile(logoPath, uploadDir);
+const getLogoUrl = (req, channelId, updatedAt) => {
+  const version = updatedAt ? new Date(updatedAt).getTime() : Date.now();
+
+  return `${getBaseUrl(req)}/api/telegram-channels/logo/${channelId}?v=${version}`;
 };
 
-const deleteChannelNoteImages = async (channelId) => {
-  const notesUploadDir = path.join(__dirname, "../../uploads/telegram-notes");
+const normalizeChannelLogo = (req, channel) => {
+  if (!channel) return channel;
 
-  const result = await db.query(
-    `SELECT image_path
-     FROM telegram_notes
-     WHERE channel_id = $1
-       AND image_path IS NOT NULL`,
-    [channelId]
-  );
+  const hasLogo = Boolean(channel.has_logo);
 
-  result.rows.forEach((note) => {
-    deleteFile(note.image_path, notesUploadDir);
-  });
+  return {
+    ...channel,
+    logo_url: hasLogo
+      ? getLogoUrl(req, channel.channel_id, channel.updated_at)
+      : null,
+    logo_path: null,
+  };
 };
 
 const cleanText = (value) => {
@@ -123,6 +108,48 @@ const isTrue = (value) => {
 const cleanPin = (pin) => {
   return String(pin || "").replace(/\D/g, "").slice(0, 4);
 };
+
+/* ===============================
+   Logo Fetch API
+   GET /api/telegram-channels/logo/:channel_id
+================================ */
+router.get("/logo/:channel_id", async (req, res) => {
+  try {
+    const { channel_id } = req.params;
+
+    const result = await db.query(
+      `SELECT logo_data, logo_mime
+       FROM telegram_channels
+       WHERE channel_id = $1`,
+      [channel_id]
+    );
+
+    if (result.rows.length === 0 || !result.rows[0].logo_data) {
+      return res.status(404).json({
+        success: false,
+        message: "Logo not found",
+      });
+    }
+
+    const logo = result.rows[0];
+
+    const logoBuffer = Buffer.isBuffer(logo.logo_data)
+      ? logo.logo_data
+      : Buffer.from(logo.logo_data);
+
+    res.setHeader("Content-Type", logo.logo_mime || "image/jpeg");
+    res.setHeader("Cache-Control", "no-store");
+
+    return res.end(logoBuffer);
+  } catch (error) {
+    console.error("Logo fetch error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Server error while fetching logo",
+    });
+  }
+});
 
 /* ===============================
    1. Get All Channels
@@ -147,6 +174,7 @@ router.get("/", async (req, res) => {
           c.channel_tagline,
           c.logo_url,
           c.logo_path,
+          (c.logo_data IS NOT NULL) AS has_logo,
           c.is_private,
           c.subscribers_count,
           c.last_message,
@@ -164,9 +192,13 @@ router.get("/", async (req, res) => {
       [user_id]
     );
 
+    const channels = result.rows.map((channel) =>
+      normalizeChannelLogo(req, channel)
+    );
+
     return res.status(200).json({
       success: true,
-      channels: result.rows,
+      channels,
     });
   } catch (error) {
     console.error("Get channels error:", error);
@@ -194,6 +226,7 @@ router.get("/:channel_id", async (req, res) => {
           c.channel_tagline,
           c.logo_url,
           c.logo_path,
+          (c.logo_data IS NOT NULL) AS has_logo,
           c.is_private,
           c.subscribers_count,
           c.last_message,
@@ -219,7 +252,7 @@ router.get("/:channel_id", async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      channel: result.rows[0],
+      channel: normalizeChannelLogo(req, result.rows[0]),
     });
   } catch (error) {
     console.error("Get single channel error:", error);
@@ -234,6 +267,9 @@ router.get("/:channel_id", async (req, res) => {
 /* ===============================
    3. Create Channel
    POST /api/telegram-channels
+
+   FormData image field name:
+   logo
 ================================ */
 router.post("/", uploadLogo, async (req, res) => {
   try {
@@ -272,12 +308,14 @@ router.post("/", uploadLogo, async (req, res) => {
       });
     }
 
-    let logoUrl = null;
-    let logoPath = null;
+    let logoData = null;
+    let logoMime = null;
+    let logoName = null;
 
     if (req.file) {
-      logoPath = `/uploads/telegram-channels/${req.file.filename}`;
-      logoUrl = `${getBaseUrl(req)}${logoPath}`;
+      logoData = req.file.buffer;
+      logoMime = req.file.mimetype;
+      logoName = getSafeFileName(req.file.originalname);
     }
 
     const result = await db.query(
@@ -286,6 +324,9 @@ router.post("/", uploadLogo, async (req, res) => {
           user_id,
           channel_name,
           channel_tagline,
+          logo_data,
+          logo_mime,
+          logo_name,
           logo_url,
           logo_path,
           is_private,
@@ -304,7 +345,10 @@ router.post("/", uploadLogo, async (req, res) => {
           $4,
           $5,
           $6,
+          NULL,
+          NULL,
           $7,
+          $8,
           1,
           'No messages yet',
           CURRENT_TIMESTAMP,
@@ -318,6 +362,7 @@ router.post("/", uploadLogo, async (req, res) => {
           channel_tagline,
           logo_url,
           logo_path,
+          (logo_data IS NOT NULL) AS has_logo,
           is_private,
           subscribers_count,
           last_message,
@@ -328,8 +373,9 @@ router.post("/", uploadLogo, async (req, res) => {
         user_id,
         finalName,
         finalTagline,
-        logoUrl,
-        logoPath,
+        logoData,
+        logoMime,
+        logoName,
         finalIsPrivate,
         finalIsPrivate ? finalPrivatePin : null,
       ]
@@ -339,7 +385,7 @@ router.post("/", uploadLogo, async (req, res) => {
       success: true,
       message: "Channel created successfully",
       channel: {
-        ...result.rows[0],
+        ...normalizeChannelLogo(req, result.rows[0]),
         total_messages: 0,
       },
     });
@@ -361,7 +407,7 @@ router.post("/", uploadLogo, async (req, res) => {
    - channel_name
    - channel_tagline
    - logo
-   - remove logo
+   - remove_logo
 
    Private status will not change here.
 ================================ */
@@ -393,20 +439,20 @@ router.put("/:channel_id", uploadLogo, async (req, res) => {
         ? oldChannel.channel_tagline
         : cleanTagline(channel_tagline);
 
-    let logoUrl = oldChannel.logo_url;
-    let logoPath = oldChannel.logo_path;
+    let logoData = oldChannel.logo_data;
+    let logoMime = oldChannel.logo_mime;
+    let logoName = oldChannel.logo_name;
 
-    if (remove_logo === "true") {
-      deleteOldLogo(oldChannel.logo_path);
-      logoUrl = null;
-      logoPath = null;
+    if (remove_logo === "true" || remove_logo === true) {
+      logoData = null;
+      logoMime = null;
+      logoName = null;
     }
 
     if (req.file) {
-      deleteOldLogo(oldChannel.logo_path);
-
-      logoPath = `/uploads/telegram-channels/${req.file.filename}`;
-      logoUrl = `${getBaseUrl(req)}${logoPath}`;
+      logoData = req.file.buffer;
+      logoMime = req.file.mimetype;
+      logoName = getSafeFileName(req.file.originalname);
     }
 
     const result = await db.query(
@@ -414,10 +460,13 @@ router.put("/:channel_id", uploadLogo, async (req, res) => {
        SET
           channel_name = $1,
           channel_tagline = $2,
-          logo_url = $3,
-          logo_path = $4,
+          logo_data = $3,
+          logo_mime = $4,
+          logo_name = $5,
+          logo_url = NULL,
+          logo_path = NULL,
           updated_at = CURRENT_TIMESTAMP
-       WHERE channel_id = $5
+       WHERE channel_id = $6
        RETURNING
           channel_id,
           user_id,
@@ -425,13 +474,21 @@ router.put("/:channel_id", uploadLogo, async (req, res) => {
           channel_tagline,
           logo_url,
           logo_path,
+          (logo_data IS NOT NULL) AS has_logo,
           is_private,
           subscribers_count,
           last_message,
           last_message_time,
           created_at,
           updated_at`,
-      [finalName, finalTagline, logoUrl, logoPath, channel_id]
+      [
+        finalName,
+        finalTagline,
+        logoData,
+        logoMime,
+        logoName,
+        channel_id,
+      ]
     );
 
     const countResult = await db.query(
@@ -445,7 +502,7 @@ router.put("/:channel_id", uploadLogo, async (req, res) => {
       success: true,
       message: "Channel updated successfully",
       channel: {
-        ...result.rows[0],
+        ...normalizeChannelLogo(req, result.rows[0]),
         total_messages: countResult.rows[0].total_messages,
       },
     });
@@ -553,11 +610,6 @@ router.delete("/:channel_id", async (req, res) => {
       });
     }
 
-    const oldChannel = oldResult.rows[0];
-
-    await deleteChannelNoteImages(channel_id);
-    deleteOldLogo(oldChannel.logo_path);
-
     await db.query(
       `DELETE FROM telegram_channels
        WHERE channel_id = $1`,
@@ -605,6 +657,7 @@ router.patch("/:channel_id/last-message", async (req, res) => {
           channel_tagline,
           logo_url,
           logo_path,
+          (logo_data IS NOT NULL) AS has_logo,
           is_private,
           subscribers_count,
           last_message,
@@ -624,7 +677,7 @@ router.patch("/:channel_id/last-message", async (req, res) => {
     return res.status(200).json({
       success: true,
       message: "Last message updated successfully",
-      channel: result.rows[0],
+      channel: normalizeChannelLogo(req, result.rows[0]),
     });
   } catch (error) {
     console.error("Update last message error:", error);

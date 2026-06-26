@@ -214,7 +214,6 @@ const teligramChannelRoutes = require("./routes/TELIGRAM/teligram_channel");
 const path = require("path");
 
 
-app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 app.use("/api/telegram-notes", teligramMessageRoutes);
 app.use("/api/telegram-channels", teligramChannelRoutes);
 

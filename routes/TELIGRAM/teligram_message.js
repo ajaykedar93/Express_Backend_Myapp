@@ -1,48 +1,38 @@
 const express = require("express");
 const multer = require("multer");
 const path = require("path");
-const fs = require("fs");
 const sanitizeHtml = require("sanitize-html");
 const db = require("../../db");
 
 const router = express.Router();
 
 /* ===============================
-   Upload Folder Setup
-================================ */
-const uploadDir = path.join(__dirname, "../../uploads/telegram-notes");
-
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
-}
-
-/* ===============================
    Multer Image Upload Config
+   Store image in memory, then save buffer in DB
 ================================ */
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, uploadDir);
-  },
-
-  filename: function (req, file, cb) {
-    const uniqueName =
-      Date.now() +
-      "-" +
-      Math.round(Math.random() * 1e9) +
-      path.extname(file.originalname);
-
-    cb(null, uniqueName);
-  },
-});
+const storage = multer.memoryStorage();
 
 const fileFilter = (req, file, cb) => {
-  const allowedTypes = ["image/jpeg", "image/jpg", "image/png", "image/webp"];
+  const allowedExt = /jpeg|jpg|png|gif|webp/;
+  const allowedMime = [
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+  ];
 
-  if (allowedTypes.includes(file.mimetype)) {
-    cb(null, true);
-  } else {
-    cb(new Error("Only JPG, PNG, and WEBP images are allowed"), false);
+  const extname = allowedExt.test(
+    path.extname(file.originalname).toLowerCase()
+  );
+
+  const mimetype = allowedMime.includes(file.mimetype);
+
+  if (extname && mimetype) {
+    return cb(null, true);
   }
+
+  cb(new Error("Only JPG, PNG, GIF, and WEBP images are allowed"), false);
 };
 
 const upload = multer({
@@ -74,66 +64,37 @@ const getBaseUrl = (req) => {
 };
 
 const getSafeFileName = (value) => {
-  if (!value) return "";
+  if (!value) return "image.jpg";
 
-  const cleanValue = String(value)
-    .replace(/\\/g, "/")
-    .split("?")[0]
-    .split("#")[0];
-
-  return path.basename(cleanValue);
+  return path
+    .basename(String(value))
+    .replace(/[/\\?%*:|"<>]/g, "-")
+    .trim();
 };
 
-const getImageViewUrl = (req, imagePathOrUrl) => {
-  const fileName = getSafeFileName(imagePathOrUrl);
-  if (!fileName) return null;
+const getImageViewUrl = (req, noteId, updatedAt) => {
+  const version = updatedAt ? new Date(updatedAt).getTime() : Date.now();
 
-  return `${getBaseUrl(req)}/api/telegram-notes/image/${encodeURIComponent(fileName)}`;
+  return `${getBaseUrl(req)}/api/telegram-notes/image/${noteId}?v=${version}`;
 };
 
-const getImageDownloadUrl = (req, imagePathOrUrl) => {
-  const fileName = getSafeFileName(imagePathOrUrl);
-  if (!fileName) return null;
-
-  return `${getBaseUrl(req)}/api/telegram-notes/image/download/${encodeURIComponent(fileName)}`;
+const getImageDownloadUrl = (req, noteId) => {
+  return `${getBaseUrl(req)}/api/telegram-notes/image/download/${noteId}`;
 };
 
 const normalizeNoteImage = (req, note) => {
   if (!note) return note;
 
-  const imageSource = note.image_path || note.image_url;
-
-  if (!imageSource) {
-    return {
-      ...note,
-      image_url: null,
-      image_path: null,
-      download_url: null,
-    };
-  }
+  const hasImage = Boolean(note.has_image);
 
   return {
     ...note,
-    // Always return a stable backend API URL, so old /uploads URLs also work after refresh.
-    image_url: getImageViewUrl(req, imageSource),
-    image_path: note.image_path,
-    download_url: getImageDownloadUrl(req, imageSource),
+    image_url: hasImage
+      ? getImageViewUrl(req, note.note_id, note.updated_at)
+      : null,
+    image_path: null,
+    download_url: hasImage ? getImageDownloadUrl(req, note.note_id) : null,
   };
-};
-
-const deleteOldImage = (imagePath) => {
-  try {
-    if (!imagePath) return;
-
-    const fileName = path.basename(imagePath);
-    const fullPath = path.join(uploadDir, fileName);
-
-    if (fs.existsSync(fullPath)) {
-      fs.unlinkSync(fullPath);
-    }
-  } catch (error) {
-    console.error("Delete image error:", error);
-  }
 };
 
 const isValidColor = (color) => {
@@ -205,24 +166,24 @@ const getPlainText = (html) => {
     .trim();
 };
 
-const getLastMessageText = (contentHtml, imageUrl) => {
+const getLastMessageText = (contentHtml, hasImage) => {
   const text = getPlainText(contentHtml);
 
   if (text) {
     return text.slice(0, 100);
   }
 
-  if (imageUrl) {
+  if (hasImage) {
     return "Image message";
   }
 
   return "No messages yet";
 };
 
-const updateChannelLastMessage = async (channelId, contentHtml, imageUrl) => {
+const updateChannelLastMessage = async (channelId, contentHtml, hasImage) => {
   if (!channelId) return;
 
-  const lastMessage = getLastMessageText(contentHtml, imageUrl);
+  const lastMessage = getLastMessageText(contentHtml, hasImage);
 
   await db.query(
     `UPDATE telegram_channels
@@ -239,7 +200,9 @@ const updateChannelLastMessageAfterDelete = async (channelId) => {
   if (!channelId) return;
 
   const latestResult = await db.query(
-    `SELECT content_html, image_url
+    `SELECT
+        content_html,
+        (image_data IS NOT NULL) AS has_image
      FROM telegram_notes
      WHERE channel_id = $1
      ORDER BY created_at DESC, note_id DESC
@@ -266,7 +229,7 @@ const updateChannelLastMessageAfterDelete = async (channelId) => {
   await updateChannelLastMessage(
     channelId,
     latestNote.content_html,
-    latestNote.image_url
+    latestNote.has_image
   );
 };
 
@@ -331,8 +294,6 @@ const checkChannelAccess = async (req, res, channelId) => {
 /* ===============================
    1. Get Notes
    GET /api/telegram-notes?user_id=7&channel_id=1
-   For private channel send header:
-   x-channel-pin: 1234
 ================================ */
 router.get("/", async (req, res) => {
   try {
@@ -366,6 +327,7 @@ router.get("/", async (req, res) => {
           text_color,
           image_url,
           image_path,
+          (image_data IS NOT NULL) AS has_image,
           is_pinned,
           is_private,
           pin_hint,
@@ -395,26 +357,48 @@ router.get("/", async (req, res) => {
 });
 
 /* ===============================
-   Image View + Download
-   GET /api/telegram-notes/image/:filename
-   GET /api/telegram-notes/image/download/:filename
-================================ */
-router.get("/image/download/:filename", (req, res) => {
-  try {
-    const fileName = getSafeFileName(req.params.filename);
-    const fullPath = path.join(uploadDir, fileName);
+   Image View + Download From DB
 
-    if (!fileName || !fs.existsSync(fullPath)) {
+   GET /api/telegram-notes/image/:note_id
+   GET /api/telegram-notes/image/download/:note_id
+================================ */
+router.get("/image/download/:note_id", async (req, res) => {
+  try {
+    const { note_id } = req.params;
+
+    const result = await db.query(
+      `SELECT image_data, image_mime, image_name
+       FROM telegram_notes
+       WHERE note_id = $1`,
+      [note_id]
+    );
+
+    if (result.rows.length === 0 || !result.rows[0].image_data) {
       return res.status(404).json({
         success: false,
         message: "Image not found",
       });
     }
 
-    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
-    return res.download(fullPath, fileName);
+    const image = result.rows[0];
+
+    const imageBuffer = Buffer.isBuffer(image.image_data)
+      ? image.image_data
+      : Buffer.from(image.image_data);
+
+    const fileName = getSafeFileName(image.image_name || `note-${note_id}.jpg`);
+
+    res.setHeader("Content-Type", image.image_mime || "image/jpeg");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${fileName}"`
+    );
+    res.setHeader("Cache-Control", "no-store");
+
+    return res.end(imageBuffer);
   } catch (error) {
     console.error("Image download error:", error);
+
     return res.status(500).json({
       success: false,
       message: "Server error while downloading image",
@@ -422,22 +406,37 @@ router.get("/image/download/:filename", (req, res) => {
   }
 });
 
-router.get("/image/:filename", (req, res) => {
+router.get("/image/:note_id", async (req, res) => {
   try {
-    const fileName = getSafeFileName(req.params.filename);
-    const fullPath = path.join(uploadDir, fileName);
+    const { note_id } = req.params;
 
-    if (!fileName || !fs.existsSync(fullPath)) {
+    const result = await db.query(
+      `SELECT image_data, image_mime
+       FROM telegram_notes
+       WHERE note_id = $1`,
+      [note_id]
+    );
+
+    if (result.rows.length === 0 || !result.rows[0].image_data) {
       return res.status(404).json({
         success: false,
         message: "Image not found",
       });
     }
 
-    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
-    return res.sendFile(fullPath);
+    const image = result.rows[0];
+
+    const imageBuffer = Buffer.isBuffer(image.image_data)
+      ? image.image_data
+      : Buffer.from(image.image_data);
+
+    res.setHeader("Content-Type", image.image_mime || "image/jpeg");
+    res.setHeader("Cache-Control", "no-store");
+
+    return res.end(imageBuffer);
   } catch (error) {
     console.error("Image fetch error:", error);
+
     return res.status(500).json({
       success: false,
       message: "Server error while fetching image",
@@ -463,6 +462,7 @@ router.get("/:note_id", async (req, res) => {
           text_color,
           image_url,
           image_path,
+          (image_data IS NOT NULL) AS has_image,
           is_pinned,
           is_private,
           pin_hint,
@@ -504,8 +504,8 @@ router.get("/:note_id", async (req, res) => {
    3. Add New Note
    POST /api/telegram-notes
 
-   For private channel send:
-   x-channel-pin: 1234
+   FormData field name for image:
+   image
 ================================ */
 router.post("/", uploadImage, async (req, res) => {
   try {
@@ -527,32 +527,24 @@ router.post("/", uploadImage, async (req, res) => {
 
     const allowed = await checkChannelAccess(req, res, channel_id);
 
-    if (!allowed) {
-      if (req.file) {
-        deleteOldImage(`/uploads/telegram-notes/${req.file.filename}`);
-      }
-
-      return;
-    }
+    if (!allowed) return;
 
     const finalTitle = title ? title.trim() : null;
     const finalContent = cleanHtml(content_html);
     const finalPlainText = getPlainText(finalContent);
     const finalColor = isValidColor(text_color) ? text_color : "#111827";
 
-    let imageUrl = null;
-    let imagePath = null;
+    let imageData = null;
+    let imageMime = null;
+    let imageName = null;
 
     if (req.file) {
-      imagePath = `/uploads/telegram-notes/${req.file.filename}`;
-      imageUrl = getImageViewUrl(req, imagePath);
+      imageData = req.file.buffer;
+      imageMime = req.file.mimetype;
+      imageName = getSafeFileName(req.file.originalname);
     }
 
-    if (!finalTitle && !finalPlainText && !imageUrl) {
-      if (imagePath) {
-        deleteOldImage(imagePath);
-      }
-
+    if (!finalTitle && !finalPlainText && !imageData) {
       return res.status(400).json({
         success: false,
         message: "Please add text or image",
@@ -567,13 +559,16 @@ router.post("/", uploadImage, async (req, res) => {
           title,
           content_html,
           text_color,
+          image_data,
+          image_mime,
+          image_name,
           image_url,
           image_path,
           created_at,
           updated_at
         )
        VALUES
-        ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
        RETURNING
           note_id,
           user_id,
@@ -583,6 +578,7 @@ router.post("/", uploadImage, async (req, res) => {
           text_color,
           image_url,
           image_path,
+          (image_data IS NOT NULL) AS has_image,
           is_pinned,
           is_private,
           pin_hint,
@@ -594,12 +590,13 @@ router.post("/", uploadImage, async (req, res) => {
         finalTitle,
         finalContent,
         finalColor,
-        imageUrl,
-        imagePath,
+        imageData,
+        imageMime,
+        imageName,
       ]
     );
 
-    await updateChannelLastMessage(channel_id, finalContent, imageUrl);
+    await updateChannelLastMessage(channel_id, finalContent, Boolean(imageData));
 
     return res.status(201).json({
       success: true,
@@ -633,10 +630,6 @@ router.put("/:note_id", uploadImage, async (req, res) => {
     );
 
     if (oldNoteResult.rows.length === 0) {
-      if (req.file) {
-        deleteOldImage(`/uploads/telegram-notes/${req.file.filename}`);
-      }
-
       return res.status(404).json({
         success: false,
         message: "Message not found",
@@ -647,40 +640,30 @@ router.put("/:note_id", uploadImage, async (req, res) => {
 
     const allowed = await checkChannelAccess(req, res, oldNote.channel_id);
 
-    if (!allowed) {
-      if (req.file) {
-        deleteOldImage(`/uploads/telegram-notes/${req.file.filename}`);
-      }
-
-      return;
-    }
+    if (!allowed) return;
 
     const finalTitle = title ? title.trim() : null;
     const finalContent = cleanHtml(content_html);
     const finalPlainText = getPlainText(finalContent);
     const finalColor = isValidColor(text_color) ? text_color : "#111827";
 
-    let imageUrl = oldNote.image_url;
-    let imagePath = oldNote.image_path;
+    let imageData = oldNote.image_data;
+    let imageMime = oldNote.image_mime;
+    let imageName = oldNote.image_name;
 
-    if (remove_image === "true") {
-      deleteOldImage(oldNote.image_path);
-      imageUrl = null;
-      imagePath = null;
+    if (remove_image === "true" || remove_image === true) {
+      imageData = null;
+      imageMime = null;
+      imageName = null;
     }
 
     if (req.file) {
-      deleteOldImage(oldNote.image_path);
-
-      imagePath = `/uploads/telegram-notes/${req.file.filename}`;
-      imageUrl = getImageViewUrl(req, imagePath);
+      imageData = req.file.buffer;
+      imageMime = req.file.mimetype;
+      imageName = getSafeFileName(req.file.originalname);
     }
 
-    if (!finalTitle && !finalPlainText && !imageUrl) {
-      if (req.file) {
-        deleteOldImage(imagePath);
-      }
-
+    if (!finalTitle && !finalPlainText && !imageData) {
       return res.status(400).json({
         success: false,
         message: "Please add text or image",
@@ -693,10 +676,13 @@ router.put("/:note_id", uploadImage, async (req, res) => {
           title = $1,
           content_html = $2,
           text_color = $3,
-          image_url = $4,
-          image_path = $5,
+          image_data = $4,
+          image_mime = $5,
+          image_name = $6,
+          image_url = NULL,
+          image_path = NULL,
           updated_at = CURRENT_TIMESTAMP
-       WHERE note_id = $6
+       WHERE note_id = $7
        RETURNING
           note_id,
           user_id,
@@ -706,6 +692,7 @@ router.put("/:note_id", uploadImage, async (req, res) => {
           text_color,
           image_url,
           image_path,
+          (image_data IS NOT NULL) AS has_image,
           is_pinned,
           is_private,
           pin_hint,
@@ -715,8 +702,9 @@ router.put("/:note_id", uploadImage, async (req, res) => {
         finalTitle,
         finalContent,
         finalColor,
-        imageUrl,
-        imagePath,
+        imageData,
+        imageMime,
+        imageName,
         note_id,
       ]
     );
@@ -724,7 +712,7 @@ router.put("/:note_id", uploadImage, async (req, res) => {
     await updateChannelLastMessage(
       oldNote.channel_id,
       finalContent,
-      imageUrl
+      Boolean(imageData)
     );
 
     return res.status(200).json({
@@ -769,8 +757,6 @@ router.delete("/:note_id", async (req, res) => {
     const allowed = await checkChannelAccess(req, res, oldNote.channel_id);
 
     if (!allowed) return;
-
-    deleteOldImage(oldNote.image_path);
 
     await db.query(
       `DELETE FROM telegram_notes
