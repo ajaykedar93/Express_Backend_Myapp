@@ -21,6 +21,18 @@ function safeText(value) {
   return String(value);
 }
 
+function fixed2(value) {
+  return Number(value || 0).toFixed(2);
+}
+
+function cleanStateCode(value, fallback = "") {
+  return safeText(value || fallback).trim();
+}
+
+function isSameState(supplierStateCode, buyerStateCode) {
+  return cleanStateCode(supplierStateCode) === cleanStateCode(buyerStateCode);
+}
+
 function numberToWords(num) {
   num = Math.round(Number(num || 0));
 
@@ -73,8 +85,23 @@ function numberToWords(num) {
   return words.trim();
 }
 
-function calculateInvoice(items, igstRate = 5) {
+function getInvoiceStateCodes(body = {}) {
+  const supplierStateCode = cleanStateCode(body.supplier_state_code, "27");
+
+  // Buyer state is used for GST place-of-supply decision.
+  // If buyer state is missing, consignee state is used.
+  const buyerStateCode = cleanStateCode(
+    body.buyer_state_code || body.consignee_state_code,
+    "27"
+  );
+
+  return { supplierStateCode, buyerStateCode };
+}
+
+function calculateInvoice(items, gstRate = 5, supplierStateCode = "27", buyerStateCode = "27") {
   let taxableAmount = 0;
+  const totalGstRate = Number(gstRate || 0);
+  const sameState = isSameState(supplierStateCode, buyerStateCode);
 
   const cleanItems = Array.isArray(items) ? items : [];
 
@@ -89,7 +116,7 @@ function calculateInvoice(items, igstRate = 5) {
       sr_no: item.sr_no || index + 1,
       description: item.description || "",
       hsn_sac: item.hsn_sac || item.hsn || "251710",
-      gst_rate: Number(item.gst_rate || igstRate || 5),
+      gst_rate: Number(item.gst_rate || totalGstRate || 5),
       quantity,
       rate,
       per: item.per || item.unit || "Brass",
@@ -97,20 +124,70 @@ function calculateInvoice(items, igstRate = 5) {
     };
   });
 
-  const igstAmount = taxableAmount * (Number(igstRate || 0) / 100);
-  const totalBeforeRound = taxableAmount + igstAmount;
+  const totalTaxAmount = taxableAmount * (totalGstRate / 100);
+
+  const cgstRate = sameState ? totalGstRate / 2 : 0;
+  const sgstRate = sameState ? totalGstRate / 2 : 0;
+  const igstRate = sameState ? 0 : totalGstRate;
+
+  const cgstAmount = sameState ? taxableAmount * (cgstRate / 100) : 0;
+  const sgstAmount = sameState ? taxableAmount * (sgstRate / 100) : 0;
+  const igstAmount = sameState ? 0 : totalTaxAmount;
+
+  const totalBeforeRound = taxableAmount + totalTaxAmount;
   const grandTotal = Math.round(totalBeforeRound);
   const roundUp = grandTotal - totalBeforeRound;
 
   return {
     items: calculatedItems,
     taxableAmount,
-    igstRate: Number(igstRate || 0),
+    gstRate: totalGstRate,
+    taxType: sameState ? "CGST_SGST" : "IGST",
+
+    cgstRate,
+    cgstAmount,
+    sgstRate,
+    sgstAmount,
+    igstRate,
     igstAmount,
+    totalTaxAmount,
+
     roundUp,
     grandTotal,
     amountInWords: `${numberToWords(grandTotal)} Rupees Only`,
-    taxAmountInWords: `${numberToWords(igstAmount)} Rupees only.`
+    taxAmountInWords: `${numberToWords(totalTaxAmount)} Rupees only.`
+  };
+}
+
+function decorateInvoice(invoice = {}) {
+  const { supplierStateCode, buyerStateCode } = getInvoiceStateCodes(invoice);
+  const sameState = isSameState(supplierStateCode, buyerStateCode);
+
+  const taxableAmount = Number(invoice.taxable_amount || 0);
+  const gstRate = Number(invoice.gst_rate || invoice.igst_rate || 5);
+  const totalTaxAmount = Number(invoice.total_tax_amount || invoice.igst_amount || 0);
+
+  const cgstRate = sameState ? gstRate / 2 : 0;
+  const sgstRate = sameState ? gstRate / 2 : 0;
+  const igstRate = sameState ? 0 : gstRate;
+
+  const cgstAmount = sameState ? totalTaxAmount / 2 : 0;
+  const sgstAmount = sameState ? totalTaxAmount / 2 : 0;
+  const igstAmount = sameState ? 0 : totalTaxAmount;
+
+  return {
+    ...invoice,
+    gst_rate: gstRate,
+    tax_type: sameState ? "CGST_SGST" : "IGST",
+    cgst_rate: Number(fixed2(cgstRate)),
+    cgst_amount: Number(fixed2(cgstAmount)),
+    sgst_rate: Number(fixed2(sgstRate)),
+    sgst_amount: Number(fixed2(sgstAmount)),
+    igst_rate_display: Number(fixed2(igstRate)),
+    igst_amount_display: Number(fixed2(igstAmount)),
+    total_tax_amount: Number(fixed2(totalTaxAmount)),
+    taxable_amount: Number(fixed2(taxableAmount)),
+    grand_total: Number(fixed2(invoice.grand_total || 0))
   };
 }
 
@@ -179,6 +256,16 @@ router.get("/invoices/next-no", async (req, res) => {
 /* =========================================================
    API 2: Create Invoice
    POST /api/invoices
+
+   GST LOGIC:
+   supplier_state_code === buyer_state_code  => CGST + SGST
+   supplier_state_code !== buyer_state_code  => IGST only
+
+   Note:
+   This version does not need DB schema changes.
+   Existing columns igst_rate and igst_amount are used as:
+   igst_rate   = total GST rate
+   igst_amount = total tax amount
 ========================================================= */
 
 router.post("/invoices", async (req, res) => {
@@ -228,7 +315,16 @@ router.post("/invoices", async (req, res) => {
       invoiceNo = `${nextNumber}/${financialYear}`;
     }
 
-    const calculation = calculateInvoice(body.items || [], body.igst_rate || 5);
+    const supplierStateCode = body.supplier_state_code || "27";
+    const buyerStateCode = body.buyer_state_code || body.consignee_state_code || "27";
+    const gstRate = body.gst_rate || body.igst_rate || 5;
+
+    const calculation = calculateInvoice(
+      body.items || [],
+      gstRate,
+      supplierStateCode,
+      buyerStateCode
+    );
 
     const invoiceResult = await client.query(
       `
@@ -284,18 +380,17 @@ router.post("/invoices", async (req, res) => {
           "1 Adgaon Kh, Pimpli Lokai Shirdi, Tal:- Rahata Dist :- Ahmednagar",
         body.supplier_gstin || "27KNNVPS8477J1ZE",
         body.supplier_state_name || "Maharashtra",
-        body.supplier_state_code || "27",
+        supplierStateCode,
 
-        body.consignee_name || "BIOSEL SOLAR PRIVATE LIMITED",
-        body.consignee_state_name || "Gujrat",
-        body.consignee_state_code || "24",
+        body.consignee_name || body.buyer_name || "BABA ENTERPRISES",
+        body.consignee_state_name || body.buyer_state_name || "Maharashtra",
+        body.consignee_state_code || buyerStateCode,
 
-        body.buyer_name || "BIOSEL SOLAR PRIVATE LIMITED",
-        body.buyer_gstin || "24AALCB1497J1ZE",
-        body.buyer_state_name || "Gujrat",
-        body.buyer_state_code || "24",
-        body.buyer_address ||
-          "BUNGLOWS NO.82, GULMAHOR-ENCLAV, 2, GULMAHOR GREEN AND GOLF COUNTRY, COUNTRY CLUB, Kolat, Ahmedabad, Gujarat,382210",
+        body.buyer_name || "BABA ENTERPRISES",
+        body.buyer_gstin || "27AATFB5667K1ZO",
+        body.buyer_state_name || "Maharashtra",
+        buyerStateCode,
+        body.buyer_address || "324/12 NAGAR MANMAD ROAD RAHATA",
 
         body.bank_name || "STATE BANK OF INDIA",
         body.bank_account_no || "41116710845",
@@ -303,8 +398,8 @@ router.post("/invoices", async (req, res) => {
         body.bank_ifsc || "SBIN0006322",
 
         calculation.taxableAmount,
-        calculation.igstRate,
-        calculation.igstAmount,
+        calculation.gstRate,
+        calculation.totalTaxAmount,
         calculation.roundUp,
         calculation.grandTotal,
         calculation.amountInWords,
@@ -349,8 +444,10 @@ router.post("/invoices", async (req, res) => {
     res.status(201).json({
       success: true,
       message: "Invoice created successfully",
-      invoice,
-      items: calculation.items
+      invoice: decorateInvoice(invoice),
+      items: calculation.items,
+      pdfViewUrl: `/api/invoices/${invoice.id}/pdf-view`,
+      pdfDownloadUrl: `/api/invoices/${invoice.id}/pdf`
     });
   } catch (error) {
     await client.query("ROLLBACK");
@@ -391,7 +488,7 @@ router.get("/invoices", async (req, res) => {
 
     res.json({
       success: true,
-      data: result.rows
+      data: result.rows.map(decorateInvoice)
     });
   } catch (error) {
     console.error("Get invoices error:", error);
@@ -429,8 +526,10 @@ router.get("/invoices/:id", async (req, res) => {
 
     res.json({
       success: true,
-      invoice: invoiceResult.rows[0],
-      items: itemsResult.rows
+      invoice: decorateInvoice(invoiceResult.rows[0]),
+      items: itemsResult.rows,
+      pdfViewUrl: `/api/invoices/${req.params.id}/pdf-view`,
+      pdfDownloadUrl: `/api/invoices/${req.params.id}/pdf`
     });
   } catch (error) {
     console.error("Get invoice error:", error);
@@ -478,7 +577,20 @@ router.put("/invoices/:id", async (req, res) => {
       });
     }
 
-    const calculation = calculateInvoice(body.items || [], body.igst_rate || 5);
+    const supplierStateCode = body.supplier_state_code || existingInvoice.rows[0].supplier_state_code || "27";
+    const buyerStateCode =
+      body.buyer_state_code ||
+      body.consignee_state_code ||
+      existingInvoice.rows[0].buyer_state_code ||
+      "27";
+    const gstRate = body.gst_rate || body.igst_rate || existingInvoice.rows[0].igst_rate || 5;
+
+    const calculation = calculateInvoice(
+      body.items || [],
+      gstRate,
+      supplierStateCode,
+      buyerStateCode
+    );
 
     const invoiceResult = await client.query(
       `
@@ -519,33 +631,33 @@ router.put("/invoices/:id", async (req, res) => {
       RETURNING *
       `,
       [
-        body.invoice_no,
-        body.invoice_date,
+        body.invoice_no || existingInvoice.rows[0].invoice_no,
+        body.invoice_date || existingInvoice.rows[0].invoice_date,
 
-        body.supplier_name,
-        body.supplier_address,
-        body.supplier_gstin,
-        body.supplier_state_name,
-        body.supplier_state_code,
+        body.supplier_name || existingInvoice.rows[0].supplier_name,
+        body.supplier_address || existingInvoice.rows[0].supplier_address,
+        body.supplier_gstin || existingInvoice.rows[0].supplier_gstin,
+        body.supplier_state_name || existingInvoice.rows[0].supplier_state_name,
+        supplierStateCode,
 
-        body.consignee_name,
-        body.consignee_state_name,
-        body.consignee_state_code,
+        body.consignee_name || existingInvoice.rows[0].consignee_name,
+        body.consignee_state_name || existingInvoice.rows[0].consignee_state_name,
+        body.consignee_state_code || buyerStateCode,
 
-        body.buyer_name,
-        body.buyer_gstin,
-        body.buyer_state_name,
-        body.buyer_state_code,
-        body.buyer_address,
+        body.buyer_name || existingInvoice.rows[0].buyer_name,
+        body.buyer_gstin || existingInvoice.rows[0].buyer_gstin,
+        body.buyer_state_name || existingInvoice.rows[0].buyer_state_name,
+        buyerStateCode,
+        body.buyer_address || existingInvoice.rows[0].buyer_address,
 
-        body.bank_name,
-        body.bank_account_no,
-        body.bank_branch,
-        body.bank_ifsc,
+        body.bank_name || existingInvoice.rows[0].bank_name,
+        body.bank_account_no || existingInvoice.rows[0].bank_account_no,
+        body.bank_branch || existingInvoice.rows[0].bank_branch,
+        body.bank_ifsc || existingInvoice.rows[0].bank_ifsc,
 
         calculation.taxableAmount,
-        calculation.igstRate,
-        calculation.igstAmount,
+        calculation.gstRate,
+        calculation.totalTaxAmount,
         calculation.roundUp,
         calculation.grandTotal,
         calculation.amountInWords,
@@ -594,8 +706,10 @@ router.put("/invoices/:id", async (req, res) => {
     res.json({
       success: true,
       message: "Invoice updated successfully",
-      invoice: invoiceResult.rows[0],
-      items: calculation.items
+      invoice: decorateInvoice(invoiceResult.rows[0]),
+      items: calculation.items,
+      pdfViewUrl: `/api/invoices/${req.params.id}/pdf-view`,
+      pdfDownloadUrl: `/api/invoices/${req.params.id}/pdf`
     });
   } catch (error) {
     await client.query("ROLLBACK");
