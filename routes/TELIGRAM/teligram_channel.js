@@ -121,13 +121,22 @@ const cleanDeviceId = (value) => {
 };
 
 const getRequestDeviceId = (req) => {
-  // Header first, then body/query. This works for JSON, FormData and DELETE.
   return cleanDeviceId(
     req.headers["x-device-id"] ||
       req.body?.device_id ||
       req.body?.sender_device_id ||
       req.body?.created_device_id ||
       req.query?.device_id ||
+      ""
+  );
+};
+
+const getRequestPin = (req) => {
+  return cleanPin(
+    req.headers["x-channel-pin"] ||
+      req.body?.pin ||
+      req.body?.private_pin ||
+      req.query?.pin ||
       ""
   );
 };
@@ -297,15 +306,13 @@ router.get("/:channel_id", async (req, res) => {
    3. Create Channel
    POST /api/telegram-channels
 
-   Required from frontend:
-   - user_id
-   - channel_name
-   - created_device_id OR device_id
-   - is_private
-   - private_pin if private
+   Public channel:
+   - created_device_id OR device_id required
+   - delete later requires same device
 
-   FormData image field name:
-   logo
+   Private channel:
+   - private_pin required
+   - open/delete requires same PIN only
 ================================ */
 router.post("/", uploadLogo, async (req, res) => {
   try {
@@ -326,15 +333,6 @@ router.post("/", uploadLogo, async (req, res) => {
       });
     }
 
-    const finalDeviceId = cleanDeviceId(created_device_id || device_id);
-
-    if (!finalDeviceId) {
-      return res.status(400).json({
-        success: false,
-        message: "created_device_id or device_id is required",
-      });
-    }
-
     const finalName = cleanText(channel_name);
 
     if (!finalName) {
@@ -346,7 +344,15 @@ router.post("/", uploadLogo, async (req, res) => {
 
     const finalTagline = cleanTagline(channel_tagline);
     const finalIsPrivate = isTrue(is_private);
+    const finalDeviceId = cleanDeviceId(created_device_id || device_id);
     const finalPrivatePin = finalIsPrivate ? cleanPin(private_pin) : null;
+
+    if (!finalIsPrivate && !finalDeviceId) {
+      return res.status(400).json({
+        success: false,
+        message: "created_device_id or device_id is required for public channel",
+      });
+    }
 
     if (finalIsPrivate && !/^[0-9]{4}$/.test(finalPrivatePin)) {
       return res.status(400).json({
@@ -427,7 +433,7 @@ router.post("/", uploadLogo, async (req, res) => {
         logoName,
         finalIsPrivate,
         finalIsPrivate ? finalPrivatePin : null,
-        finalDeviceId,
+        finalDeviceId || null,
       ]
     );
 
@@ -452,14 +458,6 @@ router.post("/", uploadLogo, async (req, res) => {
 /* ===============================
    4. Update Channel
    PUT /api/telegram-channels/:channel_id
-
-   Update only:
-   - channel_name
-   - channel_tagline
-   - logo
-   - remove_logo
-
-   Private status will not change here.
 ================================ */
 router.put("/:channel_id", uploadLogo, async (req, res) => {
   try {
@@ -562,29 +560,6 @@ router.put("/:channel_id", uploadLogo, async (req, res) => {
 /* ===============================
    5. Verify Private Channel PIN
    POST /api/telegram-channels/:channel_id/verify-pin
-
-   Correct PIN response:
-   {
-     success: true,
-     unlocked: true,
-     verified: true,
-     valid: true,
-     pin_match: true
-   }
-
-   Wrong PIN response:
-   {
-     success: false,
-     unlocked: false,
-     verified: false,
-     valid: false,
-     pin_match: false
-   }
-
-   Note:
-   "Trust this device" should be handled by frontend localStorage.
-   When device is trusted, frontend should open channel directly and should
-   not show the PIN popup again. This API remains clean and consistent.
 ================================ */
 router.post("/:channel_id/verify-pin", async (req, res) => {
   setNoStoreHeaders(res);
@@ -678,30 +653,21 @@ router.post("/:channel_id/verify-pin", async (req, res) => {
    6. Delete Channel
    DELETE /api/telegram-channels/:channel_id
 
-   Required:
-   - device_id OR x-device-id header
+   Public channel:
+   - same created device only
 
    Private channel:
-   - device_id / x-device-id
-   - pin
-
-   Rules:
-   - Public channel: same created device only
-   - Private channel: same created device + correct PIN only
+   - correct same PIN only
+   - no device id check
 ================================ */
 router.delete("/:channel_id", async (req, res) => {
+  setNoStoreHeaders(res);
+
   try {
     const { channel_id } = req.params;
-    const { pin } = req.body || {};
 
     const requestDeviceId = getRequestDeviceId(req);
-
-    if (!requestDeviceId) {
-      return res.status(400).json({
-        success: false,
-        message: "device_id is required",
-      });
-    }
+    const requestPin = getRequestPin(req);
 
     const oldResult = await db.query(
       `SELECT
@@ -723,39 +689,47 @@ router.delete("/:channel_id", async (req, res) => {
     }
 
     const channel = oldResult.rows[0];
+    const privateChannel = isTrue(channel.is_private);
 
-    const storedDeviceId = cleanDeviceId(channel.created_device_id);
-
-    if (!storedDeviceId) {
-      return res.status(403).json({
-        success: false,
-        message: "Delete blocked. This old channel has no creator device saved.",
-      });
-    }
-
-    if (String(storedDeviceId) !== String(requestDeviceId)) {
-      return res.status(403).json({
-        success: false,
-        message:
-          "Delete blocked. Only the device that created this channel can delete it.",
-      });
-    }
-
-    if (isTrue(channel.is_private)) {
-      const finalPin = cleanPin(pin);
+    if (privateChannel) {
       const storedPin = cleanPin(channel.private_pin);
 
-      if (!/^[0-9]{4}$/.test(finalPin)) {
+      if (!/^[0-9]{4}$/.test(requestPin)) {
         return res.status(400).json({
           success: false,
           message: "Enter valid 4 digit PIN",
         });
       }
 
-      if (!/^[0-9]{4}$/.test(storedPin) || storedPin !== finalPin) {
+      if (!/^[0-9]{4}$/.test(storedPin) || storedPin !== requestPin) {
         return res.status(401).json({
           success: false,
           message: "Wrong PIN",
+        });
+      }
+    } else {
+      const storedDeviceId = cleanDeviceId(channel.created_device_id);
+
+      if (!requestDeviceId) {
+        return res.status(400).json({
+          success: false,
+          message: "device_id is required",
+        });
+      }
+
+      if (!storedDeviceId) {
+        return res.status(403).json({
+          success: false,
+          message:
+            "Delete blocked. This public channel has no creator device saved.",
+        });
+      }
+
+      if (String(storedDeviceId) !== String(requestDeviceId)) {
+        return res.status(403).json({
+          success: false,
+          message:
+            "Delete blocked. Only the device that created this public channel can delete it.",
         });
       }
     }
@@ -839,32 +813,3 @@ router.patch("/:channel_id/last-message", async (req, res) => {
 });
 
 module.exports = router;
-
-/*
-============================================================
-IMPORTANT FOR DIFFERENT MESSAGE BACKGROUND
-============================================================
-
-This file is only the channel backend. It can identify which device created
-a channel, but it cannot identify which device sent each chat message.
-
-In your /api/telegram-notes backend, add this once in PostgreSQL:
-
-ALTER TABLE telegram_notes
-ADD COLUMN IF NOT EXISTS sender_device_id VARCHAR(120),
-ADD COLUMN IF NOT EXISTS device_id VARCHAR(120),
-ADD COLUMN IF NOT EXISTS created_device_id VARCHAR(120);
-
-Then when inserting a message, save:
-const finalDeviceId = getRequestDeviceId(req);
-
-and INSERT finalDeviceId into:
-sender_device_id, device_id, created_device_id
-
-Also return these fields in GET notes:
-sender_device_id, device_id, created_device_id
-
-Frontend can then compare:
-note.sender_device_id === getCurrentDeviceId()
-and show my-message / other-message card background.
-*/
