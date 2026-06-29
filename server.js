@@ -212,11 +212,13 @@ app.use("/api", invoicePdfRoutes);
 const teligramMessageRoutes = require("./routes/TELIGRAM/teligram_message");
 const teligramChannelRoutes = require("./routes/TELIGRAM/teligram_channel");
 const path = require("path");
+const telegramUserRoutes = require("./routes/TELIGRAM/telegram_user");
 
 
 app.use("/api/telegram-notes", teligramMessageRoutes);
 app.use("/api/telegram-channels", teligramChannelRoutes);
 
+app.use("/api/telegram-users", telegramUserRoutes);
 
 
 /* ---------------- Health Check ---------------- */
