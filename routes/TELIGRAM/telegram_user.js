@@ -6,7 +6,7 @@ const jwt = require("jsonwebtoken");
 
 const db = require("../../db");
 
-// Mailer (Mailjet HTTPS API): sendOTP / sendEmail
+// Mailer
 const { sendOTP, sendEmail } = require("../../utils/mailer");
 
 const router = express.Router();
@@ -20,9 +20,19 @@ const OTP_EXPIRE_MINUTES = 10;
 const OTP_VERIFY_VALID_MINUTES = 30;
 const OTP_MAX_ATTEMPTS = 5;
 
+/*
+  IMPORTANT FIX:
+  Your database currently does not have:
+  profile_image_data, profile_image_mime, profile_image_name, profile_image_size
+
+  This backend will NOT crash if those columns are missing.
+  Profile image is optional.
+  If image columns are missing, profile image upload is ignored safely.
+*/
+
 /* ===============================
    Multer Config
-   Direct DB upload using memoryStorage
+   Optional profile image
 ================================ */
 const storage = multer.memoryStorage();
 
@@ -58,10 +68,6 @@ const upload = multer({
   },
 });
 
-/*
-  React page sends field name: profile_image
-  If your frontend sends "logo", change profile_image to logo below.
-*/
 const uploadProfileImage = (req, res, next) => {
   upload.single("profile_image")(req, res, function (error) {
     if (error) {
@@ -98,6 +104,49 @@ const addMinutes = (minutes) => {
   return new Date(Date.now() + minutes * 60 * 1000);
 };
 
+/* ===============================
+   Profile Image Column Check
+   This prevents:
+   column "profile_image_data" does not exist
+================================ */
+let profileColumnCache = null;
+
+const getProfileColumnInfo = async () => {
+  if (profileColumnCache) return profileColumnCache;
+
+  const result = await db.query(
+    `
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'telegram_users'
+        AND column_name IN (
+          'profile_image_data',
+          'profile_image_mime',
+          'profile_image_name',
+          'profile_image_size'
+        )
+    `
+  );
+
+  const columns = new Set(result.rows.map((row) => row.column_name));
+
+  profileColumnCache = {
+    hasData: columns.has("profile_image_data"),
+    hasMime: columns.has("profile_image_mime"),
+    hasName: columns.has("profile_image_name"),
+    hasSize: columns.has("profile_image_size"),
+  };
+
+  profileColumnCache.hasAll =
+    profileColumnCache.hasData &&
+    profileColumnCache.hasMime &&
+    profileColumnCache.hasName &&
+    profileColumnCache.hasSize;
+
+  return profileColumnCache;
+};
+
 const normalizeUser = (user) => {
   if (!user) return null;
 
@@ -115,30 +164,27 @@ const normalizeUser = (user) => {
   };
 };
 
+/*
+  Mailjet FIX:
+  Your error was:
+  Type mismatch. Expected type "string". ErrorRelatedTo: Messages.To
+
+  So do not call sendEmail({ to, subject, ... }).
+  Call sendEmail(to, subject, html, text), where "to" is a string.
+*/
 const sendProfessionalMail = async ({ to, subject, text, html, otp }) => {
-  /*
-    This helper supports common mailer styles:
-    1) sendEmail({ to, subject, text, html })
-    2) sendEmail(to, subject, html, text)
-    3) sendOTP(to, otp, subject)
-  */
+  const cleanTo = cleanEmail(to);
+
+  if (!isValidEmail(cleanTo)) {
+    throw new Error("Invalid email recipient");
+  }
 
   if (typeof sendEmail === "function") {
-    try {
-      return await sendEmail({ to, subject, text, html });
-    } catch (firstError) {
-      try {
-        return await sendEmail(to, subject, html, text);
-      } catch (secondError) {
-        if (typeof sendOTP !== "function") {
-          throw secondError;
-        }
-      }
-    }
+    return await sendEmail(cleanTo, subject, html, text);
   }
 
   if (typeof sendOTP === "function") {
-    return await sendOTP(to, otp, subject);
+    return await sendOTP(cleanTo, otp, subject);
   }
 
   throw new Error("Mailer function not found");
@@ -153,7 +199,7 @@ const buildOtpEmail = ({ otp, title, subtitle, purposeText }) => {
       <div style="max-width:520px;margin:0 auto;padding:24px 14px;">
         <div style="background:#ffffff;border-radius:22px;overflow:hidden;border:1px solid #e5e7eb;box-shadow:0 16px 40px rgba(15,23,42,0.10);">
           <div style="background:linear-gradient(135deg,#1d4ed8,#06b6d4);padding:24px 22px;color:#ffffff;text-align:center;">
-            <div style="width:62px;height:62px;border-radius:18px;background:rgba(255,255,255,0.16);margin:0 auto 12px;display:flex;align-items:center;justify-content:center;font-size:30px;font-weight:900;">âœˆ</div>
+            <div style="width:62px;height:62px;border-radius:18px;background:rgba(255,255,255,0.16);margin:0 auto 12px;display:flex;align-items:center;justify-content:center;font-size:30px;font-weight:900;">✈</div>
             <h2 style="margin:0;font-size:24px;line-height:1.2;font-weight:900;">${title}</h2>
             <p style="margin:8px 0 0;color:rgba(255,255,255,0.86);font-size:13px;font-weight:600;">${subtitle}</p>
           </div>
@@ -174,7 +220,7 @@ const buildOtpEmail = ({ otp, title, subtitle, purposeText }) => {
 
           <div style="background:#f8fafc;border-top:1px solid #e2e8f0;padding:14px 20px;text-align:center;">
             <p style="margin:0;color:#94a3b8;font-size:12px;font-weight:600;">
-              Telegram Login Security â€¢ Infinity Techno Solutions
+              Telegram Login Security • Infinity Techno Solutions
             </p>
           </div>
         </div>
@@ -504,49 +550,89 @@ router.post("/register", uploadProfileImage, async (req, res) => {
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
+    const profileInfo = await getProfileColumnInfo();
 
-    const profileImageBuffer = req.file ? req.file.buffer : null;
-    const profileImageMime = req.file ? req.file.mimetype : null;
-    const profileImageName = req.file ? req.file.originalname : null;
-    const profileImageSize = req.file ? req.file.size : null;
+    let insertResult;
 
-    const insertResult = await db.query(
-      `
-        INSERT INTO telegram_users
-          (
+    /*
+      If DB has image columns and image was uploaded, store image.
+      If columns are missing, image is ignored safely because profile is optional.
+    */
+    if (profileInfo.hasAll) {
+      const profileImageBuffer = req.file ? req.file.buffer : null;
+      const profileImageMime = req.file ? req.file.mimetype : null;
+      const profileImageName = req.file ? req.file.originalname : null;
+      const profileImageSize = req.file ? req.file.size : null;
+
+      insertResult = await db.query(
+        `
+          INSERT INTO telegram_users
+            (
+              full_name,
+              mobile_no,
+              email,
+              password_hash,
+              profile_image_data,
+              profile_image_mime,
+              profile_image_name,
+              profile_image_size,
+              is_email_verified
+            )
+          VALUES
+            ($1, $2, $3, $4, $5, $6, $7, $8, TRUE)
+          RETURNING
+            telegram_user_id,
             full_name,
             mobile_no,
             email,
-            password_hash,
-            profile_image_data,
-            profile_image_mime,
-            profile_image_name,
-            profile_image_size,
-            is_email_verified
-          )
-        VALUES
-          ($1, $2, $3, $4, $5, $6, $7, $8, TRUE)
-        RETURNING
-          telegram_user_id,
-          full_name,
-          mobile_no,
+            is_email_verified,
+            (profile_image_data IS NOT NULL) AS has_profile_image,
+            last_login_at,
+            created_at
+        `,
+        [
+          fullName,
+          mobileNo,
           email,
-          is_email_verified,
-          (profile_image_data IS NOT NULL) AS has_profile_image,
-          last_login_at,
-          created_at
-      `,
-      [
-        fullName,
-        mobileNo,
-        email,
-        passwordHash,
-        profileImageBuffer,
-        profileImageMime,
-        profileImageName,
-        profileImageSize,
-      ]
-    );
+          passwordHash,
+          profileImageBuffer,
+          profileImageMime,
+          profileImageName,
+          profileImageSize,
+        ]
+      );
+    } else {
+      if (req.file) {
+        console.warn(
+          "Profile image ignored because profile_image_* columns do not exist in telegram_users table."
+        );
+      }
+
+      insertResult = await db.query(
+        `
+          INSERT INTO telegram_users
+            (
+              full_name,
+              mobile_no,
+              email,
+              password_hash,
+              is_email_verified
+            )
+          VALUES
+            ($1, $2, $3, $4, TRUE)
+          RETURNING
+            telegram_user_id,
+            full_name,
+            mobile_no,
+            email,
+            is_email_verified,
+            FALSE AS has_profile_image,
+            last_login_at,
+            created_at
+        `,
+        [fullName, mobileNo, email, passwordHash]
+      );
+    }
 
     const user = normalizeUser(insertResult.rows[0]);
 
@@ -596,6 +682,12 @@ router.post("/login", async (req, res) => {
       });
     }
 
+    const profileInfo = await getProfileColumnInfo();
+
+    const hasProfileImageSql = profileInfo.hasData
+      ? `(profile_image_data IS NOT NULL) AS has_profile_image`
+      : `FALSE AS has_profile_image`;
+
     const result = await db.query(
       `
         SELECT
@@ -606,7 +698,7 @@ router.post("/login", async (req, res) => {
           password_hash,
           is_email_verified,
           is_active,
-          (profile_image_data IS NOT NULL) AS has_profile_image,
+          ${hasProfileImageSql},
           last_login_at,
           created_at
         FROM telegram_users
@@ -861,6 +953,9 @@ router.post("/forgot-password/reset", async (req, res) => {
 /* ===============================
    API 7: Get Profile Image From DB
    GET /api/telegram-users/profile-image/:id
+
+   If image columns do not exist, it returns 404
+   instead of crashing.
 ================================ */
 router.get("/profile-image/:id", async (req, res) => {
   try {
@@ -870,6 +965,15 @@ router.get("/profile-image/:id", async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "Invalid user id",
+      });
+    }
+
+    const profileInfo = await getProfileColumnInfo();
+
+    if (!profileInfo.hasData || !profileInfo.hasMime) {
+      return res.status(404).json({
+        success: false,
+        message: "Profile image storage not enabled",
       });
     }
 
