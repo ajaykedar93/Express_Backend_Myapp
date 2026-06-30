@@ -220,6 +220,12 @@ app.use("/api/telegram-channels", teligramChannelRoutes);
 
 app.use("/api/telegram-users", telegramUserRoutes);
 
+//LOGIN USER LOGIN-
+const telegramloginChannelsRoutes = require("./routes/TELIGRAM/telegramlogin_channels");
+const telegramloginNotesRoutes = require("./routes/TELIGRAM/telegramlogin_notes");
+
+app.use("/api/telegramlogin-channels", telegramloginChannelsRoutes);
+app.use("/api/telegramlogin-notes", telegramloginNotesRoutes);
 
 /* ---------------- Health Check ---------------- */
 app.get("/health", (_req, res) => res.json({ status: "OK--(API LOAD START)" }));

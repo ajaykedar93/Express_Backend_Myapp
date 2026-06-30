@@ -20,16 +20,6 @@ const OTP_EXPIRE_MINUTES = 10;
 const OTP_VERIFY_VALID_MINUTES = 30;
 const OTP_MAX_ATTEMPTS = 5;
 
-/*
-  IMPORTANT FIX:
-  Your database currently does not have:
-  profile_image_data, profile_image_mime, profile_image_name, profile_image_size
-
-  This backend will NOT crash if those columns are missing.
-  Profile image is optional.
-  If image columns are missing, profile image upload is ignored safely.
-*/
-
 /* ===============================
    Multer Config
    Optional profile image
@@ -106,8 +96,6 @@ const addMinutes = (minutes) => {
 
 /* ===============================
    Profile Image Column Check
-   This prevents:
-   column "profile_image_data" does not exist
 ================================ */
 let profileColumnCache = null;
 
@@ -156,22 +144,100 @@ const normalizeUser = (user) => {
     mobile_no: user.mobile_no,
     email: user.email,
     is_email_verified: user.is_email_verified,
+    is_active: user.is_active,
     profile_image_url: user.has_profile_image
       ? `/api/telegram-users/profile-image/${user.telegram_user_id}`
       : "",
     last_login_at: user.last_login_at,
     created_at: user.created_at,
+    updated_at: user.updated_at,
   };
 };
 
-/*
-  Mailjet FIX:
-  Your error was:
-  Type mismatch. Expected type "string". ErrorRelatedTo: Messages.To
+const getUserSelectColumns = (profileInfo) => {
+  const hasProfileImageSql = profileInfo.hasData
+    ? `(profile_image_data IS NOT NULL) AS has_profile_image`
+    : `FALSE AS has_profile_image`;
 
-  So do not call sendEmail({ to, subject, ... }).
-  Call sendEmail(to, subject, html, text), where "to" is a string.
-*/
+  return `
+    telegram_user_id,
+    full_name,
+    mobile_no,
+    email,
+    is_email_verified,
+    is_active,
+    ${hasProfileImageSql},
+    last_login_at,
+    created_at,
+    updated_at
+  `;
+};
+
+const authenticateTelegramUser = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization || "";
+    const token = authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7)
+      : "";
+
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        message: "Authorization token required",
+      });
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const telegramUserId = Number(decoded.telegram_user_id);
+
+    if (!Number.isInteger(telegramUserId) || telegramUserId <= 0) {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid token",
+      });
+    }
+
+    const profileInfo = await getProfileColumnInfo();
+    const userColumns = getUserSelectColumns(profileInfo);
+
+    const result = await db.query(
+      `
+        SELECT
+          ${userColumns}
+        FROM telegram_users
+        WHERE telegram_user_id = $1
+          AND is_active = TRUE
+        LIMIT 1
+      `,
+      [telegramUserId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(401).json({
+        success: false,
+        message: "User not found or inactive",
+      });
+    }
+
+    req.telegramUser = normalizeUser(result.rows[0]);
+    req.telegramUserId = telegramUserId;
+
+    return next();
+  } catch (error) {
+    if (error.name === "TokenExpiredError") {
+      return res.status(401).json({
+        success: false,
+        message: "Session expired. Please login again.",
+      });
+    }
+
+    return res.status(401).json({
+      success: false,
+      message: "Invalid authorization token",
+    });
+  }
+};
+
 const sendProfessionalMail = async ({ to, subject, text, html, otp }) => {
   const cleanTo = cleanEmail(to);
 
@@ -480,6 +546,7 @@ router.post("/verify-code", async (req, res) => {
 /* ===============================
    API 3: Register
    POST /api/telegram-users/register
+
    form-data:
    full_name, mobile_no, email, password, profile_image(optional)
 ================================ */
@@ -554,10 +621,6 @@ router.post("/register", uploadProfileImage, async (req, res) => {
 
     let insertResult;
 
-    /*
-      If DB has image columns and image was uploaded, store image.
-      If columns are missing, image is ignored safely because profile is optional.
-    */
     if (profileInfo.hasAll) {
       const profileImageBuffer = req.file ? req.file.buffer : null;
       const profileImageMime = req.file ? req.file.mimetype : null;
@@ -586,9 +649,11 @@ router.post("/register", uploadProfileImage, async (req, res) => {
             mobile_no,
             email,
             is_email_verified,
+            is_active,
             (profile_image_data IS NOT NULL) AS has_profile_image,
             last_login_at,
-            created_at
+            created_at,
+            updated_at
         `,
         [
           fullName,
@@ -626,9 +691,11 @@ router.post("/register", uploadProfileImage, async (req, res) => {
             mobile_no,
             email,
             is_email_verified,
+            is_active,
             FALSE AS has_profile_image,
             last_login_at,
-            created_at
+            created_at,
+            updated_at
         `,
         [fullName, mobileNo, email, passwordHash]
       );
@@ -661,7 +728,9 @@ router.post("/register", uploadProfileImage, async (req, res) => {
 /* ===============================
    API 4: Login
    POST /api/telegram-users/login
-   json: email, password
+
+   json:
+   email, password
 ================================ */
 router.post("/login", async (req, res) => {
   try {
@@ -700,7 +769,8 @@ router.post("/login", async (req, res) => {
           is_active,
           ${hasProfileImageSql},
           last_login_at,
-          created_at
+          created_at,
+          updated_at
         FROM telegram_users
         WHERE email = $1
         LIMIT 1
@@ -953,9 +1023,6 @@ router.post("/forgot-password/reset", async (req, res) => {
 /* ===============================
    API 7: Get Profile Image From DB
    GET /api/telegram-users/profile-image/:id
-
-   If image columns do not exist, it returns 404
-   instead of crashing.
 ================================ */
 router.get("/profile-image/:id", async (req, res) => {
   try {
@@ -1012,7 +1079,405 @@ router.get("/profile-image/:id", async (req, res) => {
 });
 
 /* ===============================
-   API 8: Health Check
+   API 8: Get Logged-In User Profile
+   GET /api/telegram-users/me
+
+   Header:
+   Authorization: Bearer <token>
+
+   Use after login to show username and profile image.
+================================ */
+router.get("/me", authenticateTelegramUser, async (req, res) => {
+  return res.status(200).json({
+    success: true,
+    message: "User profile loaded successfully",
+    user: req.telegramUser,
+  });
+});
+
+/* ===============================
+   API 9: Get All Users List
+   GET /api/telegram-users/list
+
+   Optional:
+   /list?search=rahul
+   /list?include_inactive=true
+   /list?page=1&limit=20
+================================ */
+router.get("/list", async (req, res) => {
+  try {
+    const profileInfo = await getProfileColumnInfo();
+    const userColumns = getUserSelectColumns(profileInfo);
+
+    const search = cleanText(req.query.search);
+    const includeInactive =
+      String(req.query.include_inactive || "").toLowerCase() === "true";
+
+    const page = Math.max(parseInt(req.query.page || "1", 10), 1);
+    const limit = Math.min(
+      Math.max(parseInt(req.query.limit || "20", 10), 1),
+      100
+    );
+    const offset = (page - 1) * limit;
+
+    const whereParts = [];
+    const params = [];
+
+    if (!includeInactive) {
+      whereParts.push("is_active = TRUE");
+    }
+
+    if (search) {
+      params.push(`%${search}%`);
+      whereParts.push(
+        `(full_name ILIKE $${params.length} OR email ILIKE $${params.length} OR mobile_no ILIKE $${params.length})`
+      );
+    }
+
+    const whereSql =
+      whereParts.length > 0 ? `WHERE ${whereParts.join(" AND ")}` : "";
+
+    const countResult = await db.query(
+      `
+        SELECT COUNT(*)::INTEGER AS total
+        FROM telegram_users
+        ${whereSql}
+      `,
+      params
+    );
+
+    params.push(limit);
+    const limitParam = params.length;
+
+    params.push(offset);
+    const offsetParam = params.length;
+
+    const result = await db.query(
+      `
+        SELECT
+          ${userColumns}
+        FROM telegram_users
+        ${whereSql}
+        ORDER BY created_at DESC
+        LIMIT $${limitParam}
+        OFFSET $${offsetParam}
+      `,
+      params
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Users loaded successfully",
+      total: countResult.rows[0].total,
+      page,
+      limit,
+      users: result.rows.map(normalizeUser),
+    });
+  } catch (error) {
+    console.error("Get all telegram users error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Server error while loading users",
+    });
+  }
+});
+
+/* ===============================
+   API 10: Update User Details
+   PUT /api/telegram-users/:id
+
+   JSON:
+   full_name, mobile_no, email, password
+
+   Form-data:
+   full_name, mobile_no, email, password, profile_image
+================================ */
+router.put("/:id", uploadProfileImage, async (req, res) => {
+  try {
+    const telegramUserId = Number(req.params.id);
+
+    if (!Number.isInteger(telegramUserId) || telegramUserId <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid user id",
+      });
+    }
+
+    const existingResult = await db.query(
+      `
+        SELECT telegram_user_id, full_name, mobile_no, email
+        FROM telegram_users
+        WHERE telegram_user_id = $1
+        LIMIT 1
+      `,
+      [telegramUserId]
+    );
+
+    if (existingResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    const existingUser = existingResult.rows[0];
+
+    const hasFullName = Object.prototype.hasOwnProperty.call(
+      req.body,
+      "full_name"
+    );
+    const hasMobileNo = Object.prototype.hasOwnProperty.call(
+      req.body,
+      "mobile_no"
+    );
+    const hasEmail = Object.prototype.hasOwnProperty.call(req.body, "email");
+    const hasPassword = Object.prototype.hasOwnProperty.call(
+      req.body,
+      "password"
+    );
+
+    const fullName = hasFullName ? cleanText(req.body.full_name) : null;
+    const mobileNo = hasMobileNo ? cleanText(req.body.mobile_no) : null;
+    const email = hasEmail ? cleanEmail(req.body.email) : null;
+    const password = hasPassword ? String(req.body.password || "") : null;
+
+    if (hasFullName && fullName.length < 3) {
+      return res.status(400).json({
+        success: false,
+        message: "Full name must be at least 3 characters",
+      });
+    }
+
+    if (hasMobileNo && !isValidMobile(mobileNo)) {
+      return res.status(400).json({
+        success: false,
+        message: "Enter valid 10 digit mobile number",
+      });
+    }
+
+    if (hasEmail && !isValidEmail(email)) {
+      return res.status(400).json({
+        success: false,
+        message: "Enter valid email",
+      });
+    }
+
+    if (hasPassword && password.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must be at least 6 characters",
+      });
+    }
+
+    const duplicateConditions = [];
+    const duplicateParams = [];
+
+    if (hasEmail && email !== existingUser.email) {
+      duplicateParams.push(email);
+      duplicateConditions.push(`email = $${duplicateParams.length}`);
+    }
+
+    if (hasMobileNo && mobileNo !== existingUser.mobile_no) {
+      duplicateParams.push(mobileNo);
+      duplicateConditions.push(`mobile_no = $${duplicateParams.length}`);
+    }
+
+    if (duplicateConditions.length > 0) {
+      duplicateParams.push(telegramUserId);
+
+      const duplicateResult = await db.query(
+        `
+          SELECT telegram_user_id, email, mobile_no
+          FROM telegram_users
+          WHERE (${duplicateConditions.join(" OR ")})
+            AND telegram_user_id <> $${duplicateParams.length}
+          LIMIT 1
+        `,
+        duplicateParams
+      );
+
+      if (duplicateResult.rows.length > 0) {
+        const duplicateUser = duplicateResult.rows[0];
+
+        return res.status(409).json({
+          success: false,
+          message:
+            duplicateUser.email === email
+              ? "Email already registered"
+              : "Mobile number already registered",
+        });
+      }
+    }
+
+    const setClauses = [];
+    const values = [];
+
+    if (hasFullName) {
+      values.push(fullName);
+      setClauses.push(`full_name = $${values.length}`);
+    }
+
+    if (hasMobileNo) {
+      values.push(mobileNo);
+      setClauses.push(`mobile_no = $${values.length}`);
+    }
+
+    if (hasEmail) {
+      values.push(email);
+      setClauses.push(`email = $${values.length}`);
+    }
+
+    if (hasPassword) {
+      const passwordHash = await bcrypt.hash(password, 12);
+      values.push(passwordHash);
+      setClauses.push(`password_hash = $${values.length}`);
+    }
+
+    if (req.file) {
+      const profileInfo = await getProfileColumnInfo();
+
+      if (!profileInfo.hasAll) {
+        return res.status(400).json({
+          success: false,
+          message: "Profile image storage not enabled in database",
+        });
+      }
+
+      values.push(req.file.buffer);
+      setClauses.push(`profile_image_data = $${values.length}`);
+
+      values.push(req.file.mimetype);
+      setClauses.push(`profile_image_mime = $${values.length}`);
+
+      values.push(req.file.originalname);
+      setClauses.push(`profile_image_name = $${values.length}`);
+
+      values.push(req.file.size);
+      setClauses.push(`profile_image_size = $${values.length}`);
+    }
+
+    if (setClauses.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No valid user details provided for update",
+      });
+    }
+
+    const profileInfo = await getProfileColumnInfo();
+    const userColumns = getUserSelectColumns(profileInfo);
+
+    values.push(telegramUserId);
+
+    const result = await db.query(
+      `
+        UPDATE telegram_users
+        SET ${setClauses.join(", ")}
+        WHERE telegram_user_id = $${values.length}
+        RETURNING
+          ${userColumns}
+      `,
+      values
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "User updated successfully",
+      user: normalizeUser(result.rows[0]),
+    });
+  } catch (error) {
+    console.error("Update telegram user error:", error);
+
+    if (error.code === "23505") {
+      return res.status(409).json({
+        success: false,
+        message: "Email or mobile already registered",
+      });
+    }
+
+    return res.status(500).json({
+      success: false,
+      message: "Server error while updating user",
+    });
+  }
+});
+
+/* ===============================
+   API 11: Delete User
+   DELETE /api/telegram-users/:id
+
+   Permanently deletes user and related OTP records.
+================================ */
+router.delete("/:id", async (req, res) => {
+  try {
+    const telegramUserId = Number(req.params.id);
+
+    if (!Number.isInteger(telegramUserId) || telegramUserId <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid user id",
+      });
+    }
+
+    const existingResult = await db.query(
+      `
+        SELECT telegram_user_id, email
+        FROM telegram_users
+        WHERE telegram_user_id = $1
+        LIMIT 1
+      `,
+      [telegramUserId]
+    );
+
+    if (existingResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    const email = existingResult.rows[0].email;
+
+    await db.query("BEGIN");
+
+    await db.query(
+      `
+        DELETE FROM telegram_user_otps
+        WHERE email = $1
+      `,
+      [email]
+    );
+
+    const deleteResult = await db.query(
+      `
+        DELETE FROM telegram_users
+        WHERE telegram_user_id = $1
+        RETURNING telegram_user_id, full_name, email
+      `,
+      [telegramUserId]
+    );
+
+    await db.query("COMMIT");
+
+    return res.status(200).json({
+      success: true,
+      message: "User deleted successfully",
+      deleted_user: deleteResult.rows[0],
+    });
+  } catch (error) {
+    await db.query("ROLLBACK").catch(() => {});
+
+    console.error("Delete telegram user error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Server error while deleting user",
+    });
+  }
+});
+
+/* ===============================
+   API 12: Health Check
    GET /api/telegram-users/health
 ================================ */
 router.get("/health", (req, res) => {
