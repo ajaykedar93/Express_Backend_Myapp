@@ -224,6 +224,12 @@ app.use("/api/telegram-users", telegramUserRoutes);
 const telegramloginChannelsRoutes = require("./routes/TELIGRAM/telegramlogin_channels");
 const telegramloginNotesRoutes = require("./routes/TELIGRAM/telegramlogin_notes");
 
+const telegramloginUsersRoutes = require("./routes/TELIGRAM/telegramloginusers");
+app.use("/api/telegramlogin-users", telegramloginUsersRoutes);
+
+
+
+
 app.use("/api/telegramlogin-channels", telegramloginChannelsRoutes);
 app.use("/api/telegramlogin-notes", telegramloginNotesRoutes);
 
