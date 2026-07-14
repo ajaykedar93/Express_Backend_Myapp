@@ -227,11 +227,14 @@ const telegramloginNotesRoutes = require("./routes/TELIGRAM/telegramlogin_notes"
 const telegramloginUsersRoutes = require("./routes/TELIGRAM/telegramloginusers");
 app.use("/api/telegramlogin-users", telegramloginUsersRoutes);
 
-
+const telegramAllMissRoutes = require("./routes/TELIGRAM/telegramlogin_allmiss");
 
 
 app.use("/api/telegramlogin-channels", telegramloginChannelsRoutes);
 app.use("/api/telegramlogin-notes", telegramloginNotesRoutes);
+// ADD THIS LINE FOR MISSING LOGIC
+app.use("/api/telegramlogin-allmiss", telegramAllMissRoutes);
+
 
 /* ---------------- Health Check ---------------- */
 app.get("/health", (_req, res) => res.json({ status: "OK--(API LOAD START)" }));
