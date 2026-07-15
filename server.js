@@ -209,6 +209,8 @@ const invoicePdfRoutes = require("./routes/invoicepdf");
 app.use("/api", invoiceRoutes);
 app.use("/api", invoicePdfRoutes);
 
+
+
 const teligramMessageRoutes = require("./routes/TELIGRAM/teligram_message");
 const teligramChannelRoutes = require("./routes/TELIGRAM/teligram_channel");
 const path = require("path");
@@ -223,17 +225,17 @@ app.use("/api/telegram-users", telegramUserRoutes);
 //LOGIN USER LOGIN-
 const telegramloginChannelsRoutes = require("./routes/TELIGRAM/telegramlogin_channels");
 const telegramloginNotesRoutes = require("./routes/TELIGRAM/telegramlogin_notes");
-
 const telegramloginUsersRoutes = require("./routes/TELIGRAM/telegramloginusers");
-app.use("/api/telegramlogin-users", telegramloginUsersRoutes);
-
 const telegramAllMissRoutes = require("./routes/TELIGRAM/telegramlogin_allmiss");
 
+// ✅ users sathi don alias - tu donhi thikani use kartoys
+app.use("/api/telegram-users", telegramloginUsersRoutes);
+app.use("/api/telegramlogin-users", telegramloginUsersRoutes);
 
 app.use("/api/telegramlogin-channels", telegramloginChannelsRoutes);
 app.use("/api/telegramlogin-notes", telegramloginNotesRoutes);
-// ADD THIS LINE FOR MISSING LOGIC
 app.use("/api/telegramlogin-allmiss", telegramAllMissRoutes);
+
 
 
 /* ---------------- Health Check ---------------- */

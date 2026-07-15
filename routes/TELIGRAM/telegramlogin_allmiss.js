@@ -50,7 +50,7 @@ const verifyPrivatePin = async ({ channel, pin }) => {
   return bcrypt.compare(String(pin), channel.security_pin_hash);
 };
 
-// 1) SEND-LINK
+// 1) SEND-LINK - ORIGINAL PIN STORE
 router.post("/send-link", authenticateTelegramUser, async (req, res) => {
   try {
     const senderId = getCurrentUserId(req);
@@ -65,7 +65,7 @@ router.post("/send-link", authenticateTelegramUser, async (req, res) => {
     let plainPinToStore = null;
     if (channel.channel_type === "private") {
       const ok = await verifyPrivatePin({ channel, pin });
-      if (!ok) return res.status(403).json({ success: false, message: "Correct PIN required" });
+      if (!ok) return res.status(403).json({ success: false, message: "Correct Original PIN required" });
       plainPinToStore = String(pin);
     }
     receiverIds = [...new Set(receiverIds)].filter(id => id!== senderId);
@@ -81,10 +81,10 @@ router.post("/send-link", authenticateTelegramUser, async (req, res) => {
     }
     await db.query("COMMIT");
     return res.status(201).json({ success: true, sent_count: created.length, share_link: shareLink, invitations: created });
-  } catch (e) { await db.query("ROLLBACK").catch(()=>{}); return res.status(500).json({ success: false, message: "Server error" }); }
+  } catch (e) { await db.query("ROLLBACK").catch(()=>{}); console.error("send-link error", e); return res.status(500).json({ success: false, message: "Server error" }); }
 });
 
-// 2) RECEIVED-LINKS
+// 2) RECEIVED-LINKS - FAKT RECEIVER LA
 router.get("/received-links", authenticateTelegramUser, async (req, res) => {
   try {
     const uid = getCurrentUserId(req);
@@ -99,52 +99,55 @@ router.get("/received-links", authenticateTelegramUser, async (req, res) => {
       invitation_id: row.invitation_id, channel_id: row.channel_id, channel_name: row.channel_name, channel_type: row.channel_type,
       channel_logo_url: row.has_logo? `${BACKEND_URL}/api/telegramlogin-channels/logo/${row.channel_id}` : "",
       share_code: row.share_code, share_link: row.share_link || buildShareLink(row.share_code),
-      private_pin: row.private_pin_plain || "", sender_name: row.sender_name
+      private_pin: row.private_pin_plain || "", private_pin_plain: row.private_pin_plain || "", sender_name: row.sender_name
     }));
     return res.json({ success: true, links, invitations: links });
   } catch (e) { return res.status(500).json({ success: false, message: "Load failed" }); }
 });
 
-// 3) JOIN - BACKEND MADHUN HONAR - FRONTEND URL FAKT COPY SATHI
+// 3) JOIN - PIN NAKO, FAKT JOIN, PRIVATE TRUST OPEN LA
 router.post("/join", authenticateTelegramUser, async (req, res) => {
   try {
     const uid = getCurrentUserId(req);
-    const shareCode = cleanText(req.body.share_code || req.body.code || "");
+    const shareCode = cleanText(req.body.share_code || req.body.code || req.body.invite_code || "");
     const channelId = toInt(req.body.channel_id);
-    const pin = cleanText(req.body.security_pin || req.body.pin || "");
     const deviceId = getClientDeviceId(req);
 
     let channel = null;
-    if (channelId) channel = await getChannelById(channelId);
-    else if (shareCode) {
+
+    // 1) invitation ne shodh - tula pathavlela code
+    if (shareCode) {
+      const inv = await db.query(`SELECT channel_id FROM telegramlogin_channel_invitations WHERE share_code=$1 AND receiver_user_id=$2 AND invitation_status='pending' LIMIT 1`, [shareCode, uid]);
+      if (inv.rows.length) {
+        channel = await getChannelById(inv.rows[0].channel_id);
+      }
+    }
+    // 2) channel share_code ne shodh
+    if (!channel && shareCode) {
       const rr = await db.query(`SELECT * FROM telegramlogin_channellist WHERE share_code=$1 AND is_active=TRUE AND is_deleted=FALSE LIMIT 1`, [shareCode]);
       channel = rr.rows[0] || null;
     }
-    if (!channel) return res.status(404).json({ success: false, message: "Invalid link" });
+    // 3) channel_id ne shodh
+    if (!channel && channelId) channel = await getChannelById(channelId);
 
-    if (channel.channel_type === "private") {
-      const ok = await verifyPrivatePin({ channel, pin });
-      if (!ok) return res.status(403).json({ success: false, message: "Wrong PIN - Correct create-time PIN required" });
-    }
+    if (!channel) return res.status(404).json({ success: false, message: "Invalid link - code not found" });
 
+    // ✅ PRIVATE LA JOIN LA PIN CHECK NAHI - PIN FAKT OPEN LA LAGEL
     const mem = await getMembership({ channelId: channel.channel_id, userId: uid });
     if (!mem) {
-      await db.query(`INSERT INTO telegramlogin_channel_members (channel_id, telegram_user_id, member_role, member_status, pin_verified_at) VALUES ($1,$2,'member','active', CASE WHEN $3='private' THEN NOW() ELSE NULL END)`, [channel.channel_id, uid, channel.channel_type]);
+      await db.query(`INSERT INTO telegramlogin_channel_members (channel_id, telegram_user_id, member_role, member_status, pin_verified_at) VALUES ($1,$2,'member','active',NULL)`, [channel.channel_id, uid]);
     } else if (mem.member_status!== "active") {
-      await db.query(`UPDATE telegramlogin_channel_members SET member_status='active', pin_verified_at=CASE WHEN $2='private' THEN NOW() ELSE pin_verified_at END WHERE channel_id=$1 AND telegram_user_id=$3`, [channel.channel_id, channel.channel_type, uid]);
+      await db.query(`UPDATE telegramlogin_channel_members SET member_status='active' WHERE channel_id=$1 AND telegram_user_id=$2`, [channel.channel_id, uid]);
     }
 
+    // invitation accept mark - private la open hoi paryant pending rahu de? pan join jhala ki accept kara
     await db.query(`UPDATE telegramlogin_channel_invitations SET invitation_status='accepted', accepted_at=NOW() WHERE channel_id=$1 AND receiver_user_id=$2 AND invitation_status='pending'`, [channel.channel_id, uid]);
 
-    if (channel.channel_type === "private" && deviceId) {
-      await db.query(`INSERT INTO telegramlogin_private_channel_trusted_devices (channel_id, telegram_user_id, device_id, expires_at) VALUES ($1,$2,$3, NOW() + INTERVAL '${365} days') ON CONFLICT DO NOTHING`, [channel.channel_id, uid, deviceId]).catch(()=>{});
-    }
-
-    return res.json({ success: true, message: "Channel joined", channel: { channel_id: channel.channel_id, channel_name: channel.channel_name, channel_type: channel.channel_type } });
-  } catch (e) { console.error(e); return res.status(500).json({ success: false, message: "Join failed" }); }
+    return res.json({ success: true, message: "Channel joined", channel: { channel_id: channel.channel_id, channel_name: channel.channel_name, channel_type: channel.channel_type, share_code: channel.share_code } });
+  } catch (e) { console.error("join error", e); return res.status(500).json({ success: false, message: "Join failed" }); }
 });
 
-// 4) ACCEPT / REJECT
+// 4) ACCEPT / REJECT - PUBLIC ACCEPT = DELETE, PRIVATE ACCEPT = COPY (frontend handle)
 router.post("/received-links/:id", authenticateTelegramUser, async (req, res) => {
   try {
     const invId = toInt(req.params.id); const uid = getCurrentUserId(req);
@@ -158,7 +161,7 @@ router.post("/received-links/:id", authenticateTelegramUser, async (req, res) =>
   } catch (e) { return res.status(500).json({ success: false, message: "Server error" }); }
 });
 
-// 5) REMOVE
+// 5) REMOVE - PRIVATE LA PIN LAGEL
 router.post("/remove/:id", authenticateTelegramUser, async (req, res) => {
   try {
     const channelId = toInt(req.params.id); const uid = getCurrentUserId(req);
@@ -170,7 +173,7 @@ router.post("/remove/:id", authenticateTelegramUser, async (req, res) => {
     if (Number(channel.created_by_user_id)===uid) return res.status(400).json({ success: false, message: "Owner use DELETE" });
     if (channel.channel_type==="private") {
       const ok = await verifyPrivatePin({ channel, pin });
-      if (!ok) return res.status(403).json({ success: false, message: "Wrong PIN" });
+      if (!ok) return res.status(403).json({ success: false, message: "Wrong Original PIN" });
     }
     await db.query(`UPDATE telegramlogin_channel_members SET member_status='left', removed_from_dashboard_at=NOW() WHERE channel_id=$1 AND telegram_user_id=$2`, [channelId, uid]);
     return res.json({ success: true, message: "Removed" });
