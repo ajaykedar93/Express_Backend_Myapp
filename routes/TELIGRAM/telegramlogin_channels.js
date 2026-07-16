@@ -17,7 +17,7 @@ const allowedImageMimeTypes = ["image/jpeg","image/jpg","image/png","image/gif",
 
 const channelLogoUpload = multer({
   storage: imageStorage,
-  limits: { fileSize: CHANNEL_LOGO_LIMIT_MB * 1024 },
+  limits: { fileSize: CHANNEL_LOGO_LIMIT_MB * 1024 * 1024 },
   fileFilter: (req,file,cb)=>{
     const extOk=/jpeg|jpg|png|gif|webp/.test(path.extname(file.originalname||"").toLowerCase());
     const mimeOk=allowedImageMimeTypes.includes(file.mimetype);
@@ -25,16 +25,13 @@ const channelLogoUpload = multer({
     return cb(new Error("Only JPG, PNG, GIF, WEBP allowed"));
   },
 });
-
 const noteAttachmentUpload = multer({ storage: multer.memoryStorage(), limits:{ fileSize: NOTE_FILE_LIMIT_MB*1024*1024 } });
-
 const uploadChannelLogo=(req,res,next)=> channelLogoUpload.single("channel_logo")(req,res,(e)=>{ if(e) return res.status(400).json({success:false,message:e.message}); next(); });
 const uploadNoteAttachment=(req,res,next)=> noteAttachmentUpload.single("attachment")(req,res,(e)=>{ if(e) return res.status(400).json({success:false,message:e.message}); next(); });
 
 const cleanText=(v)=> String(v||"").trim();
-const cleanEmail=(v)=> String(v||"").trim().toLowerCase();
 const toInt=(v)=>{ const n=Number(v); return Number.isInteger(n)&&n>0?n:0; };
-const getClientDeviceId=(req)=> cleanText(req.body?.device_id||req.body?.deviceId||req.headers["x-device-id"]||"");
+const getClientDeviceId=(req)=> cleanText(req.body?.device_id||req.body?.deviceId||req.query?.device_id||req.headers["x-device-id"]||"");
 const getFrontendOrigin=(req)=> cleanText(process.env.FRONTEND_URL||req.get("origin")||`${req.protocol}://${req.get("host")}`).replace(/\/$/,"");
 const buildShareLink=(req,code)=> `${getFrontendOrigin(req)}/channel/join/${code}`;
 const extractShareCode=(v)=>{ const t=cleanText(v); if(!t) return ""; try{ const u=new URL(t); const p=u.pathname.split("/").filter(Boolean); const j=p.indexOf("join"); if(j>=0&&p[j+1]) return p[j+1]; return p[p.length-1]||t; }catch{ const p=t.split("/").filter(Boolean); return p[p.length-1]||t; } };
@@ -100,19 +97,13 @@ const authenticateTelegramUser=async(req,res,next)=>{
 };
 
 const getChannelById=async(channelId)=>{
-  const r=await db.query(`SELECT c.*, (c.channel_logo_data IS NOT NULL) AS has_channel_logo, u.full_name AS owner_name, u.email AS owner_email
-    FROM telegramlogin_channellist c INNER JOIN telegram_users u ON u.telegram_user_id=c.created_by_user_id
-    WHERE c.channel_id=$1 AND c.is_active=TRUE AND c.is_deleted=FALSE LIMIT 1`,[channelId]);
+  const r=await db.query(`SELECT c.*, (c.channel_logo_data IS NOT NULL) AS has_channel_logo, u.full_name AS owner_name, u.email AS owner_email FROM telegramlogin_channellist c INNER JOIN telegram_users u ON u.telegram_user_id=c.created_by_user_id WHERE c.channel_id=$1 AND c.is_active=TRUE AND c.is_deleted=FALSE LIMIT 1`,[channelId]);
   return r.rows[0]||null;
 };
-
 const getChannelByShareCode=async(code)=>{
-  const r=await db.query(`SELECT c.*, (c.channel_logo_data IS NOT NULL) AS has_channel_logo, u.full_name AS owner_name, u.email AS owner_email
-    FROM telegramlogin_channellist c INNER JOIN telegram_users u ON u.telegram_user_id=c.created_by_user_id
-    WHERE c.share_code=$1 AND c.is_active=TRUE AND c.is_deleted=FALSE LIMIT 1`,[code]);
+  const r=await db.query(`SELECT c.*, (c.channel_logo_data IS NOT NULL) AS has_channel_logo, u.full_name AS owner_name, u.email AS owner_email FROM telegramlogin_channellist c INNER JOIN telegram_users u ON u.telegram_user_id=c.created_by_user_id WHERE c.share_code=$1 AND c.is_active=TRUE AND c.is_deleted=FALSE LIMIT 1`,[code]);
   return r.rows[0]||null;
 };
-
 const getMembership=async({channelId,userId})=>{
   const r=await db.query(`SELECT * FROM telegramlogin_channel_members WHERE channel_id=$1 AND telegram_user_id=$2 LIMIT 1`,[channelId,userId]);
   return r.rows[0]||null;
@@ -125,7 +116,6 @@ const requireActiveMembership=async(req,res,next)=>{
     const channel=await getChannelById(channelId); if(!channel) return res.status(404).json({success:false,message:"Channel not found"});
     const membership=await getMembership({channelId,userId});
     if(!membership || membership.member_status!=='active'){
-      // owner la pan allow - membership nasel tar owner check
       if(Number(channel.created_by_user_id)!==userId) return res.status(403).json({success:false,message:"No access to this channel"});
     }
     req.channel=channel; req.membership=membership||{member_role: Number(channel.created_by_user_id)===userId?'owner':'member', member_status:'active'};
@@ -155,24 +145,16 @@ const trustPrivateDevice=async({channelId,userId,deviceId})=>{
 const verifyPrivatePin=async({channel,pin})=>{
   if(channel.channel_type!=='private') return true; if(!isPinFormatValid(pin)) return false; if(!channel.security_pin_hash) return false; return bcrypt.compare(cleanText(pin),channel.security_pin_hash);
 };
-
 const upsertActiveMember=async({channelId,userId,role="member",deviceId="",joinedViaLink=false,shareCode="",invitationId=null,pinVerified=false})=>{
-  const r=await db.query(`INSERT INTO telegramlogin_channel_members (channel_id, telegram_user_id, member_role, member_status, joined_device_id, joined_via_link, share_code_used, invitation_id, pin_verified_at, last_opened_at, joined_at)
-    VALUES($1,$2,$3,'active',$4,$5,$6,$7,${pinVerified?"NOW()":"NULL"},NOW(),NOW())
-    ON CONFLICT(channel_id, telegram_user_id) DO UPDATE SET member_status='active', joined_device_id=COALESCE(EXCLUDED.joined_device_id, telegramlogin_channel_members.joined_device_id), joined_via_link=telegramlogin_channel_members.joined_via_link OR EXCLUDED.joined_via_link, share_code_used=COALESCE(EXCLUDED.share_code_used, telegramlogin_channel_members.share_code_used), pin_verified_at=CASE WHEN EXCLUDED.pin_verified_at IS NOT NULL THEN EXCLUDED.pin_verified_at ELSE telegramlogin_channel_members.pin_verified_at END, last_opened_at=NOW(), removed_from_dashboard_at=NULL RETURNING *`,
-    [channelId,userId,role,deviceId||null,joinedViaLink,shareCode||null,invitationId]);
+  const r=await db.query(`INSERT INTO telegramlogin_channel_members (channel_id, telegram_user_id, member_role, member_status, joined_device_id, joined_via_link, share_code_used, invitation_id, pin_verified_at, last_opened_at, joined_at) VALUES($1,$2,$3,'active',$4,$5,$6,$7,${pinVerified?"NOW()":"NULL"},NOW(),NOW()) ON CONFLICT(channel_id, telegram_user_id) DO UPDATE SET member_status='active', joined_device_id=COALESCE(EXCLUDED.joined_device_id, telegramlogin_channel_members.joined_device_id), joined_via_link=telegramlogin_channel_members.joined_via_link OR EXCLUDED.joined_via_link, share_code_used=COALESCE(EXCLUDED.share_code_used, telegramlogin_channel_members.share_code_used), pin_verified_at=CASE WHEN EXCLUDED.pin_verified_at IS NOT NULL THEN EXCLUDED.pin_verified_at ELSE telegramlogin_channel_members.pin_verified_at END, last_opened_at=NOW(), removed_from_dashboard_at=NULL RETURNING *`,[channelId,userId,role,deviceId||null,joinedViaLink,shareCode||null,invitationId]);
   return r.rows[0];
 };
-
 const getMyChannelsRows=async(userId)=>{
-  const r=await db.query(`SELECT c.*, (c.channel_logo_data IS NOT NULL) AS has_channel_logo, u.full_name AS owner_name, u.email AS owner_email, m.member_role, m.member_status
-    FROM telegramlogin_channellist c INNER JOIN telegramlogin_channel_members m ON m.channel_id=c.channel_id INNER JOIN telegram_users u ON u.telegram_user_id=c.created_by_user_id
-    WHERE m.telegram_user_id=$1 AND m.member_status='active' AND c.is_active=TRUE AND c.is_deleted=FALSE ORDER BY m.last_opened_at DESC, c.created_at DESC`,[userId]);
+  const r=await db.query(`SELECT c.*, (c.channel_logo_data IS NOT NULL) AS has_channel_logo, u.full_name AS owner_name, u.email AS owner_email, m.member_role, m.member_status FROM telegramlogin_channellist c INNER JOIN telegramlogin_channel_members m ON m.channel_id=c.channel_id INNER JOIN telegram_users u ON u.telegram_user_id=c.created_by_user_id WHERE m.telegram_user_id=$1 AND m.member_status='active' AND c.is_active=TRUE AND c.is_deleted=FALSE ORDER BY m.last_opened_at DESC, c.created_at DESC`,[userId]);
   return r.rows;
 };
 
 router.get("/health",(req,res)=> res.json({success:true,message:"Channels API running"}));
-
 router.get("/logo/:id",async(req,res)=>{
   try{
     const channelId=toInt(req.params.id); const r=await db.query(`SELECT channel_logo_data, channel_logo_mime FROM telegramlogin_channellist WHERE channel_id=$1 AND is_active=TRUE AND is_deleted=FALSE LIMIT 1`,[channelId]);
@@ -181,12 +163,10 @@ router.get("/logo/:id",async(req,res)=>{
     return res.send(r.rows[0].channel_logo_data);
   }catch(e){ return res.status(500).json({success:false,message:"Server error"}); }
 });
-
 router.get("/my-channels",authenticateTelegramUser,async(req,res)=>{
   try{ const rows=await getMyChannelsRows(getCurrentUserId(req)); return res.json({success:true,channels:rows.map(r=>normalizeChannel(r,req))}); }
   catch(e){ console.error(e); return res.status(500).json({success:false,message:"Server error"}); }
 });
-
 router.post("/create",authenticateTelegramUser,uploadChannelLogo,async(req,res)=>{
   try{
     const userId=getCurrentUserId(req); const channelName=cleanText(req.body.channel_name||req.body.name); const channelDescription=cleanText(req.body.channel_description||req.body.description);
@@ -195,22 +175,18 @@ router.post("/create",authenticateTelegramUser,uploadChannelLogo,async(req,res)=
     if(!["public","private"].includes(channelType)) return res.status(400).json({success:false,message:"Invalid type"});
     let pinHash=null; if(channelType==="private"){ if(!isPinFormatValid(pin)) return res.status(400).json({success:false,message:"PIN 4-8 digits required"}); pinHash=await bcrypt.hash(pin,12); }
     const shareCode=genShareCode();
-    const result=await db.query(`INSERT INTO telegramlogin_channellist (created_by_user_id, channel_name, channel_description, channel_type, channel_logo_data, channel_logo_mime, channel_logo_name, channel_logo_size, security_pin_hash, share_code, created_device_id)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *, (channel_logo_data IS NOT NULL) AS has_channel_logo`,[userId,channelName,channelDescription||null,channelType,req.file?req.file.buffer:null,req.file?req.file.mimetype:null,req.file?req.file.originalname:null,req.file?req.file.size:null,pinHash,shareCode,deviceId||null]);
+    const result=await db.query(`INSERT INTO telegramlogin_channellist (created_by_user_id, channel_name, channel_description, channel_type, channel_logo_data, channel_logo_mime, channel_logo_name, channel_logo_size, security_pin_hash, share_code, created_device_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *, (channel_logo_data IS NOT NULL) AS has_channel_logo`,[userId,channelName,channelDescription||null,channelType,req.file?req.file.buffer:null,req.file?req.file.mimetype:null,req.file?req.file.originalname:null,req.file?req.file.size:null,pinHash,shareCode,deviceId||null]);
     const channel=result.rows[0];
-    // FIX: owner membership insert - nahi tar old message disat nahi
     await upsertActiveMember({channelId:channel.channel_id,userId,role:"owner",deviceId,pinVerified:true});
     if(channelType==="private") await trustPrivateDevice({channelId:channel.channel_id,userId,deviceId});
     return res.status(201).json({success:true,channel:normalizeChannel({...channel,member_role:"owner",member_status:"active",is_owner:true},req)});
   }catch(e){ console.error(e); return res.status(500).json({success:false,message:"Server error"}); }
 });
-
 router.post("/join/:shareCode",authenticateTelegramUser,async(req,res)=>{
   try{
     const userId=getCurrentUserId(req); const shareCode=extractShareCode(req.params.shareCode||req.body.share_code); const deviceId=getClientDeviceId(req); const pin=cleanText(req.body.security_pin||req.body.pin||""); const trustDevice=String(req.body.trust_device).toLowerCase()==="true";
     if(!shareCode) return res.status(400).json({success:false,message:"Share code required"});
     const channel=await getChannelByShareCode(shareCode); if(!channel) return res.status(404).json({success:false,message:"Link expired"});
-    const existing=await getMembership({channelId:channel.channel_id,userId});
     let pinVerified=false;
     if(channel.channel_type==="private"){
       const trusted=await hasTrustedPrivateDevice({channelId:channel.channel_id,userId,deviceId});
@@ -220,7 +196,6 @@ router.post("/join/:shareCode",authenticateTelegramUser,async(req,res)=>{
     return res.json({success:true,message:"Joined",channel:normalizeChannel({...channel,...membership,has_channel_logo:channel.channel_logo_data!=null,is_owner:Number(channel.created_by_user_id)===userId},req)});
   }catch(e){ console.error(e); return res.status(500).json({success:false,message:"Server error"}); }
 });
-
 router.post("/:id/verify-pin",authenticateTelegramUser,requireActiveMembership,async(req,res)=>{
   try{
     const channel=req.channel; const userId=getCurrentUserId(req); const deviceId=getClientDeviceId(req); const pin=cleanText(req.body.security_pin||req.body.pin||""); const trustDevice=String(req.body.trust_device).toLowerCase()==="true";
@@ -232,49 +207,47 @@ router.post("/:id/verify-pin",authenticateTelegramUser,requireActiveMembership,a
     return res.json({success:true,verified:true});
   }catch(e){ return res.status(500).json({success:false,message:"Server error"}); }
 });
-
-// FIX: members - saglyanna disnar, owner name always
 router.get("/:id/members",authenticateTelegramUser,requireActiveMembership,async(req,res)=>{
   try{
     const channel=req.channel;
-    const r=await db.query(`SELECT m.channel_id, m.telegram_user_id, m.member_role, m.member_status, m.joined_at, u.full_name, u.email, u.mobile_no
-      FROM telegramlogin_channel_members m INNER JOIN telegram_users u ON u.telegram_user_id=m.telegram_user_id
-      WHERE m.channel_id=$1 AND m.member_status='active' ORDER BY CASE WHEN m.member_role='owner' THEN 0 ELSE 1 END, m.joined_at ASC`,[channel.channel_id]);
+    const r=await db.query(`SELECT m.channel_id, m.telegram_user_id, m.member_role, m.member_status, m.joined_at, u.full_name, u.email, u.mobile_no FROM telegramlogin_channel_members m INNER JOIN telegram_users u ON u.telegram_user_id=m.telegram_user_id WHERE m.channel_id=$1 AND m.member_status='active' ORDER BY CASE WHEN m.member_role='owner' THEN 0 ELSE 1 END, m.joined_at ASC`,[channel.channel_id]);
     return res.json({success:true,members:r.rows, owner_name: channel.owner_name, owner_id: channel.created_by_user_id});
   }catch(e){ console.error(e); return res.status(500).json({success:false,message:"Server error"}); }
 });
-
-// FIX: notes - no limit, no hide, ASC
 router.get("/:id/notes",authenticateTelegramUser,requireActiveMembership,async(req,res)=>{
   try{
-    const r=await db.query(`SELECT n.note_id, n.channel_id, n.created_by_user_id, n.note_type, n.note_text, (n.attachment_data IS NOT NULL) AS has_attachment, n.attachment_mime, n.attachment_name, n.attachment_size, n.attachment_category, n.created_at, u.full_name AS created_by_name
-      FROM telegramlogin_notes n JOIN telegram_users u ON u.telegram_user_id=n.created_by_user_id
-      WHERE n.channel_id=$1 AND n.is_deleted=FALSE ORDER BY n.created_at ASC`,[req.channel.channel_id]);
+    const r=await db.query(`SELECT n.note_id, n.channel_id, n.created_by_user_id, n.note_type, n.note_text, (n.attachment_data IS NOT NULL) AS has_attachment, n.attachment_mime, n.attachment_name, n.attachment_size, n.attachment_category, n.created_at, u.full_name AS created_by_name FROM telegramlogin_notes n JOIN telegram_users u ON u.telegram_user_id=n.created_by_user_id WHERE n.channel_id=$1 AND n.is_deleted=FALSE ORDER BY n.created_at ASC`,[req.channel.channel_id]);
     return res.json({success:true,notes:r.rows.map(normalizeNote)});
   }catch(e){ return res.status(500).json({success:false,message:"Server error"}); }
 });
-
 router.post("/:id/notes",authenticateTelegramUser,requireActiveMembership,uploadNoteAttachment,async(req,res)=>{
   try{
     const channel=req.channel; const userId=getCurrentUserId(req); const noteText=cleanText(req.body.note_text||req.body.text||""); const deviceId=getClientDeviceId(req); const file=req.file||null;
     if(!noteText &&!file) return res.status(400).json({success:false,message:"Write note or file"});
     const cat=file? getAttachmentCategory(file.mimetype,file.originalname):null; const type=file? (cat==="image"?"image":"file"):"text";
-    const result=await db.query(`INSERT INTO telegramlogin_notes (channel_id, created_by_user_id, note_type, note_text, attachment_data, attachment_mime, attachment_name, attachment_size, attachment_category, created_device_id)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING note_id, channel_id, created_by_user_id, note_type, note_text, (attachment_data IS NOT NULL) AS has_attachment, attachment_mime, attachment_name, attachment_size, attachment_category, created_at, updated_at`,
-      [channel.channel_id,userId,type,noteText||null,file?file.buffer:null,file?file.mimetype:null,file?file.originalname:null,file?file.size:null,cat,deviceId||null]);
+    const result=await db.query(`INSERT INTO telegramlogin_notes (channel_id, created_by_user_id, note_type, note_text, attachment_data, attachment_mime, attachment_name, attachment_size, attachment_category, created_device_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING note_id, channel_id, created_by_user_id, note_type, note_text, (attachment_data IS NOT NULL) AS has_attachment, attachment_mime, attachment_name, attachment_size, attachment_category, created_at, updated_at`,[channel.channel_id,userId,type,noteText||null,file?file.buffer:null,file?file.mimetype:null,file?file.originalname:null,file?file.size:null,cat,deviceId||null]);
     return res.status(201).json({success:true,note:normalizeNote({...result.rows[0],created_by_name:req.telegramUser.full_name})});
   }catch(e){ console.error(e); return res.status(500).json({success:false,message:"Server error"}); }
 });
 
-// DIRECT IMAGE - no fail
+// FIXED IMAGE DIRECT - OWNER BYPASS
 router.get("/notes/:noteId/attachment",authenticateTelegramUser,async(req,res)=>{
   try{
     const noteId=toInt(req.params.noteId); const userId=getCurrentUserId(req);
-    const r=await db.query(`SELECT n.attachment_data, n.attachment_mime, n.attachment_name FROM telegramlogin_notes n JOIN telegramlogin_channel_members m ON m.channel_id=n.channel_id AND m.telegram_user_id=$2 AND m.member_status='active' WHERE n.note_id=$1 AND n.is_deleted=FALSE AND n.attachment_data IS NOT NULL LIMIT 1`,[noteId,userId]);
+    const r=await db.query(`SELECT n.note_id, n.channel_id, n.attachment_data, n.attachment_mime, n.attachment_name, c.created_by_user_id as owner_id FROM telegramlogin_notes n JOIN telegramlogin_channellist c ON c.channel_id=n.channel_id WHERE n.note_id=$1 AND n.is_deleted=FALSE AND n.attachment_data IS NOT NULL LIMIT 1`,[noteId]);
     if(r.rows.length===0) return res.status(404).json({success:false,message:"Attachment not found"});
-    res.setHeader("Content-Type", r.rows[0].attachment_mime||"application/octet-stream"); res.setHeader("Content-Disposition",`inline; filename="${encodeURIComponent(r.rows[0].attachment_name||"file")}"`); res.setHeader("Cache-Control","private, max-age=86400"); res.setHeader("Access-Control-Allow-Origin","*");
-    return res.send(r.rows[0].attachment_data);
-  }catch(e){ return res.status(500).json({success:false,message:"Server error"}); }
+    const row=r.rows[0];
+    const isOwner=String(row.owner_id)===String(userId);
+    if(!isOwner){
+      const mem=await db.query(`SELECT member_status FROM telegramlogin_channel_members WHERE channel_id=$1 AND telegram_user_id=$2 LIMIT 1`,[row.channel_id, userId]);
+      if(!mem.rows[0] || mem.rows[0].member_status!=='active') return res.status(403).json({success:false,message:"No access"});
+    }
+    res.setHeader("Content-Type", row.attachment_mime||"image/jpeg");
+    res.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(row.attachment_name||"file")}"`);
+    res.setHeader("Cache-Control", "private, max-age=86400");
+    res.setHeader("Access-Control-Allow-Origin","*");
+    return res.send(row.attachment_data);
+  }catch(e){ console.error(e); return res.status(500).json({success:false,message:"Server error"}); }
 });
 
 router.get("/:id",authenticateTelegramUser,requireActiveMembership,async(req,res)=>{
@@ -283,10 +256,9 @@ router.get("/:id",authenticateTelegramUser,requireActiveMembership,async(req,res
     return res.json({success:true,channel:normalizeChannel(row,req)});
   }catch(e){ return res.status(500).json({success:false,message:"Server error"}); }
 });
-
 router.delete("/:id",authenticateTelegramUser,async(req,res)=>{
   try{
-    const channelId=toInt(req.params.id); const userId=getCurrentUserId(req); const deviceId=getClientDeviceId(req); const pin=cleanText(req.body.security_pin||"");
+    const channelId=toInt(req.params.id); const userId=getCurrentUserId(req); const pin=cleanText(req.body?.security_pin||"");
     const channel=await getChannelById(channelId); if(!channel) return res.status(404).json({success:false,message:"Not found"});
     const membership=await getMembership({channelId,userId}); if(!membership) return res.status(403).json({success:false,message:"No access"});
     const isOwner=Number(channel.created_by_user_id)===userId;
