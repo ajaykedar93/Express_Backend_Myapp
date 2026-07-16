@@ -7,6 +7,7 @@ const router = express.Router();
 
 const JWT_SECRET = process.env.JWT_SECRET || "change_this_telegram_login_secret";
 
+/* MULTER - 25MB */
 const storage = multer.memoryStorage();
 const upload = multer({ storage, limits: { fileSize: 25 * 1024 * 1024 } });
 const uploadNoteAttachment = (req, res, next) => {
@@ -14,22 +15,26 @@ const uploadNoteAttachment = (req, res, next) => {
   (req, res, (err) => { if(err) return res.status(400).json({success:false,message:err.message}); next(); });
 };
 
-const cleanText = (v) => String(v || "").trim();
+const cleanText = (v) => String(v || "").trim(); // HTML color <span> keep
 const isValidId = (v) => { const id=Number(v); return Number.isInteger(id) && id>0; };
 const getDeviceId = (req) => cleanText(req.body.device_id || req.query.device_id || req.headers["x-device-id"] || req.headers["device-id"]);
 const getUploadedFile = (req) => req.files?.attachment?.[0] || req.files?.image?.[0] || req.files?.file?.[0] || null;
+
 const getAttachmentCategory = (file) => {
   if(!file) return null; const mime=String(file.mimetype||"").toLowerCase(); const ext=path.extname(file.originalname||"").toLowerCase();
   if(mime.startsWith("image/")) return "image"; if(mime==="application/pdf"||ext===".pdf") return "pdf";
   if(mime.includes("spreadsheet")||mime.includes("excel")||[".xls",".xlsx",".csv"].includes(ext)) return "excel";
-  if(mime.includes("word")||ext===".doc"||ext===".docx") return "word"; if(mime.startsWith("text/")||ext===".txt") return "txt"; return "other";
+  if(mime.includes("word")||ext===".doc"||ext===".docx") return "word";
+  if(mime.startsWith("text/")||ext===".txt") return "txt"; return "other";
 };
 const getNoteType = (file) =>!file? "text" : getAttachmentCategory(file)==="image"? "image" : "file";
+
 const normalizeNote = (note) => {
   if(!note) return null;
   return {
     note_id: note.note_id, channel_id: note.channel_id, created_by_user_id: note.created_by_user_id,
-    created_by_name: note.created_by_name||"", note_type: note.note_type, note_text: note.note_text||"",
+    created_by_name: note.created_by_name||"", note_type: note.note_type,
+    note_text: note.note_text||"", // HTML with <span style=color> save as is - color fix
     attachment_available: Boolean(note.has_attachment), attachment_category: note.attachment_category||"",
     attachment_mime: note.attachment_mime||"", attachment_name: note.attachment_name||"", attachment_size: note.attachment_size||null,
     attachment_url: note.has_attachment? `/api/telegramlogin-notes/attachment/${note.note_id}` : "",
@@ -50,6 +55,7 @@ const authenticateTelegramUser = async (req,res,next)=>{
   }catch(e){ return res.status(401).json({success:false,message:"Invalid token"}); }
 };
 
+/* ✅ PIN LOGIC - OWNER BYPASS + EKDA VERIFY */
 const checkChannelAccess = async ({channelId,userId,deviceId})=>{
   const result=await db.query(`
     SELECT c.channel_id, c.channel_name, c.channel_type, c.created_by_user_id, c.security_pin_hash, c.is_active, c.is_deleted,
@@ -59,15 +65,18 @@ const checkChannelAccess = async ({channelId,userId,deviceId})=>{
     WHERE c.channel_id=$1 AND c.is_deleted=FALSE AND c.is_active=TRUE LIMIT 1`,[channelId,userId]);
   if(result.rows.length===0) return {ok:false,status:404,message:"Channel not found"};
   const ch=result.rows[0];
+
   if(ch.channel_type==="public"){
     if(ch.member_status==="blocked") return {ok:false,status:403,message:"You are blocked"};
     await db.query(`INSERT INTO telegramlogin_channel_members(channel_id,telegram_user_id,member_role,member_status,joined_device_id,last_opened_at)
       VALUES($1,$2,'member','active',$3,NOW()) ON CONFLICT(channel_id,telegram_user_id) DO UPDATE SET last_opened_at=NOW(), updated_at=NOW()`,[channelId,userId,deviceId||null]);
     return {ok:true,channel:ch};
   }
-  // PRIVATE - FAKT EKDA PIN
+
+  // PRIVATE
   if(!ch.member_status || ch.member_status!=="active") return {ok:false,status:403,message:"You are not added to this private channel"};
-  if(ch.security_pin_hash &&!ch.pin_verified_at){
+  const isOwner = String(ch.created_by_user_id)===String(userId);
+  if(!isOwner && ch.security_pin_hash &&!ch.pin_verified_at){
     return {ok:false,status:403,pin_required:true,message:"Please verify channel PIN before opening notes/chat"};
   }
   await db.query(`UPDATE telegramlogin_channel_members SET last_opened_at=NOW(), updated_at=NOW() WHERE channel_id=$1 AND telegram_user_id=$2`,[channelId,userId]);
@@ -87,22 +96,25 @@ const canEditOrDeleteNote = async ({noteId,userId})=>{
 
 router.get("/health",(req,res)=> res.json({success:true,message:"Telegram login notes API is running"}));
 
+/* ADD NOTE - text + image/file - color HTML save */
 router.post("/:channelId/add", authenticateTelegramUser, uploadNoteAttachment, async(req,res)=>{
   try{
-    const channelId=Number(req.params.channelId); const noteText=cleanText(req.body.note_text||req.body.text); const deviceId=getDeviceId(req); const file=getUploadedFile(req);
+    const channelId=Number(req.params.channelId);
+    const noteText=req.body.note_text || req.body.text || ""; // HTML keep - don't clean to remove tags
+    const deviceId=getDeviceId(req); const file=getUploadedFile(req);
     if(!isValidId(channelId)) return res.status(400).json({success:false,message:"Invalid channel id"});
-    if(!noteText &&!file) return res.status(400).json({success:false,message:"Add note text or file"});
+    if(!String(noteText).trim() &&!file) return res.status(400).json({success:false,message:"Add note text or file"});
     const access=await checkChannelAccess({channelId,userId:req.telegramUserId,deviceId});
     if(!access.ok) return res.status(access.status).json({success:false,pin_required:access.pin_required||false,message:access.message});
     const result=await db.query(`INSERT INTO telegramlogin_notes(channel_id,created_by_user_id,note_type,note_text,attachment_data,attachment_mime,attachment_name,attachment_size,attachment_category,created_device_id)
       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING note_id,channel_id,created_by_user_id,note_type,note_text,attachment_data IS NOT NULL AS has_attachment,attachment_mime,attachment_name,attachment_size,attachment_category,created_device_id,is_deleted,deleted_at,deleted_by_user_id,created_at,updated_at`,
-      [channelId,req.telegramUserId,getNoteType(file),noteText||null,file?file.buffer:null,file?file.mimetype:null,file?file.originalname:null,file?file.size:null,getAttachmentCategory(file),deviceId||null]);
+      [channelId,req.telegramUserId,getNoteType(file),String(noteText).trim()||null,file?file.buffer:null,file?file.mimetype:null,file?file.originalname:null,file?file.size:null,getAttachmentCategory(file),deviceId||null]);
     const note={...result.rows[0],created_by_name:req.telegramUser.full_name};
     return res.status(201).json({success:true,message:"Note added",note:normalizeNote(note)});
   }catch(e){ console.error("Add note error:",e); return res.status(500).json({success:false,message:"Server error"}); }
 });
 
-// ✅ FIX 1 - CHAT HIDE HONAR NAHI - LATEST 500 DESC THEN ASC
+/* ✅ FIX - REFRESH LA DELETE NAHI - LATEST 500 */
 router.get("/:channelId/all", authenticateTelegramUser, async(req,res)=>{
   try{
     const channelId=Number(req.params.channelId); const deviceId=getDeviceId(req);
@@ -111,7 +123,6 @@ router.get("/:channelId/all", authenticateTelegramUser, async(req,res)=>{
     const access=await checkChannelAccess({channelId,userId:req.telegramUserId,deviceId});
     if(!access.ok) return res.status(access.status).json({success:false,pin_required:access.pin_required||false,message:access.message});
     const countResult=await db.query(`SELECT COUNT(*)::INTEGER AS total FROM telegramlogin_notes WHERE channel_id=$1 AND is_deleted=FALSE`,[channelId]);
-    // LATEST notes gheun ASC madhe return - mhanun hide honar nahi
     const result=await db.query(`
       SELECT * FROM (
         SELECT n.note_id,n.channel_id,n.created_by_user_id,u.full_name AS created_by_name,n.note_type,n.note_text,
@@ -139,7 +150,7 @@ router.get("/single/:noteId", authenticateTelegramUser, async(req,res)=>{
   }catch(e){ return res.status(500).json({success:false,message:"Server error"}); }
 });
 
-// ✅ FIX 2 - IMAGE LOAD + DOWNLOAD - PIN check nanter buffer send
+/* ✅ FIX - IMAGE LOAD FAIL - BLOB SEND + CORS + CACHE */
 router.get("/attachment/:noteId", authenticateTelegramUser, async(req,res)=>{
   try{
     const noteId=Number(req.params.noteId); const deviceId=getDeviceId(req);
@@ -153,20 +164,21 @@ router.get("/attachment/:noteId", authenticateTelegramUser, async(req,res)=>{
     res.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(note.attachment_name||"file")}"`);
     res.setHeader("Cache-Control", "private, max-age=86400");
     res.setHeader("Access-Control-Allow-Origin","*");
-    return res.send(note.attachment_data);
+    res.setHeader("Access-Control-Allow-Headers","Authorization, x-device-id");
+    return res.end(note.attachment_data);
   }catch(e){ console.error("Attachment error:",e); return res.status(500).json({success:false,message:"Server error"}); }
 });
 
 router.put("/:noteId", authenticateTelegramUser, uploadNoteAttachment, async(req,res)=>{
   try{
-    const noteId=Number(req.params.noteId); const noteText=cleanText(req.body.note_text||req.body.text);
+    const noteId=Number(req.params.noteId); const noteText=req.body.note_text || req.body.text || "";
     const hasNoteText=Object.prototype.hasOwnProperty.call(req.body,"note_text")||Object.prototype.hasOwnProperty.call(req.body,"text");
     const removeAttachment=String(req.body.remove_attachment||"").toLowerCase()==="true"; const file=getUploadedFile(req); const deviceId=getDeviceId(req);
     if(!isValidId(noteId)) return res.status(400).json({success:false,message:"Invalid note id"});
     const permission=await canEditOrDeleteNote({noteId,userId:req.telegramUserId}); if(!permission.ok) return res.status(permission.status).json({success:false,message:permission.message});
     const access=await checkChannelAccess({channelId:permission.note.channel_id,userId:req.telegramUserId,deviceId}); if(!access.ok) return res.status(access.status).json({success:false,pin_required:access.pin_required||false,message:access.message});
     const setClauses=[]; const values=[];
-    if(hasNoteText){ values.push(noteText||null); setClauses.push(`note_text = $${values.length}`); }
+    if(hasNoteText){ values.push(String(noteText).trim()||null); setClauses.push(`note_text = $${values.length}`); }
     if(file){
       values.push(getNoteType(file)); setClauses.push(`note_type = $${values.length}`);
       values.push(file.buffer); setClauses.push(`attachment_data = $${values.length}`);
@@ -178,10 +190,10 @@ router.put("/:noteId", authenticateTelegramUser, uploadNoteAttachment, async(req
     if(removeAttachment &&!file){ setClauses.push(`attachment_data=NULL, attachment_mime=NULL, attachment_name=NULL, attachment_size=NULL, attachment_category=NULL, note_type='text'`); }
     if(setClauses.length===0) return res.status(400).json({success:false,message:"No data for update"});
     values.push(noteId);
-    const result=await db.query(`UPDATE telegramlogin_notes SET ${setClauses.join(", ")} WHERE note_id=$${values.length} RETURNING note_id,channel_id,created_by_user_id,note_type,note_text,attachment_data IS NOT NULL AS has_attachment,attachment_mime,attachment_name,attachment_size,attachment_category,created_device_id,is_deleted,deleted_at,deleted_by_user_id,created_at,updated_at`,values);
+    const result=await db.query(`UPDATE telegramlogin_notes SET ${setClauses.join(", ")}, updated_at=NOW() WHERE note_id=$${values.length} RETURNING note_id,channel_id,created_by_user_id,note_type,note_text,attachment_data IS NOT NULL AS has_attachment,attachment_mime,attachment_name,attachment_size,attachment_category,created_device_id,is_deleted,deleted_at,deleted_by_user_id,created_at,updated_at`,values);
     const updated={...result.rows[0],created_by_name:req.telegramUser.full_name};
     return res.json({success:true,note:normalizeNote(updated)});
-  }catch(e){ return res.status(500).json({success:false,message:"Server error"}); }
+  }catch(e){ console.error("Update error:",e); return res.status(500).json({success:false,message:"Server error"}); }
 });
 
 router.delete("/:noteId", authenticateTelegramUser, async(req,res)=>{
