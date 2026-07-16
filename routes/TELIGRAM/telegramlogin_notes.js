@@ -8,7 +8,7 @@ const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || "change_this_telegram_login_secret";
 
 const storage = multer.memoryStorage();
-const upload = multer({ storage, limits: { fileSize: 25 * 1024 * 1024 } });
+const upload = multer({ storage, limits: { fileSize: 25 * 1024 } });
 const uploadNoteAttachment = (req,res,next)=>{
   upload.fields([{name:"attachment",maxCount:1},{name:"image",maxCount:1},{name:"file",maxCount:1}])(req,res,(err)=>{
     if(err) return res.status(400).json({success:false,message:err.message});
@@ -18,7 +18,7 @@ const uploadNoteAttachment = (req,res,next)=>{
 
 const cleanText = (v)=> String(v||"").trim();
 const isValidId = (v)=> { const id=Number(v); return Number.isInteger(id) && id>0; };
-const getDeviceId = (req)=> cleanText(req.body.device_id||req.query.device_id||req.headers["x-device-id"]||req.headers["device-id"]);
+const getDeviceId = (req)=> cleanText(req.body?.device_id||req.query?.device_id||req.headers["x-device-id"]||req.headers["device-id"]||"");
 const getUploadedFile = (req)=> req.files?.attachment?.[0]||req.files?.image?.[0]||req.files?.file?.[0]||null;
 const getAttachmentCategory = (file)=>{
   if(!file) return null; const mime=String(file.mimetype||"").toLowerCase(); const ext=path.extname(file.originalname||"").toLowerCase();
@@ -44,7 +44,7 @@ const authenticateTelegramUser = async(req,res,next)=>{
   try{
     const auth=req.headers.authorization||""; const token=auth.startsWith("Bearer ")? auth.slice(7):"";
     if(!token) return res.status(401).json({success:false,message:"Authorization token required"});
-    const decoded=jwt.verify(token,JWT_SECRET); const telegramUserId=Number(decoded.telegram_user_id||decoded.id);
+    const decoded=jwt.verify(token,JWT_SECRET); const telegramUserId=Number(decoded.telegram_user_id||decoded.id||decoded.telegramUserId);
     if(!isValidId(telegramUserId)) return res.status(401).json({success:false,message:"Invalid token"});
     const r=await db.query(`SELECT telegram_user_id, full_name FROM telegram_users WHERE telegram_user_id=$1 AND is_active=TRUE LIMIT 1`,[telegramUserId]);
     if(r.rows.length===0) return res.status(401).json({success:false,message:"User not found"});
@@ -52,7 +52,6 @@ const authenticateTelegramUser = async(req,res,next)=>{
   }catch(e){ return res.status(401).json({success:false,message:"Invalid token"}); }
 };
 
-// FIX: owner la PIN bypass, public auto join
 const checkChannelAccess = async({channelId,userId,deviceId})=>{
   const r=await db.query(`SELECT c.channel_id,c.channel_type,c.created_by_user_id,c.security_pin_hash,c.is_active,c.is_deleted,m.member_status,m.pin_verified_at
     FROM telegramlogin_channellist c LEFT JOIN telegramlogin_channel_members m ON m.channel_id=c.channel_id AND m.telegram_user_id=$2
@@ -66,8 +65,8 @@ const checkChannelAccess = async({channelId,userId,deviceId})=>{
     return {ok:true,channel:ch};
   }
   if(!ch.member_status || ch.member_status!=="active"){
-    if(isOwner) {
-      await db.query(`INSERT INTO telegramlogin_channel_members(channel_id,telegram_user_id,member_role,member_status,pin_verified_at) VALUES($1,$2,'owner','active',NOW()) ON CONFLICT(channel_id,telegram_user_id) DO UPDATE SET member_status='active', pin_verified_at=NOW()`,[channelId,userId]);
+    if(isOwner){
+      await db.query(`INSERT INTO telegramlogin_channel_members(channel_id,telegram_user_id,member_role,member_status,pin_verified_at,last_opened_at) VALUES($1,$2,'owner','active',NOW(),NOW()) ON CONFLICT(channel_id,telegram_user_id) DO UPDATE SET member_status='active', pin_verified_at=NOW(), last_opened_at=NOW(), updated_at=NOW()`,[channelId,userId]);
       return {ok:true,channel:ch};
     }
     return {ok:false,status:403,message:"You are not added to this private channel"};
@@ -81,11 +80,10 @@ const canEditOrDeleteNote = async({noteId,userId})=>{
   const r=await db.query(`SELECT n.note_id,n.channel_id,n.created_by_user_id,c.created_by_user_id AS channel_owner_id,m.member_role
     FROM telegramlogin_notes n JOIN telegramlogin_channellist c ON c.channel_id=n.channel_id
     LEFT JOIN telegramlogin_channel_members m ON m.channel_id=n.channel_id AND m.telegram_user_id=$2 AND m.member_status='active'
-    WHERE n.note_id=$1 AND n.is_deleted=FALSE AND c.is_deleted=FALSE LIMIT 1`,[noteId,userId]);
+    WHERE n.note_id=$1 AND n.is_deleted=FALSE LIMIT 1`,[noteId,userId]);
   if(r.rows.length===0) return {ok:false,status:404,message:"Note not found"};
   const note=r.rows[0];
-  const isCreator=String(note.created_by_user_id)===String(userId); const isOwner=String(note.channel_owner_id)===String(userId);
-  if(!isCreator &&!isOwner && note.member_role!=="admin") return {ok:false,status:403,message:"No permission"};
+  if(String(note.created_by_user_id)!==String(userId) && String(note.channel_owner_id)!==String(userId) && note.member_role!=="admin") return {ok:false,status:403,message:"No permission"};
   return {ok:true,note};
 };
 
@@ -101,27 +99,22 @@ router.post("/:channelId/add", authenticateTelegramUser, uploadNoteAttachment, a
     const result=await db.query(`INSERT INTO telegramlogin_notes(channel_id,created_by_user_id,note_type,note_text,attachment_data,attachment_mime,attachment_name,attachment_size,attachment_category,created_device_id)
       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING note_id,channel_id,created_by_user_id,note_type,note_text,attachment_data IS NOT NULL AS has_attachment,attachment_mime,attachment_name,attachment_size,attachment_category,created_device_id,created_at,updated_at`,
       [channelId,req.telegramUserId,getNoteType(file),noteText||null,file?file.buffer:null,file?file.mimetype:null,file?file.originalname:null,file?file.size:null,getAttachmentCategory(file),deviceId||null]);
-    const note={...result.rows[0],created_by_name:req.telegramUser.full_name};
-    return res.status(201).json({success:true,note:normalizeNote(note)});
-  }catch(e){ console.error("Add error",e); return res.status(500).json({success:false,message:"Server error"}); }
+    return res.status(201).json({success:true,note:normalizeNote({...result.rows[0],created_by_name:req.telegramUser.full_name})});
+  }catch(e){ console.error(e); return res.status(500).json({success:false,message:"Server error"}); }
 });
 
-// NO LIMIT - old message hide nahi
 router.get("/:channelId/all", authenticateTelegramUser, async(req,res)=>{
   try{
     const channelId=Number(req.params.channelId); const deviceId=getDeviceId(req);
     if(!isValidId(channelId)) return res.status(400).json({success:false,message:"Invalid id"});
     const access=await checkChannelAccess({channelId,userId:req.telegramUserId,deviceId});
     if(!access.ok) return res.status(access.status).json({success:false,pin_required:access.pin_required||false,message:access.message});
-    const result=await db.query(`
-      SELECT n.note_id,n.channel_id,n.created_by_user_id,u.full_name AS created_by_name,n.note_type,n.note_text,
-             n.attachment_data IS NOT NULL AS has_attachment,n.attachment_mime,n.attachment_name,n.attachment_size,n.attachment_category,
-             n.created_device_id,n.created_at,n.updated_at
+    const result=await db.query(`SELECT n.note_id,n.channel_id,n.created_by_user_id,u.full_name AS created_by_name,n.note_type,n.note_text,
+      n.attachment_data IS NOT NULL AS has_attachment,n.attachment_mime,n.attachment_name,n.attachment_size,n.attachment_category,n.created_device_id,n.created_at,n.updated_at
       FROM telegramlogin_notes n JOIN telegram_users u ON u.telegram_user_id=n.created_by_user_id
-      WHERE n.channel_id=$1 AND n.is_deleted=FALSE
-      ORDER BY n.created_at ASC`,[channelId]);
+      WHERE n.channel_id=$1 AND n.is_deleted=FALSE ORDER BY n.created_at ASC`,[channelId]);
     return res.json({success:true,total:result.rows.length,notes:result.rows.map(normalizeNote)});
-  }catch(e){ console.error("All error",e); return res.status(500).json({success:false,message:"Server error"}); }
+  }catch(e){ console.error(e); return res.status(500).json({success:false,message:"Server error"}); }
 });
 
 router.get("/single/:noteId", authenticateTelegramUser, async(req,res)=>{
@@ -136,7 +129,6 @@ router.get("/single/:noteId", authenticateTelegramUser, async(req,res)=>{
   }catch(e){ return res.status(500).json({success:false,message:"Server error"}); }
 });
 
-// DIRECT IMAGE - NO SERVER ERROR
 router.get("/attachment/:noteId", authenticateTelegramUser, async(req,res)=>{
   try{
     const noteId=Number(req.params.noteId); const deviceId=getDeviceId(req);
@@ -147,13 +139,14 @@ router.get("/attachment/:noteId", authenticateTelegramUser, async(req,res)=>{
     const access=await checkChannelAccess({channelId:note.channel_id,userId:req.telegramUserId,deviceId});
     if(!access.ok) return res.status(access.status).json({success:false,pin_required:access.pin_required||false,message:access.message});
     if(!note.attachment_data) return res.status(404).json({success:false,message:"Empty file"});
-    res.setHeader("Content-Type", note.attachment_mime||"application/octet-stream");
-    res.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(note.attachment_name||"file")}"`);
+    res.setHeader("Content-Type", note.attachment_mime||"image/jpeg");
+    res.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(note.attachment_name||"image.jpg")}"`);
     res.setHeader("Cache-Control", "private, max-age=86400");
-    res.setHeader("Access-Control-Allow-Origin","*");
-    res.setHeader("Access-Control-Allow-Headers","Authorization, x-device-id, Content-Type");
-    return res.send(note.attachment_data);
-  }catch(e){ console.error("Attachment error",e); return res.status(500).json({success:false,message:"Server error"}); }
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Headers", "Authorization, x-device-id");
+    res.setHeader("Content-Length", Buffer.byteLength(note.attachment_data));
+    return res.end(note.attachment_data);
+  }catch(e){ console.error(e); return res.status(500).json({success:false,message:"Server error"}); }
 });
 
 router.put("/:noteId", authenticateTelegramUser, uploadNoteAttachment, async(req,res)=>{
@@ -175,9 +168,8 @@ router.put("/:noteId", authenticateTelegramUser, uploadNoteAttachment, async(req
     if(clauses.length===0) return res.status(400).json({success:false,message:"No data"});
     vals.push(noteId);
     const result=await db.query(`UPDATE telegramlogin_notes SET ${clauses.join(", ")}, updated_at=NOW() WHERE note_id=$${vals.length} RETURNING note_id,channel_id,created_by_user_id,note_type,note_text,attachment_data IS NOT NULL AS has_attachment,attachment_mime,attachment_name,attachment_size,attachment_category,created_device_id,created_at,updated_at`,vals);
-    const note={...result.rows[0],created_by_name:req.telegramUser.full_name};
-    return res.json({success:true,note:normalizeNote(note)});
-  }catch(e){ console.error("Update error",e); return res.status(500).json({success:false,message:"Server error"}); }
+    return res.json({success:true,note:normalizeNote({...result.rows[0],created_by_name:req.telegramUser.full_name})});
+  }catch(e){ console.error(e); return res.status(500).json({success:false,message:"Server error"}); }
 });
 
 router.delete("/:noteId", authenticateTelegramUser, async(req,res)=>{
