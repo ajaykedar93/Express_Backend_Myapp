@@ -19,16 +19,17 @@ const genShareCode = () => crypto.randomBytes(16).toString("hex");
 
 let patched = false;
 const ensureCols = async () => {
-  if(patched) return;
-  try{
+  if (patched) return;
+  try {
     await db.query(`ALTER TABLE telegramlogin_channellist ADD COLUMN IF NOT EXISTS share_code VARCHAR(64)`);
     await db.query(`ALTER TABLE telegramlogin_channellist ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE`);
     await db.query(`ALTER TABLE telegramlogin_channellist ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT FALSE`);
     await db.query(`ALTER TABLE telegramlogin_channel_invitations ADD COLUMN IF NOT EXISTS private_pin_plain VARCHAR(8)`);
     await db.query(`ALTER TABLE telegramlogin_channel_invitations ADD COLUMN IF NOT EXISTS share_code VARCHAR(64)`);
     await db.query(`ALTER TABLE telegramlogin_channel_members ADD COLUMN IF NOT EXISTS removed_by_owner BOOLEAN DEFAULT FALSE`);
+    await db.query(`ALTER TABLE telegramlogin_channel_members ADD COLUMN IF NOT EXISTS is_owner BOOLEAN DEFAULT FALSE`);
     patched = true;
-  }catch{}
+  } catch (e) { console.log("ensureCols error", e.message); }
 };
 ensureCols();
 
@@ -38,7 +39,7 @@ const authenticateTelegramUser = async (req, res, next) => {
     const token = h.startsWith("Bearer ")? h.slice(7) : "";
     if (!token) return res.status(401).json({ success: false, message: "Authorization token required" });
     const d = jwt.verify(token, JWT_SECRET);
-    const uid = Number(d.telegram_user_id);
+    const uid = Number(d.telegram_user_id || d.id);
     if (!uid) return res.status(401).json({ success: false, message: "Invalid token" });
     req.telegramUserId = uid; return next();
   } catch { return res.status(401).json({ success: false, message: "Invalid token" }); }
@@ -48,22 +49,6 @@ const getChannelById = async (id) => {
   const r = await db.query(`SELECT * FROM telegramlogin_channellist WHERE channel_id=$1 LIMIT 1`, [id]);
   return r.rows[0] || null;
 };
-
-const findChannelByAnyCode = async (code, uid) => {
-  const c = cleanText(code); if(!c) return null;
-  let r = await db.query(`SELECT * FROM telegramlogin_channellist WHERE LOWER(share_code)=LOWER($1) LIMIT 1`, [c]);
-  if(r.rows[0]) return r.rows[0];
-  let inv = await db.query(`SELECT channel_id FROM telegramlogin_channel_invitations WHERE LOWER(share_code)=LOWER($1) LIMIT 1`, [c]);
-  if(inv.rows[0]) { let ch = await getChannelById(inv.rows[0].channel_id); if(ch) return ch; }
-  if(uid){
-    let inv2 = await db.query(`SELECT channel_id FROM telegramlogin_channel_invitations WHERE LOWER(share_code)=LOWER($1) AND receiver_user_id=$2 LIMIT 1`, [c, uid]);
-    if(inv2.rows[0]) { let ch = await getChannelById(inv2.rows[0].channel_id); if(ch) return ch; }
-  }
-  const num = toInt(c); if(num){ let ch = await getChannelById(num); if(ch) return ch; }
-  r = await db.query(`SELECT * FROM telegramlogin_channellist WHERE share_code ILIKE $1 LIMIT 1`, [`%${c.slice(-8)}%`]);
-  return r.rows[0] || null;
-};
-
 const getMembership = async ({ channelId, userId }) => {
   const r = await db.query(`SELECT * FROM telegramlogin_channel_members WHERE channel_id=$1 AND telegram_user_id=$2 LIMIT 1`, [channelId, userId]);
   return r.rows[0] || null;
@@ -72,6 +57,51 @@ const verifyPrivatePin = async ({ channel, pin }) => {
   if (channel.channel_type!== "private") return true;
   if (!isPinFormatValid(pin) ||!channel.security_pin_hash) return false;
   return bcrypt.compare(String(pin), channel.security_pin_hash);
+};
+const findChannelByAnyCode = async (code, uid) => {
+  const c = cleanText(code); if (!c) return null;
+  let r = await db.query(`SELECT * FROM telegramlogin_channellist WHERE LOWER(share_code)=LOWER($1) LIMIT 1`, [c]);
+  if (r.rows[0]) return r.rows[0];
+  let inv = await db.query(`SELECT channel_id FROM telegramlogin_channel_invitations WHERE LOWER(share_code)=LOWER($1) LIMIT 1`, [c]);
+  if (inv.rows[0]) { let ch = await getChannelById(inv.rows[0].channel_id); if (ch) return ch; }
+  if (uid) {
+    let inv2 = await db.query(`SELECT channel_id FROM telegramlogin_channel_invitations WHERE LOWER(share_code)=LOWER($1) AND receiver_user_id=$2 LIMIT 1`, [c, uid]);
+    if (inv2.rows[0]) { let ch = await getChannelById(inv2.rows[0].channel_id); if (ch) return ch; }
+  }
+  const num = toInt(c); if (num) { let ch = await getChannelById(num); if (ch) return ch; }
+  r = await db.query(`SELECT * FROM telegramlogin_channellist WHERE share_code ILIKE $1 LIMIT 1`, [`%${c.slice(-8)}%`]);
+  return r.rows[0] || null;
+};
+
+// CORE REMOVE LOGIC - USED BY BOTH ROUTES
+const removeMemberCore = async ({ ownerId, channelId, memberId }) => {
+  if (!channelId ||!memberId) throw new Error("Invalid ids");
+  if (ownerId === memberId) throw new Error("Cannot remove yourself");
+
+  const channel = await getChannelById(channelId);
+  if (!channel) throw new Error("Channel not found");
+
+  const isOwnerByChannel = Number(channel.created_by_user_id) === Number(ownerId);
+  const ownerMem = await getMembership({ channelId, userId: ownerId });
+  const isOwnerRole = ownerMem?.member_role === 'owner' || ownerMem?.is_owner === true;
+
+  if (!isOwnerByChannel &&!isOwnerRole) throw new Error("Only owner can remove");
+
+  if (Number(channel.created_by_user_id) === Number(memberId)) throw new Error("Cannot remove owner");
+
+  // try update with removed_by_owner flag, fallback without flag if column missing
+  try {
+    await db.query(`UPDATE telegramlogin_channel_members SET member_status='left', removed_by_owner=true, updated_at=NOW() WHERE channel_id=$1 AND telegram_user_id=$2`, [channelId, memberId]);
+  } catch {
+    await db.query(`UPDATE telegramlogin_channel_members SET member_status='left', updated_at=NOW() WHERE channel_id=$1 AND telegram_user_id=$2`, [channelId, memberId]);
+  }
+
+  // invitation block
+  try {
+    await db.query(`UPDATE telegramlogin_channel_invitations SET invitation_status='removed' WHERE channel_id=$1 AND receiver_user_id=$2`, [channelId, memberId]);
+  } catch {}
+
+  return channel;
 };
 
 // SEND-LINK
@@ -85,7 +115,7 @@ router.post("/send-link", authenticateTelegramUser, async (req, res) => {
     if (!channelId) return res.status(400).json({ success: false, message: "Channel id required" });
     let channel = await getChannelById(channelId);
     if (!channel) return res.status(404).json({ success: false, message: "Channel not found" });
-    if(!channel.share_code){
+    if (!channel.share_code) {
       const newCode = genShareCode();
       await db.query(`UPDATE telegramlogin_channellist SET share_code=$1 WHERE channel_id=$2`, [newCode, channelId]);
       channel.share_code = newCode;
@@ -111,10 +141,10 @@ router.post("/send-link", authenticateTelegramUser, async (req, res) => {
     }
     await db.query("COMMIT");
     return res.status(201).json({ success: true, sent_count: created.length, share_link: shareLink, invitations: created });
-  } catch (e) { await db.query("ROLLBACK").catch(()=>{}); console.error(e); return res.status(500).json({ success: false, message: "Server error" }); }
+  } catch (e) { await db.query("ROLLBACK").catch(() => {}); console.error(e); return res.status(500).json({ success: false, message: "Server error" }); }
 });
 
-// ✅ FIX: OWNER REMOVE MEMBER - MAIN ROUTE
+// ✅ MAIN FIX: OWNER REMOVE ANY USER IMMEDIATELY
 router.delete("/:id/members/:memberId", authenticateTelegramUser, async (req, res) => {
   try {
     await ensureCols();
@@ -123,41 +153,32 @@ router.delete("/:id/members/:memberId", authenticateTelegramUser, async (req, re
     const memberId = toInt(req.params.memberId);
     const deviceId = getClientDeviceId(req);
 
-    if(!channelId ||!memberId) return res.status(400).json({success:false,message:"Invalid ids"});
-    if(ownerId===memberId) return res.status(400).json({success:false,message:"Cannot remove yourself"});
-
-    const channel = await getChannelById(channelId);
-    if(!channel) return res.status(404).json({success:false,message:"Channel not found"});
-
-    // owner check
-    const isOwner = Number(channel.created_by_user_id)===ownerId;
-    const ownerMem = await getMembership({channelId, userId: ownerId});
-    if(!isOwner && ownerMem?.member_role!=='owner' &&!ownerMem?.is_owner){
-      return res.status(403).json({success:false,message:"Only owner can remove"});
-    }
-
-    const targetMem = await getMembership({channelId, userId: memberId});
-    if(!targetMem) return res.status(404).json({success:false,message:"Member not found"});
-
-    // prevent owner removal
-    if(Number(channel.created_by_user_id)===memberId) return res.status(403).json({success:false,message:"Cannot remove owner"});
-
-    // immediate remove - set left + removed_by_owner
-    await db.query(`UPDATE telegramlogin_channel_members SET member_status='left', removed_by_owner=true, updated_at=NOW() WHERE channel_id=$1 AND telegram_user_id=$2`, [channelId, memberId]);
-
-    // also mark invitations as rejected so dashboard query filtered
-    await db.query(`UPDATE telegramlogin_channel_invitations SET invitation_status='removed' WHERE channel_id=$1 AND receiver_user_id=$2`, [channelId, memberId]);
-
+    await removeMemberCore({ ownerId, channelId, memberId });
     console.log(`OWNER ${ownerId} removed ${memberId} from ${channelId} device ${deviceId}`);
-
-    return res.json({success:true,message:"Member removed and access revoked"});
-  } catch(e){ console.error("owner remove error",e); return res.status(500).json({success:false,message:"Server error remove"}); }
+    return res.json({ success: true, message: "Member removed and access revoked" });
+  } catch (e) {
+    console.error("owner remove error", e);
+    const msg = e.message || "Server error remove";
+    const status = msg.includes("Only owner")? 403 : msg.includes("Cannot")? 400 : msg.includes("not found")? 404 : 500;
+    return res.status(status).json({ success: false, message: msg });
+  }
 });
 
-// fallback for old frontend path
-router.post("/remove-member", authenticateTelegramUser, async (req,res)=>{
-  req.params.id=req.body.channel_id; req.params.memberId=req.body.member_id;
-  return router.handle(req,res);
+// ✅ FALLBACK OLD PATH - NO router.handle LOOP
+router.post("/remove-member", authenticateTelegramUser, async (req, res) => {
+  try {
+    await ensureCols();
+    const ownerId = getCurrentUserId(req);
+    const channelId = toInt(req.body.channel_id);
+    const memberId = toInt(req.body.member_id);
+    const deviceId = getClientDeviceId(req);
+    await removeMemberCore({ ownerId, channelId, memberId });
+    console.log(`OWNER ${ownerId} removed ${memberId} from ${channelId} via fallback device ${deviceId}`);
+    return res.json({ success: true, message: "Member removed and access revoked" });
+  } catch (e) {
+    console.error("fallback remove error", e);
+    return res.status(500).json({ success: false, message: e.message || "Server error remove" });
+  }
 });
 
 router.get("/received-links", authenticateTelegramUser, async (req, res) => {
@@ -170,7 +191,7 @@ router.get("/received-links", authenticateTelegramUser, async (req, res) => {
       JOIN telegramlogin_channellist c ON c.channel_id=i.channel_id
       JOIN telegram_users s ON s.telegram_user_id=i.sender_user_id
       WHERE i.receiver_user_id=$1 AND i.invitation_status='pending' ORDER BY i.created_at DESC`, [uid]);
-    const links = r.rows.map(row=>({
+    const links = r.rows.map(row => ({
       invitation_id: row.invitation_id, channel_id: row.channel_id, channel_name: row.channel_name, channel_type: row.channel_type,
       channel_logo_url: row.has_logo? `${BACKEND_URL}/api/telegramlogin-channels/logo/${row.channel_id}` : "",
       share_code: row.share_code, share_link: row.share_link || buildShareLink(row.share_code),
@@ -186,12 +207,11 @@ router.post("/join", authenticateTelegramUser, async (req, res) => {
     const shareCode = cleanText(req.body.share_code || req.body.code || "");
     const channelId = toInt(req.body.channel_id);
     let channel = await findChannelByAnyCode(shareCode, uid);
-    if(!channel && channelId) channel = await getChannelById(channelId);
+    if (!channel && channelId) channel = await getChannelById(channelId);
     if (!channel) return res.status(404).json({ success: false, message: `Invalid link - code ${shareCode} not found` });
 
-    // check if previously removed by owner - block rejoin
-    const prev = await getMembership({channelId: channel.channel_id, userId: uid});
-    if(prev?.removed_by_owner) return res.status(403).json({success:false,message:"You were removed by owner, cannot rejoin"});
+    const prev = await getMembership({ channelId: channel.channel_id, userId: uid });
+    if (prev?.removed_by_owner) return res.status(403).json({ success: false, message: "You were removed by owner, cannot rejoin" });
 
     const mem = await getMembership({ channelId: channel.channel_id, userId: uid });
     if (!mem) {
@@ -210,9 +230,9 @@ router.post("/received-links/:id", authenticateTelegramUser, async (req, res) =>
     const action = cleanText(req.body.action).toLowerCase();
     const r = await db.query(`SELECT * FROM telegramlogin_channel_invitations WHERE invitation_id=$1 AND receiver_user_id=$2 LIMIT 1`, [invId, uid]);
     if (!r.rows.length) return res.status(404).json({ success: false, message: "Not found" });
-    const status = ["accept","accepted"].includes(action)? "accepted" : "rejected";
+    const status = ["accept", "accepted"].includes(action)? "accepted" : "rejected";
     const up = await db.query(`UPDATE telegramlogin_channel_invitations SET invitation_status=$1 WHERE invitation_id=$2 RETURNING *`, [status, invId]);
-    return res.json({ success: true, share_link: up.rows[0].share_link, private_pin: up.rows[0].private_pin_plain||"" });
+    return res.json({ success: true, share_link: up.rows[0].share_link, private_pin: up.rows[0].private_pin_plain || "" });
   } catch { return res.status(500).json({ success: false, message: "Server error" }); }
 });
 
@@ -224,8 +244,8 @@ router.post("/remove/:id", authenticateTelegramUser, async (req, res) => {
     if (!channel) return res.status(404).json({ success: false, message: "Not found" });
     const mem = await getMembership({ channelId, userId: uid });
     if (!mem) return res.status(403).json({ success: false, message: "No access" });
-    if (Number(channel.created_by_user_id)===uid) return res.status(400).json({ success: false, message: "Owner use DELETE" });
-    if (channel.channel_type==="private") {
+    if (Number(channel.created_by_user_id) === uid) return res.status(400).json({ success: false, message: "Owner use DELETE channel" });
+    if (channel.channel_type === "private") {
       const ok = await verifyPrivatePin({ channel, pin });
       if (!ok) return res.status(403).json({ success: false, message: "Wrong PIN" });
     }
