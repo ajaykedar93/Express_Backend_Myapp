@@ -15,6 +15,7 @@ const NOTE_FILE_LIMIT_MB = 12;
 const imageStorage = multer.memoryStorage();
 const allowedImageMimeTypes = ["image/jpeg","image/jpg","image/png","image/gif","image/webp"];
 
+// LOGO UPLOAD - ACCEPT ANY FIELD NAME
 const channelLogoUpload = multer({
   storage: imageStorage,
   limits: { fileSize: CHANNEL_LOGO_LIMIT_MB * 1024 * 1024 },
@@ -24,10 +25,36 @@ const channelLogoUpload = multer({
     if(extOk && mimeOk) return cb(null,true);
     return cb(new Error("Only JPG, PNG, GIF, WEBP allowed"));
   },
+}).fields([
+  {name:"channel_logo",maxCount:1},
+  {name:"logo",maxCount:1},
+  {name:"image",maxCount:1},
+  {name:"file",maxCount:1}
+]);
+
+const noteAttachmentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits:{ fileSize: NOTE_FILE_LIMIT_MB*1024*1024 }
+}).fields([
+  {name:"attachment",maxCount:1},
+  {name:"file",maxCount:1},
+  {name:"image",maxCount:1}
+]);
+
+const uploadChannelLogo = (req,res,next)=> channelLogoUpload(req,res,(e)=>{
+  if(e) return res.status(400).json({success:false,message:e.message});
+  // get file from any field
+  const f = req.files?.channel_logo?.[0] || req.files?.logo?.[0] || req.files?.image?.[0] || req.files?.file?.[0] || null;
+  req.file = f;
+  next();
 });
-const noteAttachmentUpload = multer({ storage: multer.memoryStorage(), limits:{ fileSize: NOTE_FILE_LIMIT_MB*1024*1024 } });
-const uploadChannelLogo=(req,res,next)=> channelLogoUpload.single("channel_logo")(req,res,(e)=>{ if(e) return res.status(400).json({success:false,message:e.message}); next(); });
-const uploadNoteAttachment=(req,res,next)=> noteAttachmentUpload.single("attachment")(req,res,(e)=>{ if(e) return res.status(400).json({success:false,message:e.message}); next(); });
+
+const uploadNoteAttachment = (req,res,next)=> noteAttachmentUpload(req,res,(e)=>{
+  if(e) return res.status(400).json({success:false,message:e.message});
+  const f = req.files?.attachment?.[0] || req.files?.file?.[0] || req.files?.image?.[0] || null;
+  req.file = f;
+  next();
+});
 
 const cleanText=(v)=> String(v||"").trim();
 const toInt=(v)=>{ const n=Number(v); return Number.isInteger(n)&&n>0?n:0; };
@@ -60,18 +87,6 @@ const normalizeChannel=(row,req)=>{
   };
 };
 
-const normalizeInvitation=(row,req)=>{
-  if(!row) return null;
-  return {
-    invitation_id: row.invitation_id, id: row.invitation_id, channel_id: row.channel_id,
-    channel_name: row.channel_name, channel_type: row.channel_type,
-    sender_user_id: row.sender_user_id, sender_name: row.sender_name||"User", sender_email: row.sender_email||"",
-    receiver_user_id: row.receiver_user_id, receiver_name: row.receiver_name||"", receiver_email: row.receiver_email||"",
-    share_code: row.share_code||"", share_link: row.share_link||(row.share_code? buildShareLink(req,row.share_code):""),
-    invitation_status: row.invitation_status, status: row.invitation_status, created_at: row.created_at,
-  };
-};
-
 const normalizeNote=(row)=>{
   if(!row) return null;
   const hasAttachment=row.has_attachment===true||row.has_attachment==="true";
@@ -88,7 +103,7 @@ const authenticateTelegramUser=async(req,res,next)=>{
   try{
     const token=(req.headers.authorization||"").startsWith("Bearer ")? req.headers.authorization.slice(7):"";
     if(!token) return res.status(401).json({success:false,message:"Authorization token required"});
-    const decoded=jwt.verify(token,JWT_SECRET); const telegramUserId=Number(decoded.telegram_user_id);
+    const decoded=jwt.verify(token,JWT_SECRET); const telegramUserId=Number(decoded.telegram_user_id||decoded.id);
     if(!Number.isInteger(telegramUserId)||telegramUserId<=0) return res.status(401).json({success:false,message:"Invalid token"});
     const r=await db.query(`SELECT telegram_user_id, full_name, email FROM telegram_users WHERE telegram_user_id=$1 AND is_active=TRUE LIMIT 1`,[telegramUserId]);
     if(r.rows.length===0) return res.status(401).json({success:false,message:"User not found"});
@@ -127,7 +142,7 @@ const requireOwner=async(req,res,next)=>{
   const channelId=toInt(req.params.id||req.params.channelId); const userId=getCurrentUserId(req);
   const channel=await getChannelById(channelId); if(!channel) return res.status(404).json({success:false,message:"Channel not found"});
   const membership=await getMembership({channelId,userId});
-  const isOwner=Number(channel.created_by_user_id)===userId || String(membership?.member_role).toLowerCase()==='owner';
+  const isOwner=Number(channel.created_by_user_id)===userId || String(membership?.member_role).toLowerCase()==='owner' || membership?.is_owner===true;
   if(!isOwner) return res.status(403).json({success:false,message:"Only owner can do this"});
   req.channel=channel; req.membership=membership; next();
 };
@@ -159,7 +174,9 @@ router.get("/logo/:id",async(req,res)=>{
   try{
     const channelId=toInt(req.params.id); const r=await db.query(`SELECT channel_logo_data, channel_logo_mime FROM telegramlogin_channellist WHERE channel_id=$1 AND is_active=TRUE AND is_deleted=FALSE LIMIT 1`,[channelId]);
     if(r.rows.length===0||!r.rows[0].channel_logo_data) return res.status(404).json({success:false,message:"Logo not found"});
-    res.setHeader("Content-Type", r.rows[0].channel_logo_mime||"image/jpeg"); res.setHeader("Cache-Control","public, max-age=86400");
+    res.setHeader("Content-Type", r.rows[0].channel_logo_mime||"image/jpeg");
+    res.setHeader("Cache-Control","public, max-age=86400");
+    res.setHeader("Access-Control-Allow-Origin","*");
     return res.send(r.rows[0].channel_logo_data);
   }catch(e){ return res.status(500).json({success:false,message:"Server error"}); }
 });
@@ -182,15 +199,20 @@ router.post("/create",authenticateTelegramUser,uploadChannelLogo,async(req,res)=
     return res.status(201).json({success:true,channel:normalizeChannel({...channel,member_role:"owner",member_status:"active",is_owner:true},req)});
   }catch(e){ console.error(e); return res.status(500).json({success:false,message:"Server error"}); }
 });
-router.put("/:id/logo",authenticateTelegramUser,requireOwner,uploadChannelLogo,async(req,res)=>{
+
+// ✅ FIXED LOGO UPDATE - BOTH PUT AND POST
+const handleLogoUpdate = async(req,res)=>{
   try{
     const channel=req.channel; const file=req.file||null;
-    if(!file) return res.status(400).json({success:false,message:"Channel logo file required"});
+    if(!file) return res.status(400).json({success:false,message:"Channel logo file required - send as channel_logo, logo, image or file"});
     await db.query(`UPDATE telegramlogin_channellist SET channel_logo_data=$1, channel_logo_mime=$2, channel_logo_name=$3, channel_logo_size=$4, updated_at=NOW() WHERE channel_id=$5`,[file.buffer,file.mimetype,file.originalname,file.size,channel.channel_id]);
     const updatedChannel=await getChannelById(channel.channel_id);
     return res.json({success:true,message:"Channel logo updated",channel:normalizeChannel(updatedChannel,req)});
-  }catch(e){ console.error(e); return res.status(500).json({success:false,message:"Server error"}); }
-});
+  }catch(e){ console.error("LOGO UPDATE ERROR",e); return res.status(500).json({success:false,message:"Server error logo update: "+e.message}); }
+};
+router.put("/:id/logo",authenticateTelegramUser,requireOwner,uploadChannelLogo,handleLogoUpdate);
+router.post("/:id/logo",authenticateTelegramUser,requireOwner,uploadChannelLogo,handleLogoUpdate);
+
 router.post("/join/:shareCode",authenticateTelegramUser,async(req,res)=>{
   try{
     const userId=getCurrentUserId(req); const shareCode=extractShareCode(req.params.shareCode||req.body.share_code); const deviceId=getClientDeviceId(req); const pin=cleanText(req.body.security_pin||req.body.pin||""); const trustDevice=String(req.body.trust_device).toLowerCase()==="true";
@@ -239,7 +261,6 @@ router.post("/:id/notes",authenticateTelegramUser,requireActiveMembership,upload
   }catch(e){ console.error(e); return res.status(500).json({success:false,message:"Server error"}); }
 });
 
-// FIXED IMAGE DIRECT - OWNER BYPASS
 router.get("/notes/:noteId/attachment",authenticateTelegramUser,async(req,res)=>{
   try{
     const noteId=toInt(req.params.noteId); const userId=getCurrentUserId(req);
