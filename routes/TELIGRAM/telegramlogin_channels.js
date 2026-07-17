@@ -182,6 +182,15 @@ router.post("/create",authenticateTelegramUser,uploadChannelLogo,async(req,res)=
     return res.status(201).json({success:true,channel:normalizeChannel({...channel,member_role:"owner",member_status:"active",is_owner:true},req)});
   }catch(e){ console.error(e); return res.status(500).json({success:false,message:"Server error"}); }
 });
+router.put("/:id/logo",authenticateTelegramUser,requireOwner,uploadChannelLogo,async(req,res)=>{
+  try{
+    const channel=req.channel; const file=req.file||null;
+    if(!file) return res.status(400).json({success:false,message:"Channel logo file required"});
+    await db.query(`UPDATE telegramlogin_channellist SET channel_logo_data=$1, channel_logo_mime=$2, channel_logo_name=$3, channel_logo_size=$4, updated_at=NOW() WHERE channel_id=$5`,[file.buffer,file.mimetype,file.originalname,file.size,channel.channel_id]);
+    const updatedChannel=await getChannelById(channel.channel_id);
+    return res.json({success:true,message:"Channel logo updated",channel:normalizeChannel(updatedChannel,req)});
+  }catch(e){ console.error(e); return res.status(500).json({success:false,message:"Server error"}); }
+});
 router.post("/join/:shareCode",authenticateTelegramUser,async(req,res)=>{
   try{
     const userId=getCurrentUserId(req); const shareCode=extractShareCode(req.params.shareCode||req.body.share_code); const deviceId=getClientDeviceId(req); const pin=cleanText(req.body.security_pin||req.body.pin||""); const trustDevice=String(req.body.trust_device).toLowerCase()==="true";
