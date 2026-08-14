@@ -6,6 +6,21 @@ const db = require("../../db");
 
 const router = express.Router();
 
+// Support up to 3 images per note without changing the existing single-image API contract.
+// The extra columns are added automatically when this router initializes.
+const multiImageSchemaReady = db.query(`
+  ALTER TABLE telegram_notes
+    ADD COLUMN IF NOT EXISTS image_data_2 BYTEA,
+    ADD COLUMN IF NOT EXISTS image_mime_2 VARCHAR(100),
+    ADD COLUMN IF NOT EXISTS image_name_2 TEXT,
+    ADD COLUMN IF NOT EXISTS image_data_3 BYTEA,
+    ADD COLUMN IF NOT EXISTS image_mime_3 VARCHAR(100),
+    ADD COLUMN IF NOT EXISTS image_name_3 TEXT
+`).catch((error) => {
+  console.error("Multi-image schema initialization failed:", error);
+  throw error;
+});
+
 /* ===============================
    Multer Any File Upload Config
    Supports:
@@ -27,7 +42,7 @@ const upload = multer({
 
 const uploadAnyFile = (req, res, next) => {
   upload.fields([
-    { name: "image", maxCount: 1 },
+    { name: "image", maxCount: 3 },
     { name: "file", maxCount: 1 },
     { name: "attachment", maxCount: 1 },
   ])(req, res, function (error) {
@@ -81,6 +96,8 @@ const isPreviewableMime = (mime) => {
   );
 };
 
+const getUploadedImages = (req) => Array.isArray(req.files?.image) ? req.files.image.slice(0, 3) : [];
+
 const getUploadedFile = (req) => {
   return (
     req.files?.file?.[0] ||
@@ -117,6 +134,13 @@ const normalizeNoteFile = (req, note) => {
   const hasAttachment = Boolean(note.has_attachment);
   const hasFile = hasImage || hasAttachment;
 
+  const imageUrls = [];
+  if (hasImage) {
+    imageUrls.push(getImageViewUrl(req, note.note_id, note.updated_at));
+    if (note.has_image_2) imageUrls.push(`${getBaseUrl(req)}/api/telegram-notes/image/${note.note_id}/2?v=${note.updated_at ? new Date(note.updated_at).getTime() : Date.now()}`);
+    if (note.has_image_3) imageUrls.push(`${getBaseUrl(req)}/api/telegram-notes/image/${note.note_id}/3?v=${note.updated_at ? new Date(note.updated_at).getTime() : Date.now()}`);
+  }
+
   const fileName = hasAttachment
     ? note.attachment_name
     : hasImage
@@ -150,6 +174,7 @@ const normalizeNoteFile = (req, note) => {
     image_url: hasImage
       ? getImageViewUrl(req, note.note_id, note.updated_at)
       : null,
+    image_urls: imageUrls,
     image_path: null,
     download_url: hasImage ? getImageDownloadUrl(req, note.note_id) : null,
 
@@ -191,42 +216,46 @@ const getRequestPin = (req) => {
 
 const cleanHtml = (html) => {
   return sanitizeHtml(html || "", {
-    allowedTags: ["b", "strong", "u", "span", "font", "div", "p", "br"],
+    allowedTags: ["a", "b", "strong", "u", "span", "font", "div", "p", "br"],
     allowedAttributes: {
-      span: ["style"],
-      div: ["style"],
-      p: ["style"],
+      a: ["href", "target", "rel", "class", "style"],
+      span: ["style", "class"],
+      div: ["style", "class"],
+      p: ["style", "class"],
       font: ["color", "style"],
+      b: ["style"],
+      strong: ["style"],
+      u: ["style"],
     },
     allowedStyles: {
       "*": {
         color: [
-          /^#[0-9a-fA-F]{3,6}$/,
+          /^#[0-9a-fA-F]{3,8}$/,
           /^rgb\((\d{1,3},\s*){2}\d{1,3}\)$/,
+          /^rgba\((\d{1,3},\s*){3}0?(?:\.\d+)?\)$/i,
+        ],
+        "font-weight": [/^(?:normal|bold|[1-9]00)$/],
+        "text-decoration": [/^(?:none|underline)(?:\s+[^;]+)?$/i],
+        "text-decoration-line": [/^(?:none|underline)$/i],
+        "text-decoration-style": [/^(?:solid|dotted|dashed|double|wavy)$/i],
+        "text-decoration-thickness": [/^[0-9.]+(?:px|em|rem|%)$/i],
+        "text-underline-offset": [/^[0-9.]+(?:px|em|rem|%)$/i],
+        "-webkit-text-fill-color": [
+          /^#[0-9a-fA-F]{3,8}$/,
+          /^rgb\((\d{1,3},\s*){2}\d{1,3}\)$/i,
         ],
       },
     },
+    allowedSchemes: ["http", "https"],
+    allowedSchemesByTag: { a: ["http", "https"] },
+    allowProtocolRelative: false,
     transformTags: {
       font: function (tagName, attribs) {
         const color = attribs.color;
-
-        if (
-          color &&
-          (/^#[0-9a-fA-F]{3,6}$/.test(color) ||
-            /^rgb\((\d{1,3},\s*){2}\d{1,3}\)$/.test(color))
-        ) {
-          return {
-            tagName: "span",
-            attribs: {
-              style: `color:${color}`,
-            },
-          };
+        if (color && (/^#[0-9a-fA-F]{3,8}$/.test(color) || /^rgb\((\d{1,3},\s*){2}\d{1,3}\)$/.test(color))) {
+          return { tagName: "span", attribs: { style: `color:${color};-webkit-text-fill-color:${color}` } };
         }
-
-        return {
-          tagName: "span",
-          attribs: {},
-        };
+        return { tagName: "span", attribs: {} };
       },
     },
   });
@@ -456,6 +485,7 @@ const checkChannelAccess = async (req, res, channelId) => {
 ================================ */
 router.get("/", async (req, res) => {
   try {
+    await multiImageSchemaReady;
     const { user_id, channel_id } = req.query;
 
     if (!user_id) {
@@ -490,6 +520,8 @@ router.get("/", async (req, res) => {
           image_name,
           octet_length(image_data) AS image_size,
           (image_data IS NOT NULL) AS has_image,
+          (image_data_2 IS NOT NULL) AS has_image_2,
+          (image_data_3 IS NOT NULL) AS has_image_3,
           attachment_url,
           attachment_path,
           attachment_mime,
@@ -596,6 +628,32 @@ router.get("/file/:note_id", async (req, res) => {
 });
 
 /* ===============================
+   Multi-image slot view: /image/:note_id/:slot
+================================ */
+router.get("/image/:note_id/:slot", async (req, res) => {
+  try {
+    await multiImageSchemaReady;
+    const noteId = Number(req.params.note_id);
+    const slot = Number(req.params.slot);
+    if (![2, 3].includes(slot)) return res.status(400).json({ success: false, message: "Invalid image slot" });
+
+    const result = await db.query(
+      `SELECT image_data_${slot} AS image_data, image_mime_${slot} AS image_mime, image_name_${slot} AS image_name
+       FROM telegram_notes WHERE note_id = $1`,
+      [noteId]
+    );
+    if (!result.rows.length || !result.rows[0].image_data) return res.status(404).json({ success: false, message: "Image not found" });
+    const row = result.rows[0];
+    const buffer = Buffer.isBuffer(row.image_data) ? row.image_data : Buffer.from(row.image_data);
+    setFileHeaders(res, row.image_name || `note-${noteId}-${slot}.jpg`, row.image_mime || "image/jpeg", buffer.length, "inline");
+    return res.end(buffer);
+  } catch (error) {
+    console.error("Multi-image fetch error:", error);
+    return res.status(500).json({ success: false, message: "Server error while fetching image" });
+  }
+});
+
+/* ===============================
    Old Image View + Download From DB
    Kept same for old frontend support
 
@@ -696,6 +754,7 @@ router.get("/image/:note_id", async (req, res) => {
 ================================ */
 router.get("/:note_id", async (req, res) => {
   try {
+    await multiImageSchemaReady;
     const { note_id } = req.params;
 
     const result = await db.query(
@@ -712,6 +771,8 @@ router.get("/:note_id", async (req, res) => {
           image_name,
           octet_length(image_data) AS image_size,
           (image_data IS NOT NULL) AS has_image,
+          (image_data_2 IS NOT NULL) AS has_image_2,
+          (image_data_3 IS NOT NULL) AS has_image_3,
           attachment_url,
           attachment_path,
           attachment_mime,
@@ -768,6 +829,7 @@ router.get("/:note_id", async (req, res) => {
 ================================ */
 router.post("/", uploadAnyFile, async (req, res) => {
   try {
+    await multiImageSchemaReady;
     const { user_id, channel_id, title, content_html, text_color } = req.body;
 
     if (!user_id) {
@@ -793,11 +855,18 @@ router.post("/", uploadAnyFile, async (req, res) => {
     const finalPlainText = getPlainText(finalContent);
     const finalColor = isValidColor(text_color) ? text_color : "#111827";
 
+    const uploadedImages = getUploadedImages(req);
     const uploadedFile = getUploadedFile(req);
 
     let imageData = null;
     let imageMime = null;
     let imageName = null;
+    let imageData2 = null;
+    let imageMime2 = null;
+    let imageName2 = null;
+    let imageData3 = null;
+    let imageMime3 = null;
+    let imageName3 = null;
 
     let attachmentData = null;
     let attachmentMime = null;
@@ -805,15 +874,23 @@ router.post("/", uploadAnyFile, async (req, res) => {
     let attachmentSize = null;
     let attachmentExt = null;
 
-    if (uploadedFile) {
+    if (uploadedImages.length) {
+      const imageFiles = uploadedImages.slice(0, 3);
+      for (let i = 0; i < imageFiles.length; i += 1) {
+        const image = imageFiles[i];
+        const safeName = getSafeFileName(image.originalname, `image-${i + 1}`);
+        const safeMime = image.mimetype || "image/jpeg";
+        if (!isImageMime(safeMime)) continue;
+        if (i === 0) { imageData = image.buffer; imageMime = safeMime; imageName = safeName; }
+        if (i === 1) { imageData2 = image.buffer; imageMime2 = safeMime; imageName2 = safeName; }
+        if (i === 2) { imageData3 = image.buffer; imageMime3 = safeMime; imageName3 = safeName; }
+      }
+    }
+
+    if (uploadedFile && !(req.files?.image?.length)) {
       const safeName = getSafeFileName(uploadedFile.originalname, "file");
       const safeMime = uploadedFile.mimetype || "application/octet-stream";
-
-      if (isImageMime(safeMime)) {
-        imageData = uploadedFile.buffer;
-        imageMime = safeMime;
-        imageName = safeName;
-      } else {
+      if (!isImageMime(safeMime)) {
         attachmentData = uploadedFile.buffer;
         attachmentMime = safeMime;
         attachmentName = safeName;
@@ -840,6 +917,12 @@ router.post("/", uploadAnyFile, async (req, res) => {
           image_data,
           image_mime,
           image_name,
+          image_data_2,
+          image_mime_2,
+          image_name_2,
+          image_data_3,
+          image_mime_3,
+          image_name_3,
           image_url,
           image_path,
           attachment_data,
@@ -856,8 +939,8 @@ router.post("/", uploadAnyFile, async (req, res) => {
        VALUES
         (
           $1::int, $2::int, $3::varchar(255), $4::text, $5::varchar(20),
-          $6::bytea, $7::varchar(100), $8::text, NULL, NULL,
-          $9::bytea, $10::varchar(150), $11::text, $12::bigint, $13::varchar(30), NULL, NULL,
+          $6::bytea, $7::varchar(100), $8::text, $9::bytea, $10::varchar(100), $11::text, $12::bytea, $13::varchar(100), $14::text, NULL, NULL,
+          $15::bytea, $16::varchar(150), $17::text, $18::bigint, $19::varchar(30), NULL, NULL,
           CASE WHEN $9::bytea IS NULL THEN NULL ELSE CURRENT_TIMESTAMP END,
           CURRENT_TIMESTAMP,
           CURRENT_TIMESTAMP
@@ -875,6 +958,8 @@ router.post("/", uploadAnyFile, async (req, res) => {
           image_name,
           octet_length(image_data) AS image_size,
           (image_data IS NOT NULL) AS has_image,
+          (image_data_2 IS NOT NULL) AS has_image_2,
+          (image_data_3 IS NOT NULL) AS has_image_3,
           attachment_url,
           attachment_path,
           attachment_mime,
@@ -897,6 +982,12 @@ router.post("/", uploadAnyFile, async (req, res) => {
         imageData,
         imageMime,
         imageName,
+        imageData2,
+        imageMime2,
+        imageName2,
+        imageData3,
+        imageMime3,
+        imageName3,
         attachmentData,
         attachmentMime,
         attachmentName,
@@ -908,8 +999,8 @@ router.post("/", uploadAnyFile, async (req, res) => {
     await updateChannelLastMessage(
       channel_id,
       finalContent,
-      Boolean(imageData),
-      attachmentName || imageName || ""
+      Boolean(imageData || imageData2 || imageData3),
+      attachmentName || imageName || imageName2 || imageName3 || ""
     );
 
     return res.status(201).json({
@@ -938,6 +1029,7 @@ router.post("/", uploadAnyFile, async (req, res) => {
 ================================ */
 router.put("/:note_id", uploadAnyFile, async (req, res) => {
   try {
+    await multiImageSchemaReady;
     const { note_id } = req.params;
 
     const {
@@ -977,6 +1069,12 @@ router.put("/:note_id", uploadAnyFile, async (req, res) => {
     let imageData = oldNote.image_data;
     let imageMime = oldNote.image_mime;
     let imageName = oldNote.image_name;
+    let imageData2 = oldNote.image_data_2;
+    let imageMime2 = oldNote.image_mime_2;
+    let imageName2 = oldNote.image_name_2;
+    let imageData3 = oldNote.image_data_3;
+    let imageMime3 = oldNote.image_mime_3;
+    let imageName3 = oldNote.image_name_3;
 
     let attachmentData = oldNote.attachment_data;
     let attachmentMime = oldNote.attachment_mime;
@@ -989,6 +1087,12 @@ router.put("/:note_id", uploadAnyFile, async (req, res) => {
       imageData = null;
       imageMime = null;
       imageName = null;
+      imageData2 = null;
+      imageMime2 = null;
+      imageName2 = null;
+      imageData3 = null;
+      imageMime3 = null;
+      imageName3 = null;
     }
 
     if (
@@ -1005,29 +1109,41 @@ router.put("/:note_id", uploadAnyFile, async (req, res) => {
       attachmentUploadedAt = null;
     }
 
+    const uploadedImages = getUploadedImages(req);
     const uploadedFile = getUploadedFile(req);
 
-    if (uploadedFile) {
+    if (uploadedImages.length) {
+      imageData = null; imageMime = null; imageName = null;
+      imageData2 = null; imageMime2 = null; imageName2 = null;
+      imageData3 = null; imageMime3 = null; imageName3 = null;
+      uploadedImages.slice(0, 3).forEach((image, index) => {
+        const safeName = getSafeFileName(image.originalname, `image-${index + 1}`);
+        const safeMime = image.mimetype || "image/jpeg";
+        if (!isImageMime(safeMime)) return;
+        if (index === 0) { imageData = image.buffer; imageMime = safeMime; imageName = safeName; }
+        if (index === 1) { imageData2 = image.buffer; imageMime2 = safeMime; imageName2 = safeName; }
+        if (index === 2) { imageData3 = image.buffer; imageMime3 = safeMime; imageName3 = safeName; }
+      });
+      attachmentData = null;
+      attachmentMime = null;
+      attachmentName = null;
+      attachmentSize = null;
+      attachmentExt = null;
+      attachmentUploadedAt = null;
+    } else if (uploadedFile) {
       const safeName = getSafeFileName(uploadedFile.originalname, "file");
       const safeMime = uploadedFile.mimetype || "application/octet-stream";
 
-      if (isImageMime(safeMime)) {
-        // One file per note: new image replaces old generic attachment.
-        imageData = uploadedFile.buffer;
-        imageMime = safeMime;
-        imageName = safeName;
-
-        attachmentData = null;
-        attachmentMime = null;
-        attachmentName = null;
-        attachmentSize = null;
-        attachmentExt = null;
-        attachmentUploadedAt = null;
-      } else {
-        // One file per note: new generic file replaces old image.
+      if (!isImageMime(safeMime)) {
         imageData = null;
         imageMime = null;
         imageName = null;
+        imageData2 = null;
+        imageMime2 = null;
+        imageName2 = null;
+        imageData3 = null;
+        imageMime3 = null;
+        imageName3 = null;
 
         attachmentData = uploadedFile.buffer;
         attachmentMime = safeMime;
@@ -1054,18 +1170,24 @@ router.put("/:note_id", uploadAnyFile, async (req, res) => {
           image_data = $4::bytea,
           image_mime = $5::varchar(100),
           image_name = $6::text,
+          image_data_2 = $7::bytea,
+          image_mime_2 = $8::varchar(100),
+          image_name_2 = $9::text,
+          image_data_3 = $10::bytea,
+          image_mime_3 = $11::varchar(100),
+          image_name_3 = $12::text,
           image_url = NULL,
           image_path = NULL,
-          attachment_data = $7::bytea,
-          attachment_mime = $8::varchar(150),
-          attachment_name = $9::text,
-          attachment_size = $10::bigint,
-          attachment_ext = $11::varchar(30),
+          attachment_data = $13::bytea,
+          attachment_mime = $14::varchar(150),
+          attachment_name = $15::text,
+          attachment_size = $16::bigint,
+          attachment_ext = $17::varchar(30),
           attachment_url = NULL,
           attachment_path = NULL,
-          attachment_uploaded_at = $12::timestamp,
+          attachment_uploaded_at = $18::timestamp,
           updated_at = CURRENT_TIMESTAMP
-       WHERE note_id = $13::int
+       WHERE note_id = $19::int
        RETURNING
           note_id,
           user_id,
@@ -1079,6 +1201,8 @@ router.put("/:note_id", uploadAnyFile, async (req, res) => {
           image_name,
           octet_length(image_data) AS image_size,
           (image_data IS NOT NULL) AS has_image,
+          (image_data_2 IS NOT NULL) AS has_image_2,
+          (image_data_3 IS NOT NULL) AS has_image_3,
           attachment_url,
           attachment_path,
           attachment_mime,
@@ -1099,6 +1223,12 @@ router.put("/:note_id", uploadAnyFile, async (req, res) => {
         imageData,
         imageMime,
         imageName,
+        imageData2,
+        imageMime2,
+        imageName2,
+        imageData3,
+        imageMime3,
+        imageName3,
         attachmentData,
         attachmentMime,
         attachmentName,
@@ -1112,8 +1242,8 @@ router.put("/:note_id", uploadAnyFile, async (req, res) => {
     await updateChannelLastMessage(
       oldNote.channel_id,
       finalContent,
-      Boolean(imageData),
-      attachmentName || imageName || ""
+      Boolean(imageData || imageData2 || imageData3),
+      attachmentName || imageName || imageName2 || imageName3 || ""
     );
 
     return res.status(200).json({
