@@ -367,8 +367,6 @@ const setFileHeaders = (res, fileName, mime, size, dispositionType) => {
   );
   res.setHeader("Cache-Control", "no-store");
   res.setHeader("X-Content-Type-Options", "nosniff");
-  res.setHeader("X-Download-Success", "true");
-  res.setHeader("Access-Control-Expose-Headers", "Content-Disposition, X-Download-Success");
 
   if (size) {
     res.setHeader("Content-Length", size);
@@ -579,6 +577,8 @@ router.get("/", async (req, res) => {
    - Image, PDF, text, CSV, JSON open inline
    - Excel, Word, ZIP, other files download directly
 ================================ */
+// Direct download endpoint: intentionally does NOT call checkChannelAccess().
+// This allows browser/mobile downloads without resending a channel PIN.
 router.get("/file/download/:note_id", async (req, res) => {
   try {
     const { note_id } = req.params;
@@ -715,6 +715,8 @@ const getImageBySlot = async (noteId, slot) => {
    Image download — slot 1
    Browser + Android/iOS compatible
    ================================ */
+// Direct image download endpoint: intentionally does NOT call checkChannelAccess().
+// This allows browser/mobile downloads without resending a channel PIN.
 router.get("/image/download/:note_id", async (req, res) => {
   try {
     const { note_id } = req.params;
@@ -753,6 +755,7 @@ router.get("/image/download/:note_id", async (req, res) => {
 /* ===============================
    Image download — slots 2 and 3
    ================================ */
+// Direct multi-image download endpoint: intentionally does NOT call checkChannelAccess().
 router.get("/image/download/:note_id/:slot", async (req, res) => {
   try {
     const { note_id, slot } = req.params;
