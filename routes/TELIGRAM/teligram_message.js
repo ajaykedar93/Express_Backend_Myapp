@@ -735,10 +735,6 @@ router.get("/image/download/:note_id", async (req, res) => {
       "attachment"
     );
 
-    // Allows frontend fetch() clients to detect a completed download.
-    res.setHeader("X-Download-Success", "true");
-    res.setHeader("Access-Control-Expose-Headers", "Content-Disposition, X-Download-Success");
-
     return res.end(image.data);
   } catch (error) {
     console.error("Image download error:", error);
@@ -785,9 +781,6 @@ router.get("/image/download/:note_id/:slot", async (req, res) => {
       image.size,
       "attachment"
     );
-
-    res.setHeader("X-Download-Success", "true");
-    res.setHeader("Access-Control-Expose-Headers", "Content-Disposition, X-Download-Success");
 
     return res.end(image.data);
   } catch (error) {
