@@ -76,6 +76,19 @@ const ensureTrustedDeviceTable = async () => {
   `);
 
   await db.query(`
+    UPDATE telegram_channel_trusted_devices td
+    SET trusted_pin_version = c.pin_updated_at
+    FROM telegram_channels c
+    WHERE td.channel_id = c.channel_id
+      AND td.trusted_pin_version IS NULL
+  `);
+
+  await db.query(`
+    ALTER TABLE telegram_channel_trusted_devices
+    ALTER COLUMN trusted_pin_version SET NOT NULL
+  `);
+
+  await db.query(`
     CREATE INDEX IF NOT EXISTS idx_tctd_lookup
     ON telegram_channel_trusted_devices(channel_id, user_id, device_id)
   `);
