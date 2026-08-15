@@ -113,8 +113,11 @@ const getImageViewUrl = (req, noteId, updatedAt) => {
   return `${getBaseUrl(req)}/api/telegram-notes/image/${noteId}?v=${version}`;
 };
 
-const getImageDownloadUrl = (req, noteId) => {
-  return `${getBaseUrl(req)}/api/telegram-notes/image/download/${noteId}`;
+const getImageDownloadUrl = (req, noteId, slot = 1) => {
+  const safeSlot = Number(slot);
+  if (![1, 2, 3].includes(safeSlot)) return null;
+
+  return `${getBaseUrl(req)}/api/telegram-notes/image/download/${noteId}${safeSlot === 1 ? "" : `/${safeSlot}`}`;
 };
 
 const getFileViewUrl = (req, noteId, updatedAt) => {
@@ -176,7 +179,10 @@ const normalizeNoteFile = (req, note) => {
       : null,
     image_urls: imageUrls,
     image_path: null,
-    download_url: hasImage ? getImageDownloadUrl(req, note.note_id) : null,
+    download_url: hasImage ? getImageDownloadUrl(req, note.note_id, 1) : null,
+    image_download_urls: hasImage
+      ? imageUrls.map((_, index) => getImageDownloadUrl(req, note.note_id, index + 1))
+      : [],
 
     // New generic file response support
     has_file: hasFile,
@@ -361,6 +367,11 @@ const setFileHeaders = (res, fileName, mime, size, dispositionType) => {
   );
   res.setHeader("Cache-Control", "no-store");
   res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Download-Success", "true");
+  res.setHeader(
+    "Access-Control-Expose-Headers",
+    "Content-Disposition, X-Download-Success"
+  );
 
   if (size) {
     res.setHeader("Content-Length", size);
@@ -628,123 +639,224 @@ router.get("/file/:note_id", async (req, res) => {
 });
 
 /* ===============================
-   Multi-image slot view: /image/:note_id/:slot
-================================ */
-router.get("/image/:note_id/:slot", async (req, res) => {
-  try {
-    await multiImageSchemaReady;
-    const noteId = Number(req.params.note_id);
-    const slot = Number(req.params.slot);
-    if (![2, 3].includes(slot)) return res.status(400).json({ success: false, message: "Invalid image slot" });
+   Image download helpers
+   ================================ */
 
-    const result = await db.query(
-      `SELECT image_data_${slot} AS image_data, image_mime_${slot} AS image_mime, image_name_${slot} AS image_name
-       FROM telegram_notes WHERE note_id = $1`,
-      [noteId]
+const getImageBySlot = async (noteId, slot = 1) => {
+  const safeNoteId = Number(noteId);
+  const safeSlot = Number(slot);
+
+  if (!Number.isInteger(safeNoteId) || safeNoteId <= 0) return null;
+  if (![1, 2, 3].includes(safeSlot)) return null;
+
+  const dataColumn = safeSlot === 1 ? "image_data" : `image_data_${safeSlot}`;
+  const mimeColumn = safeSlot === 1 ? "image_mime" : `image_mime_${safeSlot}`;
+  const nameColumn = safeSlot === 1 ? "image_name" : `image_name_${safeSlot}`;
+
+  const result = await db.query(
+    `SELECT
+        ${dataColumn} AS image_data,
+        ${mimeColumn} AS image_mime,
+        ${nameColumn} AS image_name
+     FROM telegram_notes
+     WHERE note_id = $1`,
+    [safeNoteId]
+  );
+
+  if (!result.rows.length || !result.rows[0].image_data) {
+    return null;
+  }
+
+  const row = result.rows[0];
+  const buffer = Buffer.isBuffer(row.image_data)
+    ? row.image_data
+    : Buffer.from(row.image_data);
+
+  return {
+    data: buffer,
+    mime: row.image_mime || "image/jpeg",
+    name: getSafeFileName(
+      row.image_name ||
+        `note-${safeNoteId}${safeSlot === 1 ? "" : `-${safeSlot}`}.jpg`
+    ),
+    size: buffer.length,
+  };
+};
+
+/* ===============================
+   Image download — slot 1
+   GET /api/telegram-notes/image/download/:note_id
+   ================================ */
+router.get("/image/download/:note_id", async (req, res) => {
+  try {
+    const { note_id } = req.params;
+    const image = await getImageBySlot(note_id, 1);
+
+    if (!image) {
+      return res.status(404).json({
+        success: false,
+        message: "Image not found",
+      });
+    }
+
+    setFileHeaders(
+      res,
+      image.name,
+      image.mime,
+      image.size,
+      "attachment"
     );
-    if (!result.rows.length || !result.rows[0].image_data) return res.status(404).json({ success: false, message: "Image not found" });
-    const row = result.rows[0];
-    const buffer = Buffer.isBuffer(row.image_data) ? row.image_data : Buffer.from(row.image_data);
-    setFileHeaders(res, row.image_name || `note-${noteId}-${slot}.jpg`, row.image_mime || "image/jpeg", buffer.length, "inline");
-    return res.end(buffer);
+
+    return res.end(image.data);
   } catch (error) {
-    console.error("Multi-image fetch error:", error);
-    return res.status(500).json({ success: false, message: "Server error while fetching image" });
+    console.error("Image download error:", error);
+
+    if (!res.headersSent) {
+      return res.status(500).json({
+        success: false,
+        message: "Server error while downloading image",
+      });
+    }
+
+    return res.end();
   }
 });
 
 /* ===============================
-   Old Image View + Download From DB
-   Kept same for old frontend support
-
-   GET /api/telegram-notes/image/:note_id
-   GET /api/telegram-notes/image/download/:note_id
-================================ */
-router.get("/image/download/:note_id", async (req, res) => {
+   Image download — slots 2 and 3
+   GET /api/telegram-notes/image/download/:note_id/:slot
+   ================================ */
+router.get("/image/download/:note_id/:slot", async (req, res) => {
   try {
-    const { note_id } = req.params;
+    const { note_id, slot } = req.params;
+    const safeSlot = Number(slot);
 
-    const result = await db.query(
-      `SELECT image_data, image_mime, image_name
-       FROM telegram_notes
-       WHERE note_id = $1`,
-      [note_id]
-    );
+    if (![2, 3].includes(safeSlot)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid image slot",
+      });
+    }
 
-    if (result.rows.length === 0 || !result.rows[0].image_data) {
+    const image = await getImageBySlot(note_id, safeSlot);
+
+    if (!image) {
       return res.status(404).json({
         success: false,
         message: "Image not found",
       });
     }
 
-    const image = result.rows[0];
-
-    const imageBuffer = Buffer.isBuffer(image.image_data)
-      ? image.image_data
-      : Buffer.from(image.image_data);
-
-    const fileName = getSafeFileName(image.image_name || `note-${note_id}.jpg`);
-
     setFileHeaders(
       res,
-      fileName,
-      image.image_mime || "image/jpeg",
-      imageBuffer.length,
+      image.name,
+      image.mime,
+      image.size,
       "attachment"
     );
 
-    return res.end(imageBuffer);
+    return res.end(image.data);
   } catch (error) {
-    console.error("Image download error:", error);
+    console.error("Multi-image download error:", error);
 
-    return res.status(500).json({
-      success: false,
-      message: "Server error while downloading image",
-    });
+    if (!res.headersSent) {
+      return res.status(500).json({
+        success: false,
+        message: "Server error while downloading image",
+      });
+    }
+
+    return res.end();
   }
 });
 
-router.get("/image/:note_id", async (req, res) => {
+/* ===============================
+   Multi-image slot view
+   GET /api/telegram-notes/image/:note_id/:slot
+   Slots: 2, 3
+   ================================ */
+router.get("/image/:note_id/:slot", async (req, res) => {
   try {
-    const { note_id } = req.params;
+    await multiImageSchemaReady;
 
-    const result = await db.query(
-      `SELECT image_data, image_mime, image_name
-       FROM telegram_notes
-       WHERE note_id = $1`,
-      [note_id]
-    );
+    const noteId = Number(req.params.note_id);
+    const slot = Number(req.params.slot);
 
-    if (result.rows.length === 0 || !result.rows[0].image_data) {
+    if (![2, 3].includes(slot)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid image slot",
+      });
+    }
+
+    const image = await getImageBySlot(noteId, slot);
+
+    if (!image) {
       return res.status(404).json({
         success: false,
         message: "Image not found",
       });
     }
 
-    const image = result.rows[0];
-
-    const imageBuffer = Buffer.isBuffer(image.image_data)
-      ? image.image_data
-      : Buffer.from(image.image_data);
-
     setFileHeaders(
       res,
-      image.image_name || `note-${note_id}.jpg`,
-      image.image_mime || "image/jpeg",
-      imageBuffer.length,
+      image.name,
+      image.mime,
+      image.size,
       "inline"
     );
 
-    return res.end(imageBuffer);
+    return res.end(image.data);
+  } catch (error) {
+    console.error("Multi-image fetch error:", error);
+
+    if (!res.headersSent) {
+      return res.status(500).json({
+        success: false,
+        message: "Server error while fetching image",
+      });
+    }
+
+    return res.end();
+  }
+});
+
+/* ===============================
+   Old Image View
+   GET /api/telegram-notes/image/:note_id
+   ================================ */
+router.get("/image/:note_id", async (req, res) => {
+  try {
+    const { note_id } = req.params;
+    const image = await getImageBySlot(note_id, 1);
+
+    if (!image) {
+      return res.status(404).json({
+        success: false,
+        message: "Image not found",
+      });
+    }
+
+    setFileHeaders(
+      res,
+      image.name,
+      image.mime,
+      image.size,
+      "inline"
+    );
+
+    return res.end(image.data);
   } catch (error) {
     console.error("Image fetch error:", error);
 
-    return res.status(500).json({
-      success: false,
-      message: "Server error while fetching image",
-    });
+    if (!res.headersSent) {
+      return res.status(500).json({
+        success: false,
+        message: "Server error while fetching image",
+      });
+    }
+
+    return res.end();
   }
 });
 
