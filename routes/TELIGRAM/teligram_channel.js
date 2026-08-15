@@ -5,6 +5,85 @@ const db = require("../../db");
 
 const router = express.Router();
 
+/* =========================================================
+   TRUSTED DEVICE SECURITY
+   - Trust is stored in PostgreSQL, not only localStorage.
+   - trusted_pin_version stores telegram_channels.updated_at.
+   - If private_pin is changed in PgAdmin and updated_at changes,
+     the old trusted device automatically becomes untrusted.
+========================================================= */
+const ensureTrustedDeviceTable = async () => {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS telegram_channel_trusted_devices (
+      trust_id SERIAL PRIMARY KEY,
+      channel_id INT NOT NULL,
+      user_id INT NOT NULL,
+      device_id VARCHAR(120) NOT NULL,
+      trusted_pin_version TIMESTAMP NOT NULL,
+      trusted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (channel_id, user_id, device_id)
+    )
+  `);
+
+  await db.query(`
+    ALTER TABLE telegram_channel_trusted_devices
+    ADD COLUMN IF NOT EXISTS trusted_pin_version TIMESTAMP
+  `);
+
+  await db.query(`
+    CREATE INDEX IF NOT EXISTS idx_tctd_lookup
+    ON telegram_channel_trusted_devices(channel_id, user_id, device_id)
+  `);
+};
+
+ensureTrustedDeviceTable().catch((error) => {
+  console.error("Trusted device table initialization error:", error);
+});
+
+const isTrustedDevice = async (channelId, userId, deviceId, pinVersion) => {
+  const result = await db.query(
+    `SELECT 1
+     FROM telegram_channel_trusted_devices
+     WHERE channel_id = $1
+       AND user_id = $2
+       AND device_id = $3
+       AND trusted_pin_version = $4
+     LIMIT 1`,
+    [Number(channelId), Number(userId), cleanDeviceId(deviceId), pinVersion]
+  );
+
+  return result.rows.length > 0;
+};
+
+const saveTrustedDevice = async (
+  channelId,
+  userId,
+  deviceId,
+  pinVersion
+) => {
+  const cleanDevice = cleanDeviceId(deviceId);
+
+  if (!cleanDevice || !pinVersion) return false;
+
+  await db.query(
+    `INSERT INTO telegram_channel_trusted_devices
+       (channel_id, user_id, device_id, trusted_pin_version, trusted_at)
+     VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+     ON CONFLICT (channel_id, user_id, device_id)
+     DO UPDATE SET
+       trusted_pin_version = EXCLUDED.trusted_pin_version,
+       trusted_at = CURRENT_TIMESTAMP`,
+    [
+      Number(channelId),
+      Number(userId),
+      cleanDevice,
+      pinVersion,
+    ]
+  );
+
+  return true;
+};
+
 /* ===============================
    Multer Config
    Direct DB upload using memoryStorage
@@ -561,6 +640,138 @@ router.put("/:channel_id", uploadLogo, async (req, res) => {
    5. Verify Private Channel PIN
    POST /api/telegram-channels/:channel_id/verify-pin
 ================================ */
+
+/* =========================================================
+   5A. FAST BACKGROUND ACCESS CHECK
+   POST /api/telegram-channels/:channel_id/access-check
+
+   Frontend calls this BEFORE opening a channel.
+   No channel page is opened until the result is known.
+
+   Public channel:
+     allowed=true, needs_pin=false
+
+   Private + trusted device + same PIN version:
+     allowed=true, needs_pin=false
+
+   Private + missing/wrong/old trust:
+     allowed=false, needs_pin=true
+
+   This endpoint NEVER returns the private PIN.
+========================================================= */
+router.post("/:channel_id/access-check", async (req, res) => {
+  setNoStoreHeaders(res);
+
+  try {
+    const channelId = Number(req.params.channel_id);
+    const userId = Number(req.body?.user_id);
+    const deviceId = getRequestDeviceId(req);
+
+    if (!Number.isInteger(channelId) || channelId <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid channel_id",
+        allowed: false,
+        needs_pin: false,
+        trusted_device: false,
+      });
+    }
+
+    if (!Number.isInteger(userId) || userId <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "user_id is required",
+        allowed: false,
+        needs_pin: false,
+        trusted_device: false,
+      });
+    }
+
+    const result = await db.query(
+      `SELECT
+         channel_id,
+         channel_name,
+         is_private,
+         updated_at
+       FROM telegram_channels
+       WHERE channel_id = $1
+       LIMIT 1`,
+      [channelId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Channel not found",
+        allowed: false,
+        needs_pin: false,
+        trusted_device: false,
+      });
+    }
+
+    const channel = result.rows[0];
+
+    if (!isTrue(channel.is_private)) {
+      return res.status(200).json({
+        success: true,
+        message: "Public channel access allowed",
+        allowed: true,
+        needs_pin: false,
+        trusted_device: false,
+        is_private: false,
+      });
+    }
+
+    if (!deviceId) {
+      return res.status(200).json({
+        success: true,
+        message: "This device is not trusted. Enter PIN.",
+        allowed: false,
+        needs_pin: true,
+        trusted_device: false,
+        is_private: true,
+      });
+    }
+
+    const trusted = await isTrustedDevice(
+      channelId,
+      userId,
+      deviceId,
+      channel.updated_at
+    );
+
+    if (trusted) {
+      return res.status(200).json({
+        success: true,
+        message: "Trusted device",
+        allowed: true,
+        needs_pin: false,
+        trusted_device: true,
+        is_private: true,
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "This device is not trusted or PIN was changed. Enter PIN.",
+      allowed: false,
+      needs_pin: true,
+      trusted_device: false,
+      is_private: true,
+    });
+  } catch (error) {
+    console.error("Channel access-check error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Server error while checking channel access",
+      allowed: false,
+      needs_pin: false,
+      trusted_device: false,
+    });
+  }
+});
+
 router.post("/:channel_id/verify-pin", async (req, res) => {
   setNoStoreHeaders(res);
 
@@ -627,13 +838,56 @@ router.post("/:channel_id/verify-pin", async (req, res) => {
       });
     }
 
+    const trustDevice =
+      req.body?.trust_device === true ||
+      req.body?.trust_device === "true" ||
+      req.body?.remember_device === true ||
+      req.body?.remember_device === "true";
+
+    const userId = Number(req.body?.user_id);
+    const deviceId = getRequestDeviceId(req);
+
+    let trustedDevice = false;
+
+    if (
+      trustDevice &&
+      Number.isInteger(userId) &&
+      userId > 0 &&
+      deviceId
+    ) {
+      // Read the current version AFTER successful PIN validation.
+      // A future PgAdmin PIN update changes updated_at, invalidating
+      // this trust automatically.
+      const versionResult = await db.query(
+        `SELECT updated_at
+         FROM telegram_channels
+         WHERE channel_id = $1
+         LIMIT 1`,
+        [channel.channel_id]
+      );
+
+      const currentPinVersion = versionResult.rows[0]?.updated_at;
+
+      trustedDevice = await saveTrustedDevice(
+        channel.channel_id,
+        userId,
+        deviceId,
+        currentPinVersion
+      );
+    }
+
     return res.status(200).json({
       success: true,
-      message: "PIN verified successfully",
+      message: trustedDevice
+        ? "PIN verified and device trusted successfully"
+        : "PIN verified successfully",
       unlocked: true,
       verified: true,
       valid: true,
       pin_match: true,
+      allowed: true,
+      needs_pin: false,
+      trusted_device: trustedDevice,
     });
   } catch (error) {
     console.error("Verify PIN error:", error);
