@@ -8,10 +8,55 @@ const router = express.Router();
 /* =========================================================
    TRUSTED DEVICE SECURITY
    - Trust is stored in PostgreSQL, not only localStorage.
-   - trusted_pin_version stores telegram_channels.updated_at.
-   - If private_pin is changed in PgAdmin and updated_at changes,
-     the old trusted device automatically becomes untrusted.
+   - trusted_pin_version stores telegram_channels.pin_updated_at.
+   - pin_updated_at changes ONLY when private_pin/is_private changes.
+   - Changing channel name/logo/last message does NOT invalidate trust.
+   - Changing the PIN in PgAdmin automatically invalidates old trust.
 ========================================================= */
+const ensurePinVersionColumn = async () => {
+  await db.query(`
+    ALTER TABLE telegram_channels
+    ADD COLUMN IF NOT EXISTS pin_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  `);
+
+  await db.query(`
+    UPDATE telegram_channels
+    SET pin_updated_at = COALESCE(pin_updated_at, updated_at, CURRENT_TIMESTAMP)
+    WHERE pin_updated_at IS NULL
+  `);
+
+  await db.query(`
+    CREATE OR REPLACE FUNCTION public.update_telegram_channel_pin_version()
+    RETURNS TRIGGER AS $$
+    BEGIN
+      IF NEW.private_pin IS DISTINCT FROM OLD.private_pin
+         OR NEW.is_private IS DISTINCT FROM OLD.is_private THEN
+        NEW.pin_updated_at = CURRENT_TIMESTAMP;
+      ELSE
+        NEW.pin_updated_at = OLD.pin_updated_at;
+      END IF;
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+  `);
+
+  await db.query(`
+    DROP TRIGGER IF EXISTS trg_telegram_channel_pin_version
+    ON public.telegram_channels
+  `);
+
+  await db.query(`
+    CREATE TRIGGER trg_telegram_channel_pin_version
+    BEFORE UPDATE ON public.telegram_channels
+    FOR EACH ROW
+    EXECUTE FUNCTION public.update_telegram_channel_pin_version()
+  `);
+};
+
+ensurePinVersionColumn().catch((error) => {
+  console.error("PIN version initialization error:", error);
+});
+
 const ensureTrustedDeviceTable = async () => {
   await db.query(`
     CREATE TABLE IF NOT EXISTS telegram_channel_trusted_devices (
@@ -737,7 +782,7 @@ router.post("/:channel_id/access-check", async (req, res) => {
       channelId,
       userId,
       deviceId,
-      channel.updated_at
+      channel.pin_updated_at
     );
 
     if (trusted) {
