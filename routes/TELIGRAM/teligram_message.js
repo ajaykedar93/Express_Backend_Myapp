@@ -115,9 +115,14 @@ const getImageViewUrl = (req, noteId, updatedAt) => {
 
 const getImageDownloadUrl = (req, noteId, slot = 1) => {
   const safeSlot = Number(slot);
-  if (![1, 2, 3].includes(safeSlot)) return null;
 
-  return `${getBaseUrl(req)}/api/telegram-notes/image/download/${noteId}${safeSlot === 1 ? "" : `/${safeSlot}`}`;
+  if (![1, 2, 3].includes(safeSlot)) {
+    return null;
+  }
+
+  return `${getBaseUrl(req)}/api/telegram-notes/image/download/${noteId}${
+    safeSlot === 1 ? "" : `/${safeSlot}`
+  }`;
 };
 
 const getFileViewUrl = (req, noteId, updatedAt) => {
@@ -179,9 +184,11 @@ const normalizeNoteFile = (req, note) => {
       : null,
     image_urls: imageUrls,
     image_path: null,
-    download_url: hasImage ? getImageDownloadUrl(req, note.note_id, 1) : null,
+    download_url: hasImage ? getImageDownloadUrl(req, note.note_id) : null,
     image_download_urls: hasImage
-      ? imageUrls.map((_, index) => getImageDownloadUrl(req, note.note_id, index + 1))
+      ? imageUrls.map((_, index) =>
+          getImageDownloadUrl(req, note.note_id, index + 1)
+        )
       : [],
 
     // New generic file response support
@@ -577,8 +584,6 @@ router.get("/", async (req, res) => {
    - Image, PDF, text, CSV, JSON open inline
    - Excel, Word, ZIP, other files download directly
 ================================ */
-// Direct download endpoint: intentionally does NOT call checkChannelAccess().
-// This allows browser/mobile downloads without resending a channel PIN.
 router.get("/file/download/:note_id", async (req, res) => {
   try {
     const { note_id } = req.params;
@@ -667,172 +672,160 @@ router.get("/image/:note_id/:slot", async (req, res) => {
 
    GET /api/telegram-notes/image/:note_id
    GET /api/telegram-notes/image/download/:note_id
-
-   Multi-image downloads:
-   GET /api/telegram-notes/image/download/:note_id/2
-   GET /api/telegram-notes/image/download/:note_id/3
 ================================ */
-
-const getImageBySlot = async (noteId, slot) => {
-  const safeNoteId = Number(noteId);
-  const safeSlot = Number(slot);
-
-  if (!Number.isInteger(safeNoteId) || safeNoteId <= 0) return null;
-  if (![1, 2, 3].includes(safeSlot)) return null;
-
-  const column = safeSlot === 1 ? "image_data" : `image_data_${safeSlot}`;
-  const mimeColumn = safeSlot === 1 ? "image_mime" : `image_mime_${safeSlot}`;
-  const nameColumn = safeSlot === 1 ? "image_name" : `image_name_${safeSlot}`;
-
-  const result = await db.query(
-    `SELECT ${column} AS image_data,
-            ${mimeColumn} AS image_mime,
-            ${nameColumn} AS image_name
-     FROM telegram_notes
-     WHERE note_id = $1`,
-    [safeNoteId]
-  );
-
-  if (!result.rows.length || !result.rows[0].image_data) return null;
-
-  const image = result.rows[0];
-  const imageBuffer = Buffer.isBuffer(image.image_data)
-    ? image.image_data
-    : Buffer.from(image.image_data);
-
-  return {
-    data: imageBuffer,
-    mime: image.image_mime || "application/octet-stream",
-    name: getSafeFileName(
-      image.image_name || `note-${safeNoteId}${safeSlot === 1 ? "" : `-${safeSlot}`}.jpg`
-    ),
-    size: imageBuffer.length,
-    slot: safeSlot,
-  };
-};
-
-/* ===============================
-   Image download — slot 1
-   Browser + Android/iOS compatible
-   ================================ */
-// Direct image download endpoint: intentionally does NOT call checkChannelAccess().
-// This allows browser/mobile downloads without resending a channel PIN.
 router.get("/image/download/:note_id", async (req, res) => {
   try {
-    const { note_id } = req.params;
-    const image = await getImageBySlot(note_id, 1);
+    const noteId = Number(req.params.note_id);
 
-    if (!image) {
+    if (!Number.isInteger(noteId) || noteId <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid note_id",
+      });
+    }
+
+    const result = await db.query(
+      `SELECT image_data, image_mime, image_name
+       FROM telegram_notes
+       WHERE note_id = $1`,
+      [noteId]
+    );
+
+    if (result.rows.length === 0 || !result.rows[0].image_data) {
       return res.status(404).json({
         success: false,
         message: "Image not found",
       });
     }
 
+    const image = result.rows[0];
+
+    const imageBuffer = Buffer.isBuffer(image.image_data)
+      ? image.image_data
+      : Buffer.from(image.image_data);
+
+    const fileName = getSafeFileName(image.image_name || `note-${noteId}.jpg`);
+
     setFileHeaders(
       res,
-      image.name,
-      image.mime,
-      image.size,
+      fileName,
+      image.image_mime || "image/jpeg",
+      imageBuffer.length,
       "attachment"
     );
 
-    return res.end(image.data);
+    return res.end(imageBuffer);
   } catch (error) {
     console.error("Image download error:", error);
 
-    if (!res.headersSent) {
-      return res.status(500).json({
-        success: false,
-        message: "Server error while downloading image",
-      });
-    }
-
-    return res.end();
+    return res.status(500).json({
+      success: false,
+      message: "Server error while downloading image",
+    });
   }
 });
 
-/* ===============================
-   Image download — slots 2 and 3
-   ================================ */
-// Direct multi-image download endpoint: intentionally does NOT call checkChannelAccess().
+// Direct download for image slot 2 and image slot 3.
+// These routes intentionally do NOT call checkChannelAccess(), so downloads
+// work directly on desktop browsers, Android, iOS, and mobile WebViews.
 router.get("/image/download/:note_id/:slot", async (req, res) => {
   try {
-    const { note_id, slot } = req.params;
-    const safeSlot = Number(slot);
+    const noteId = Number(req.params.note_id);
+    const slot = Number(req.params.slot);
 
-    if (![2, 3].includes(safeSlot)) {
+    if (!Number.isInteger(noteId) || noteId <= 0 || ![2, 3].includes(slot)) {
       return res.status(400).json({
         success: false,
         message: "Invalid image slot",
       });
     }
 
-    const image = await getImageBySlot(note_id, safeSlot);
+    await multiImageSchemaReady;
 
-    if (!image) {
+    const result = await db.query(
+      `SELECT
+         image_data_${slot} AS image_data,
+         image_mime_${slot} AS image_mime,
+         image_name_${slot} AS image_name
+       FROM telegram_notes
+       WHERE note_id = $1`,
+      [noteId]
+    );
+
+    if (!result.rows.length || !result.rows[0].image_data) {
       return res.status(404).json({
         success: false,
         message: "Image not found",
       });
     }
 
+    const image = result.rows[0];
+    const imageBuffer = Buffer.isBuffer(image.image_data)
+      ? image.image_data
+      : Buffer.from(image.image_data);
+
     setFileHeaders(
       res,
-      image.name,
-      image.mime,
-      image.size,
+      getSafeFileName(
+        image.image_name || `note-${noteId}-${slot}.jpg`,
+        `note-${noteId}-${slot}.jpg`
+      ),
+      image.image_mime || "image/jpeg",
+      imageBuffer.length,
       "attachment"
     );
 
-    return res.end(image.data);
+    return res.end(imageBuffer);
   } catch (error) {
     console.error("Multi-image download error:", error);
 
-    if (!res.headersSent) {
-      return res.status(500).json({
-        success: false,
-        message: "Server error while downloading image",
-      });
-    }
-
-    return res.end();
+    return res.status(500).json({
+      success: false,
+      message: "Server error while downloading image",
+    });
   }
 });
-
 
 router.get("/image/:note_id", async (req, res) => {
   try {
     const { note_id } = req.params;
-    const image = await getImageBySlot(note_id, 1);
 
-    if (!image) {
+    const result = await db.query(
+      `SELECT image_data, image_mime, image_name
+       FROM telegram_notes
+       WHERE note_id = $1`,
+      [note_id]
+    );
+
+    if (result.rows.length === 0 || !result.rows[0].image_data) {
       return res.status(404).json({
         success: false,
         message: "Image not found",
       });
     }
 
+    const image = result.rows[0];
+
+    const imageBuffer = Buffer.isBuffer(image.image_data)
+      ? image.image_data
+      : Buffer.from(image.image_data);
+
     setFileHeaders(
       res,
-      image.name,
-      image.mime,
-      image.size,
+      image.image_name || `note-${note_id}.jpg`,
+      image.image_mime || "image/jpeg",
+      imageBuffer.length,
       "inline"
     );
 
-    return res.end(image.data);
+    return res.end(imageBuffer);
   } catch (error) {
     console.error("Image fetch error:", error);
 
-    if (!res.headersSent) {
-      return res.status(500).json({
-        success: false,
-        message: "Server error while fetching image",
-      });
-    }
-
-    return res.end();
+    return res.status(500).json({
+      success: false,
+      message: "Server error while fetching image",
+    });
   }
 });
 
